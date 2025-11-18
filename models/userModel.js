@@ -1,0 +1,62 @@
+// models/User.js
+const { DataTypes } = require("sequelize");
+const sequelize = require("../config/database");
+
+const User = sequelize.define("users", {
+    id: {
+        type: DataTypes.BIGINT,
+        autoIncrement: true,
+        primaryKey: true,
+    },
+    user_unique_id: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        unique: true,
+    },
+    nom: {
+        type: DataTypes.STRING,
+        allowNull: false,
+    },
+    prenom: {
+        type: DataTypes.STRING,
+        allowNull: false,
+    },
+    phone: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        unique: true,
+    },
+    email: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        unique: true,
+    },
+    ville: {
+        type: DataTypes.STRING,
+        allowNull: false,
+    },
+    quartier: {
+        type: DataTypes.STRING,
+        allowNull: false,
+    },
+    password: {
+        type: DataTypes.STRING,
+        allowNull: false,
+    },
+    photo: {
+        type: DataTypes.STRING,
+        allowNull: true,
+    },
+    // 🆕 ADDED: Trip tracking preference
+    trip_tracking_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false, // Default to disabled for safety
+        comment: 'Whether trip tracking is enabled for this user',
+    },
+}, {
+    timestamps: false,
+    tableName: 'users', // Explicitly set table name
+});
+
+module.exports = User;
