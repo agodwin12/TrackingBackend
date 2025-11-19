@@ -1,6 +1,6 @@
 const AssociationUserVoiture = require("../models/AssociationUserVoiture");
-const Voiture = require("../models/Voiture");
-const Location = require("../models/Location");
+const Voiture = require("../models/voiture");
+const Location = require("../models/location");
 
 exports.getVehicleDetails = async (req, res) => {
     try {

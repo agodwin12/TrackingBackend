@@ -27,6 +27,7 @@ exports.login = async (req, res) => {
             prenom: user.prenom,
             phone: user.phone,
             email: user.email,
+            is_first_login: user.is_first_login, // 🆕 Log first login status
         });
 
         // Validate password
@@ -60,6 +61,7 @@ exports.login = async (req, res) => {
         console.log("🚀 Login successful! Sending response...");
         res.json({
             message: "Login successful",
+            isFirstLogin: user.is_first_login, // 🆕 ADDED: Return first login flag
             user: {
                 id: user.id,
                 user_unique_id: user.user_unique_id,

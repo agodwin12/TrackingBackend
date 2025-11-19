@@ -1,5 +1,5 @@
 const User = require("../models/userModel");
-const Voiture = require("../models/Voiture");
+const Voiture = require("../models/voiture");
 const AssociationUserVoiture = require("../models/AssociationUserVoiture"); // ✅ Model linking users to vehicles
 
 /**

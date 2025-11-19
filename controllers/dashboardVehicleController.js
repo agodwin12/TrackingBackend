@@ -1,5 +1,5 @@
-const Voiture = require("../models/Voiture");
-const Location = require("../models/Location");
+const Voiture = require("../models/voiture");
+const Location = require("../models/location");
 
 exports.getVehicleDashboardData = async (req, res) => {
     try {

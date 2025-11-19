@@ -57,12 +57,12 @@ app.use(cookieParser());
 
 // ========== API ROUTES ==========
 app.use("/api/auth", authRoutes);
-app.use("/api/voitures", voitureRoutes);
+app.use("/api", voitureRoutes);
 app.use("/api", vehicleRoutes);
 app.use("/api", dashboardVehicleRoutes);
 app.use("/api", gpsRoutes);
 app.use("/api/users", userRoutes);
-app.use("/api/password", changePasswordRoutes);
+app.use("/api", changePasswordRoutes);
 app.use("/api/tracking", vehicleLocationRoutes);
 app.use('/api', vehicleSecurityRoutes);
 app.use("/api", tripRoutes);

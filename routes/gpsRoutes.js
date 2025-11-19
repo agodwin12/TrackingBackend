@@ -3,7 +3,7 @@ const router = require("express").Router();
 const {
     issueCommandToVehicle,
     getRealtimeVehicleStatus,
-} = require("../controllers/GpsController");
+} = require("../controllers/gpsController");
 
 
 router.post("/gps/issue-command", issueCommandToVehicle);

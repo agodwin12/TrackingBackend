@@ -1,8 +1,8 @@
 // controllers/homeScreenDashboardController.js
-const Voiture = require("../models/Voiture");
-const Location = require("../models/Location");
+const Voiture = require("../models/voiture");
+const Location = require("../models/location");
 const VehicleSecurity = require("../models/vehicleSecurity");
-const Trip = require("../models/Trip");
+const Trip = require("../models/trip");
 const { Alert } = require("../models");
 const { Op } = require("sequelize");
 const cacheService = require("../services/cacheService");

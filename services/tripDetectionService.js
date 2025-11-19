@@ -1,8 +1,8 @@
 const { Op } = require("sequelize");
-const Location = require("../models/Location");
-const Trip = require("../models/Trip");
-const TripWaypoint = require("../models/TripWaypoint");
-const Voiture = require("../models/Voiture");
+const Location = require("../models/location");
+const Trip = require("../models/trip");
+const TripWaypoint = require("../models/tripWaypoint");
+const Voiture = require("../models/voiture");
 const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
 const GeocodingService = require("./GeocodingService");

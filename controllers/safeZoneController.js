@@ -1,6 +1,6 @@
 // controllers/safeZoneController.js
 const SafeZone = require('../models/safeZoneModel');
-const Voiture = require('../models/Voiture');
+const Voiture = require('../models/voiture');
 const socketService = require('../services/socketService');
 const Alert = require('../models/Alert');
 const NotificationService = require('../services/notificationService'); // ✅ ADD THIS

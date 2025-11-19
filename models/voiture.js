@@ -1,3 +1,4 @@
+// models/voiture.js
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
@@ -10,8 +11,9 @@ const Voiture = sequelize.define("voitures", {
     model: { type: DataTypes.STRING, allowNull: false },
     couleur: { type: DataTypes.STRING, allowNull: false },
     photo: { type: DataTypes.STRING, allowNull: true },
+    nickname: { type: DataTypes.STRING, allowNull: true }, // 🆕 ADDED: Nickname field
 }, {
-    timestamps: false // ✅ Disable Sequelize automatic timestamps
+    timestamps: false
 });
 
 module.exports = Voiture;

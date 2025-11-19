@@ -1,4 +1,4 @@
-// controllers/GpsController.js
+// controllers/gpsController.js
 const { getVehicleStatus } = require("../services/OptimizedGpsStatusService");
 const { loginGps, sendGpsCommand, resetGpsToken } = require("../services/GpsService"); // ✅ Add resetGpsToken
 const Voiture = require("../models/voiture");

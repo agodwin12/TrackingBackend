@@ -1,4 +1,4 @@
-// models/LocationHistory.js
+// models/locationHistory.js
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/database');
 

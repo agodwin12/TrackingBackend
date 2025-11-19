@@ -1,7 +1,7 @@
 const { Op } = require("sequelize");
-const Trip = require("../models/Trip");
-const TripWaypoint = require("../models/TripWaypoint");
-const Voiture = require("../models/Voiture");
+const Trip = require("../models/trip");
+const TripWaypoint = require("../models/tripWaypoint");
+const Voiture = require("../models/voiture");
 
 exports.getVehicleTrips = async (req, res) => {
     try {

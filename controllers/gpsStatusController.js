@@ -1,6 +1,6 @@
 // controllers/gpsStatusController.js
-const Location = require("../models/Location");
-const Voiture = require("../models/Voiture");
+const Location = require("../models/location");
+const Voiture = require("../models/voiture");
 const cacheService = require("../services/cacheService");
 
 /**

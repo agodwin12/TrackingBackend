@@ -2,9 +2,9 @@
 const cron = require('node-cron');
 const geolib = require('geolib');
 
-const VehicleSecurity = require('../models/VehicleSecurity');
-const Location = require('../models/Location');
-const Voiture = require('../models/Voiture');
+const VehicleSecurity = require('../models/vehicleSecurity');
+const Location = require('../models/location');
+const Voiture = require('../models/voiture');
 
 // === Config ===
 const MOVE_THRESHOLD_METERS = Number(process.env.SECURITY_MOVE_THRESHOLD ?? 5); // alert if moved >= 5m

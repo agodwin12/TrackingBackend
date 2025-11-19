@@ -51,12 +51,19 @@ const User = sequelize.define("users", {
     trip_tracking_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
-        defaultValue: false, // Default to disabled for safety
+        defaultValue: false,
         comment: 'Whether trip tracking is enabled for this user',
+    },
+    // 🆕 ADDED: First login tracking
+    is_first_login: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment: 'Whether user needs to change password on first login',
     },
 }, {
     timestamps: false,
-    tableName: 'users', // Explicitly set table name
+    tableName: 'users',
 });
 
 module.exports = User;

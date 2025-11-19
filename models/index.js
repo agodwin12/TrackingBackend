@@ -1,8 +1,8 @@
 const AssociationUserVoiture = require("./AssociationUserVoiture");
-const Voiture = require("./Voiture");
-const Trip = require("./Trip");
-const TripWaypoint = require("./TripWaypoint");
-const Location = require("./Location");
+const Voiture = require("./voiture");
+const Trip = require("./trip");
+const TripWaypoint = require("./tripWaypoint");
+const Location = require("./location");
 const Alert = require("./Alert");
 const SafeZone = require("./safeZoneModel");
 
