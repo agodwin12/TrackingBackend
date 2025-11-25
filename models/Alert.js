@@ -15,8 +15,8 @@ const Alert = sequelize.define("alerts", {
             key: 'id'
         }
     },
-    alert_type: {  // ✅ NEW FIELD
-        type: DataTypes.ENUM('geofence', 'safe_zone', 'speed', 'engine', 'general'),
+    alert_type: {
+        type: DataTypes.ENUM('geofence', 'safe_zone', 'speed', 'engine', 'general', 'stolen'), // 🆕 Added 'stolen'
         allowNull: false,
         defaultValue: 'general'
     },
@@ -36,6 +36,22 @@ const Alert = sequelize.define("alerts", {
     read: {
         type: DataTypes.BOOLEAN,
         defaultValue: false,
+    },
+    // 🆕 Additional fields for stolen alerts
+    latitude: {
+        type: DataTypes.DECIMAL(10, 8),
+        allowNull: true,
+        comment: 'Location latitude when alert was created',
+    },
+    longitude: {
+        type: DataTypes.DECIMAL(11, 8),
+        allowNull: true,
+        comment: 'Location longitude when alert was created',
+    },
+    alert_status: {
+        type: DataTypes.ENUM('ACTIVE', 'RESOLVED', 'FALSE_ALARM'),
+        allowNull: true,
+        comment: 'Status for stolen/critical alerts',
     },
 }, {
     tableName: "alerts",

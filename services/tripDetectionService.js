@@ -10,7 +10,7 @@ const sequelize = require("../config/database");
 
 class TripDetectionService {
     // ---- SETTINGS ----
-    static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 2);
+    static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 10); // ✅ Changed from 2 to 10 minutes
     static END_GAP_MINUTES = Number(process.env.TRIP_END_GAP_MIN ?? 5);
     static MIN_SPEED_THRESHOLD = Number(process.env.TRIP_MIN_SPEED_KMH ?? 1);
     static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 1);
@@ -139,12 +139,15 @@ class TripDetectionService {
         let current = null;
         let lastMove = null;
 
+        console.log(`🔍 Analyzing ${locations.length} location points with ${this.IDLE_THRESHOLD_MINUTES} min idle threshold...`);
+
         for (let i = 0; i < locations.length; i++) {
             const loc = locations[i];
             const speed = Number(loc.speed || 0);
             const moving = speed >= this.MIN_SPEED_THRESHOLD;
 
             if (!inTrip && moving) {
+                // ✅ Start a new trip
                 inTrip = true;
                 current = {
                     vehicleId,
@@ -157,6 +160,7 @@ class TripDetectionService {
                     lastPointTime: new Date(loc.sys_time)
                 };
                 lastMove = loc;
+                console.log(`🚀 Trip started at ${loc.sys_time}`);
                 continue;
             }
 
@@ -166,25 +170,34 @@ class TripDetectionService {
                 current.locationIds.push(loc.id);
 
                 if (moving) {
+                    // Vehicle is still moving
                     lastMove = loc;
                 } else {
+                    // ✅ Vehicle stopped - check idle time
                     const idleMin = (new Date(loc.sys_time) - new Date(lastMove.sys_time)) / 60000;
 
                     if (idleMin >= this.IDLE_THRESHOLD_MINUTES) {
+                        // ✅ Vehicle has been stopped for 10+ minutes → End trip
+                        console.log(`🛑 Trip ended after ${idleMin.toFixed(1)} min idle at ${loc.sys_time}`);
                         trips.push(current);
                         inTrip = false;
                         current = null;
                         lastMove = null;
+                    } else {
+                        // Still within idle threshold - continue trip
+                        console.log(`⏳ Vehicle idle for ${idleMin.toFixed(1)} min (threshold: ${this.IDLE_THRESHOLD_MINUTES} min)`);
                     }
                 }
             }
         }
 
-        // Flush last trip
+        // Flush last trip if still in progress
         if (inTrip && current) {
+            console.log(`🏁 Final trip flushed (still in progress)`);
             trips.push(current);
         }
 
+        console.log(`✅ Detected ${trips.length} trip(s)`);
         return trips;
     }
 
@@ -196,8 +209,11 @@ class TripDetectionService {
         try {
             const metrics = this.calculateTripMetrics(t.waypoints);
 
+            console.log(`📊 Trip Metrics: ${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km`);
+
             if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
+                console.log(`⚠️ Trip too short - skipped (min: ${this.MIN_TRIP_DURATION_MIN} min, ${this.MIN_TRIP_DISTANCE_KM} km)`);
                 await trx.rollback();
                 return false;
             }
@@ -245,6 +261,7 @@ class TripDetectionService {
             );
 
             await trx.commit();
+            console.log(`✅ Trip saved: ID ${trip.id}`);
             return true;
 
         } catch (err) {

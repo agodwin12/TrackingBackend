@@ -47,19 +47,25 @@ const User = sequelize.define("users", {
         type: DataTypes.STRING,
         allowNull: true,
     },
-    // 🆕 ADDED: Trip tracking preference
+    // Trip tracking preference
     trip_tracking_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
         defaultValue: false,
         comment: 'Whether trip tracking is enabled for this user',
     },
-    // 🆕 ADDED: First login tracking
+    // First login tracking
     is_first_login: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
         defaultValue: true,
         comment: 'Whether user needs to change password on first login',
+    },
+    // 🆕 PIN for app lock (hashed with SHA-256)
+    pin_hash: {
+        type: DataTypes.STRING(64),
+        allowNull: true,
+        comment: 'User PIN for app lock (SHA-256 hashed, 4 digits)',
     },
 }, {
     timestamps: false,

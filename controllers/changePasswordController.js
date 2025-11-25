@@ -205,20 +205,20 @@ exports.setPassword = async (req, res) => {
         }
 
         console.log("✅ User found:", user.email);
+        console.log("📌 Current is_first_login:", user.is_first_login);
 
         // Hash the new password
         const saltRounds = 10;
         const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
 
-        // Update user's password
+        // Update user's password AND mark as not first login
         user.password = hashedPassword;
-
-        // Mark user as no longer first login (if you have this field)
-        // user.is_first_login = false;
+        user.is_first_login = false; // ✅ CRITICAL: Mark as not first login anymore
 
         await user.save();
 
         console.log("✅ Password updated successfully");
+        console.log("✅ is_first_login set to false");
 
         res.json({
             success: true,

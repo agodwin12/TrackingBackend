@@ -9,5 +9,9 @@ router.patch("/:id/read", alertController.markAlertAsRead);
 
 router.patch("/vehicle/:vehicleId/read-all", alertController.markAllAsRead);
 
+// 🆕 NEW: Stolen vehicle routes
+router.post('/report-stolen', alertController.reportStolenVehicle);
+router.get('/vehicle/:vehicleId/stolen', alertController.getActiveStolenAlert);
+router.patch('/:id/resolve', alertController.resolveStolenAlert);
 
 module.exports = router;

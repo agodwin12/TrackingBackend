@@ -28,7 +28,7 @@ const GeocodingService = require('./services/geocodingService');
 const { startGPSFetchCycle, stopGPSFetchCycle, isRunning } = require("./location");
 const notificationRoutes = require('./routes/notificationRoutes');
 const userSettingsRoutes = require('./routes/userSettingsRoutes');
-
+const pinRoutes = require('./routes/pinRoutes');
 
 // ✅ Security Check Job
 require('./jobs/checkSecurityMovement');
@@ -71,7 +71,7 @@ app.use("/api/gps", gpsStatus);
 app.use('/api/safezones', safeZoneRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/users-settings', userSettingsRoutes);
-
+app.use('/api/pin', pinRoutes);
 
 // ========== HEALTH CHECK ENDPOINT ==========
 app.get('/health', (req, res) => {
