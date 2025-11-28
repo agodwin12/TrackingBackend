@@ -54,6 +54,20 @@ const User = sequelize.define("users", {
         defaultValue: false,
         comment: 'Whether trip tracking is enabled for this user',
     },
+    // ✅ NEW: Geofence alerts preference
+    geofence_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment: 'Whether geofence alerts are enabled for this user',
+    },
+    // ✅ NEW: Safe zone alerts preference
+    safe_zone_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment: 'Whether safe zone alerts are enabled for this user',
+    },
     // First login tracking
     is_first_login: {
         type: DataTypes.BOOLEAN,
@@ -61,7 +75,7 @@ const User = sequelize.define("users", {
         defaultValue: true,
         comment: 'Whether user needs to change password on first login',
     },
-    // 🆕 PIN for app lock (hashed with SHA-256)
+    // PIN for app lock (hashed with SHA-256)
     pin_hash: {
         type: DataTypes.STRING(64),
         allowNull: true,

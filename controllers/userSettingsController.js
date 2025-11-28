@@ -1,9 +1,19 @@
+// controllers/userSettingsController.js
+
 const User = require("../models/userModel");
 
+/**
+ * Update trip tracking setting
+ * PUT /api/users-settings/:userId/settings/trip-tracking
+ */
 exports.updateTripTracking = async (req, res) => {
     try {
         const { userId } = req.params;
         const { enabled } = req.body;
+
+        console.log(`\n📌 [updateTripTracking] Request received`);
+        console.log(`➡ User ID: ${userId}`);
+        console.log(`➡ Enabled: ${enabled}`);
 
         if (typeof enabled !== "boolean") {
             return res.status(400).json({
@@ -14,76 +24,38 @@ exports.updateTripTracking = async (req, res) => {
 
         const user = await User.findByPk(userId);
         if (!user) {
-            return res.status(404).json({ success: false, message: "User not found" });
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
         }
 
         user.trip_tracking_enabled = enabled;
         await user.save();
 
+        console.log(`✅ Trip tracking ${enabled ? "enabled" : "disabled"} for user ${userId}`);
+
         res.json({
             success: true,
             message: `Trip tracking ${enabled ? "enabled" : "disabled"} successfully`,
-            data: { userId: user.id, tripTrackingEnabled: user.trip_tracking_enabled }
-        });
-    } catch (error) {
-        console.error("ERROR:", error);
-        res.status(500).json({ success: false, message: "Server error" });
-    }
-};
-
-exports.getUserSettings = async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const user = await User.findByPk(userId);
-
-        if (!user) {
-            return res.status(404).json({ success: false, message: "User not found" });
-        }
-
-        res.json({
-            success: true,
             data: {
                 userId: user.id,
-                name: `${user.prenom} ${user.nom}`,
-                email: user.email,
-                settings: { tripTrackingEnabled: user.trip_tracking_enabled || false }
+                tripTrackingEnabled: user.trip_tracking_enabled
             }
         });
     } catch (error) {
-        console.error("ERROR:", error);
-        res.status(500).json({ success: false, message: "Server error" });
-    }
-};
-
-exports.updateUserSettings = async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const { tripTrackingEnabled } = req.body;
-
-        const user = await User.findByPk(userId);
-        if (!user) {
-            return res.status(404).json({ success: false, message: "User not found" });
-        }
-
-        if (typeof tripTrackingEnabled === "boolean") {
-            user.trip_tracking_enabled = tripTrackingEnabled;
-        }
-
-        await user.save();
-
-        res.json({
-            success: true,
-            message: "Settings updated successfully",
-            data: { userId: user.id, settings: { tripTrackingEnabled: user.trip_tracking_enabled } }
+        console.error("🔥 ERROR in updateTripTracking:", error);
+        res.status(500).json({
+            success: false,
+            message: "Server error",
+            error: error.message
         });
-    } catch (error) {
-        console.error("ERROR:", error);
-        res.status(500).json({ success: false, message: "Server error" });
     }
 };
+
 /**
  * Get user's current settings
- * GET /api/users/:userId/settings
+ * GET /api/users-settings/:userId/settings
  */
 exports.getUserSettings = async (req, res) => {
     try {
@@ -100,8 +72,8 @@ exports.getUserSettings = async (req, res) => {
                 'email',
                 'phone',
                 'trip_tracking_enabled',
-                'created_at',
-                'updated_at'
+                'geofence_alerts_enabled',
+                'safe_zone_alerts_enabled'
             ]
         });
 
@@ -112,7 +84,14 @@ exports.getUserSettings = async (req, res) => {
             });
         }
 
+        const settings = {
+            tripTrackingEnabled: user.trip_tracking_enabled || false,
+            geofenceAlertsEnabled: user.geofence_alerts_enabled !== false, // Default true
+            safeZoneAlertsEnabled: user.safe_zone_alerts_enabled !== false, // Default true
+        };
+
         console.log("✅ User settings retrieved for:", user.email);
+        console.log("📋 Settings:", settings);
 
         res.json({
             success: true,
@@ -121,10 +100,7 @@ exports.getUserSettings = async (req, res) => {
                 name: `${user.prenom} ${user.nom}`,
                 email: user.email,
                 phone: user.phone,
-                settings: {
-                    tripTrackingEnabled: user.trip_tracking_enabled || false
-                },
-                updatedAt: user.updated_at
+                settings: settings
             }
         });
 
@@ -140,15 +116,16 @@ exports.getUserSettings = async (req, res) => {
 
 /**
  * Update multiple user settings at once
- * PUT /api/users/:userId/settings
+ * PUT /api/users-settings/:userId/settings
  */
 exports.updateUserSettings = async (req, res) => {
     try {
         const { userId } = req.params;
-        const { tripTrackingEnabled } = req.body;
+        const { tripTrackingEnabled, geofenceAlertsEnabled, safeZoneAlertsEnabled } = req.body;
 
         console.log("\n📌 [updateUserSettings] Request received");
         console.log("➡ User ID:", userId);
+        console.log("➡ Settings:", { tripTrackingEnabled, geofenceAlertsEnabled, safeZoneAlertsEnabled });
 
         const user = await User.findByPk(userId);
 
@@ -159,13 +136,20 @@ exports.updateUserSettings = async (req, res) => {
             });
         }
 
+        // Update settings
         if (typeof tripTrackingEnabled === "boolean") {
             user.trip_tracking_enabled = tripTrackingEnabled;
+        }
+        if (typeof geofenceAlertsEnabled === "boolean") {
+            user.geofence_alerts_enabled = geofenceAlertsEnabled;
+        }
+        if (typeof safeZoneAlertsEnabled === "boolean") {
+            user.safe_zone_alerts_enabled = safeZoneAlertsEnabled;
         }
 
         await user.save();
 
-        console.log("✅ User settings updated");
+        console.log("✅ User settings updated successfully");
 
         res.json({
             success: true,
@@ -173,9 +157,10 @@ exports.updateUserSettings = async (req, res) => {
             data: {
                 userId: user.id,
                 settings: {
-                    tripTrackingEnabled: user.trip_tracking_enabled
-                },
-                updatedAt: user.updated_at
+                    tripTrackingEnabled: user.trip_tracking_enabled,
+                    geofenceAlertsEnabled: user.geofence_alerts_enabled,
+                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled
+                }
             }
         });
 
@@ -188,3 +173,63 @@ exports.updateUserSettings = async (req, res) => {
         });
     }
 };
+
+/**
+ * ✅ Update alert settings (geofence and safe zone)
+ * PUT /api/users-settings/:userId/settings/alerts
+ */
+exports.updateAlertSettings = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { geofenceAlertsEnabled, safeZoneAlertsEnabled } = req.body;
+
+        console.log("\n📌 [updateAlertSettings] Request received");
+        console.log("➡ User ID:", userId);
+        console.log("➡ Geofence Alerts:", geofenceAlertsEnabled);
+        console.log("➡ Safe Zone Alerts:", safeZoneAlertsEnabled);
+
+        const user = await User.findByPk(userId);
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        // Update alert settings
+        if (typeof geofenceAlertsEnabled === "boolean") {
+            user.geofence_alerts_enabled = geofenceAlertsEnabled;
+        }
+        if (typeof safeZoneAlertsEnabled === "boolean") {
+            user.safe_zone_alerts_enabled = safeZoneAlertsEnabled;
+        }
+
+        await user.save();
+
+        console.log("✅ Alert settings updated successfully");
+
+        res.json({
+            success: true,
+            message: "Alert settings updated successfully",
+            data: {
+                userId: user.id,
+                settings: {
+                    tripTrackingEnabled: user.trip_tracking_enabled,
+                    geofenceAlertsEnabled: user.geofence_alerts_enabled,
+                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error("🔥 ERROR in updateAlertSettings:", error);
+        res.status(500).json({
+            success: false,
+            message: "Server error",
+            error: error.message
+        });
+    }
+};
+
+module.exports = exports;
