@@ -1,11 +1,10 @@
 // backend/controllers/notificationController.js
-const admin = require('firebase-admin'); // ✅ ADD THIS IMPORT
+const admin = require('firebase-admin');
 const DeviceToken = require('../models/DeviceToken');
 
 // ✅ Initialize Firebase Admin SDK (only once)
 if (!admin.apps.length) {
     try {
-        // ✅ Correct path to your service account file
         const serviceAccount = require('../config/firebase-service-account.json');
 
         admin.initializeApp({
@@ -36,13 +35,11 @@ exports.registerToken = async (req, res) => {
 
         console.log(`📱 Registering FCM token for user ${userId}`);
 
-        // Check if token already exists
         let deviceToken = await DeviceToken.findOne({
             where: { token }
         });
 
         if (deviceToken) {
-            // Update existing token
             await deviceToken.update({
                 user_id: userId,
                 device_type: device_type || 'android',
@@ -53,7 +50,6 @@ exports.registerToken = async (req, res) => {
 
             console.log(`✅ Updated device token for user ${userId}`);
         } else {
-            // Create new token
             deviceToken = await DeviceToken.create({
                 user_id: userId,
                 token,
@@ -85,13 +81,12 @@ exports.registerToken = async (req, res) => {
 };
 
 /**
- * ✅ Send push notification to specific user
+ * ✅ Send push notification to specific user (FIXED for older Firebase SDK)
  */
 exports.sendToUser = async (userId, notification) => {
     try {
         console.log(`📤 Sending notification to user ${userId}`);
 
-        // Get all active tokens for this user
         const deviceTokens = await DeviceToken.findAll({
             where: {
                 user_id: userId,
@@ -115,42 +110,52 @@ exports.sendToUser = async (userId, notification) => {
             });
         }
 
-        const message = {
-            notification: {
-                title: notification.title,
-                body: notification.body,
-            },
-            data: dataPayload,
-            tokens: tokens
-        };
+        // ✅ FIXED: Use sendEachForMulticast or send() for older SDK versions
+        let successCount = 0;
+        let failureCount = 0;
+        const tokensToRemove = [];
 
-        // Send to multiple devices
-        const response = await admin.messaging().sendMulticast(message);
+        // Send to each token individually (works with all Firebase SDK versions)
+        for (const token of tokens) {
+            try {
+                const message = {
+                    notification: {
+                        title: notification.title,
+                        body: notification.body,
+                    },
+                    data: dataPayload,
+                    token: token // Send to single token
+                };
 
-        console.log(`✅ Notification sent: ${response.successCount} success, ${response.failureCount} failures`);
+                await admin.messaging().send(message);
+                successCount++;
+                console.log(`✅ Notification sent to token: ${token.substring(0, 20)}...`);
+            } catch (error) {
+                failureCount++;
+                console.error(`❌ Failed to send to token: ${error.message}`);
+
+                // Remove invalid tokens
+                if (error.code === 'messaging/invalid-registration-token' ||
+                    error.code === 'messaging/registration-token-not-registered') {
+                    tokensToRemove.push(token);
+                }
+            }
+        }
+
+        console.log(`✅ Notification sent: ${successCount} success, ${failureCount} failures`);
 
         // Remove invalid tokens
-        if (response.failureCount > 0) {
-            const tokensToRemove = [];
-            response.responses.forEach((resp, idx) => {
-                if (!resp.success) {
-                    console.error(`❌ Failed to send to token: ${resp.error?.message}`);
-                    tokensToRemove.push(tokens[idx]);
-                }
+        if (tokensToRemove.length > 0) {
+            await DeviceToken.destroy({
+                where: { token: tokensToRemove }
             });
-
-            if (tokensToRemove.length > 0) {
-                await DeviceToken.destroy({
-                    where: { token: tokensToRemove }
-                });
-                console.log(`🗑️ Removed ${tokensToRemove.length} invalid tokens`);
-            }
+            console.log(`🗑️ Removed ${tokensToRemove.length} invalid tokens`);
         }
 
         return {
             success: true,
-            successCount: response.successCount,
-            failureCount: response.failureCount
+            successCount: successCount,
+            failureCount: failureCount
         };
     } catch (error) {
         console.error('❌ Send notification error:', error);

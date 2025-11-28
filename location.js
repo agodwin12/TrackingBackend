@@ -1,10 +1,11 @@
-// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone)
+// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence)
 const axios = require('axios');
 const mysql = require('mysql2/promise');
 const cacheInvalidationService = require('./services/cacheInvalidationService');
 const socketService = require('./services/socketService');
 const { checkSafeZoneViolation } = require('./controllers/safeZoneController');
-require('dotenv').config(); // ✅ Load environment variables
+const { checkGeofenceViolation } = require('./controllers/geofenceMonitorController');
+require('dotenv').config();
 
 // ========== CONFIGURATION FROM ENV ==========
 const GPS_CONFIG = {
@@ -12,7 +13,7 @@ const GPS_CONFIG = {
     loginPassword: process.env.GPS_LOGIN_PASSWORD || 'proxym123',
     loginUrl: process.env.GPS_LOGIN_URL || 'http://appzzl.18gps.net/',
     apiUrl: process.env.GPS_API_URL || 'http://apitest.18gps.net/GetDateServices.asmx',
-    fetchInterval: parseInt(process.env.GPS_FETCH_INTERVAL) || 100000, // milliseconds
+    fetchInterval: parseInt(process.env.GPS_FETCH_INTERVAL) || 10000, // 10 seconds
     loginType: process.env.GPS_LOGIN_TYPE || 'ENTERPRISE',
     language: process.env.GPS_LANGUAGE || 'en',
     timeZone: parseInt(process.env.GPS_TIMEZONE) || 8,
@@ -189,7 +190,7 @@ async function saveLocationsToDatabase(connection, locations) {
 
         console.log(`\n✅ Total records saved: ${totalRecords}`);
 
-        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + SAFE ZONE CHECK
+        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + SAFE ZONE CHECK + GEOFENCE CHECK
         if (invalidatedVehicles.size > 0) {
             for (const macId of invalidatedVehicles) {
                 try {
@@ -203,8 +204,10 @@ async function saveLocationsToDatabase(connection, locations) {
                         const carModel = vehicles[0].model;
                         const gpsData = gpsUpdates.get(macId);
 
+                        // Cache invalidation
                         await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
 
+                        // Socket.IO - GPS update
                         socketService.emitGPSUpdate(vehicleId, {
                             latitude: gpsData.latitude,
                             longitude: gpsData.longitude,
@@ -216,24 +219,45 @@ async function saveLocationsToDatabase(connection, locations) {
                             mac_id_gps: macId
                         });
 
+                        // Determine GPS status
                         let gpsStatus = "Disconnected";
                         if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = "Connected";
 
+                        // Socket.IO - Dashboard update
                         socketService.emitDashboardUpdate(vehicleId, {
                             speed: gpsData.speed,
                             gpsStatus: gpsStatus,
                             vehicleStatus: gpsStatus === "Connected" ? "Active" : "Inactive"
                         });
 
-                        // Safe zone check
+                        // ✅ Safe zone violation check
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (safeZoneResult.violation) {
                                 console.log(`⚠️ SAFE ZONE VIOLATION DETECTED!`);
-                                if (safeZoneResult.isFirstAlert) console.log(`📧 Alert created and notification sent`);
+                                if (safeZoneResult.isFirstAlert) {
+                                    console.log(`📧 Safe zone alert created and notification sent`);
+                                }
                             }
                         } catch (safeZoneError) {
                             console.error(`❌ Safe zone check error:`, safeZoneError.message);
+                        }
+
+                        // ✅ Geofence violation check
+                        try {
+                            const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
+                            if (geofenceResult.violation) {
+                                if (geofenceResult.isFirstAlert) {
+                                    console.log(`🚨 GEOFENCE VIOLATION DETECTED!`);
+                                    console.log(`   Vehicle: ${geofenceResult.vehicleName}`);
+                                    console.log(`   Location: ${geofenceResult.locationName || `[${geofenceResult.latitude}, ${geofenceResult.longitude}]`}`);
+                                    console.log(`📧 Geofence alert created and notification sent`);
+                                } else if (geofenceResult.reason === 'Unread alert exists') {
+                                    console.log(`⏳ Geofence violation ongoing (waiting for user to read alert)`);
+                                }
+                            }
+                        } catch (geofenceError) {
+                            console.error(`❌ Geofence check error:`, geofenceError.message);
                         }
                     }
                 } catch (error) {
@@ -260,9 +284,14 @@ async function fetchGPSData() {
             const { token, userId } = loginData;
             const locations = await fetchLocations(token, userId);
 
-            if (locations) await saveLocationsToDatabase(connection, locations);
-            else console.log('❌ Failed to fetch locations');
-        } else console.log('❌ Login failed, cannot fetch locations');
+            if (locations) {
+                await saveLocationsToDatabase(connection, locations);
+            } else {
+                console.log('❌ Failed to fetch locations');
+            }
+        } else {
+            console.log('❌ Login failed, cannot fetch locations');
+        }
 
         await connection.end();
         console.log('✅ Database connection closed');
@@ -278,15 +307,24 @@ async function fetchGPSData() {
 let fetchInterval = null;
 
 function startGPSFetchCycle() {
-    if (fetchInterval) return;
-    fetchGPSData();
+    if (fetchInterval) {
+        console.log('⚠️ GPS fetch cycle is already running');
+        return;
+    }
+
+    console.log('🚀 Starting GPS fetch cycle...');
+    fetchGPSData(); // Run immediately
     fetchInterval = setInterval(fetchGPSData, GPS_CONFIG.fetchInterval);
+    console.log(`⏰ GPS fetch cycle started (every ${GPS_CONFIG.fetchInterval / 1000} seconds)`);
 }
 
 function stopGPSFetchCycle() {
     if (fetchInterval) {
         clearInterval(fetchInterval);
         fetchInterval = null;
+        console.log('🛑 GPS fetch cycle stopped');
+    } else {
+        console.log('⚠️ GPS fetch cycle is not running');
     }
 }
 

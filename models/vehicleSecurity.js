@@ -2,6 +2,11 @@ const { DataTypes } = require('sequelize');
 const sequelize = require('../config/database');
 
 const VehicleSecurity = sequelize.define('VehicleSecurity', {
+    id: {
+        type: DataTypes.INTEGER,
+        autoIncrement: true,
+        primaryKey: true
+    },
     voiture_id: {
         type: DataTypes.BIGINT.UNSIGNED,
         allowNull: false,
@@ -11,14 +16,17 @@ const VehicleSecurity = sequelize.define('VehicleSecurity', {
         }
     },
     is_active: {
-        type: DataTypes.BOOLEAN,
-        defaultValue: false
+        type: DataTypes.TINYINT,
+        defaultValue: 0,
+        allowNull: true
     },
     parked_latitude: {
-        type: DataTypes.DECIMAL(10, 8)
+        type: DataTypes.DECIMAL(10, 8),
+        allowNull: true
     },
     parked_longitude: {
-        type: DataTypes.DECIMAL(11, 8)
+        type: DataTypes.DECIMAL(11, 8),
+        allowNull: true
     },
     activated_at: {
         type: DataTypes.DATE,
@@ -26,7 +34,9 @@ const VehicleSecurity = sequelize.define('VehicleSecurity', {
     }
 }, {
     tableName: 'vehicle_security',
-    timestamps: true
+    timestamps: true,
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
 });
 
 module.exports = VehicleSecurity;
