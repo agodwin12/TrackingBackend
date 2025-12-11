@@ -75,7 +75,8 @@ exports.getUserSettings = async (req, res) => {
                 'geofence_alerts_enabled',
                 'safe_zone_alerts_enabled',
                 'speed_alerts_enabled',
-                'time_zone_alerts_enabled'
+                'time_zone_alerts_enabled',
+                'battery_alerts_enabled'  // ✅ ADDED
             ]
         });
 
@@ -91,7 +92,8 @@ exports.getUserSettings = async (req, res) => {
             geofenceAlertsEnabled: user.geofence_alerts_enabled !== false,
             safeZoneAlertsEnabled: user.safe_zone_alerts_enabled !== false,
             speedAlertsEnabled: user.speed_alerts_enabled !== false,
-            timeZoneAlertsEnabled: user.time_zone_alerts_enabled !== false
+            timeZoneAlertsEnabled: user.time_zone_alerts_enabled !== false,
+            batteryAlertsEnabled: user.battery_alerts_enabled !== false  // ✅ ADDED
         };
 
         console.log("✅ User settings retrieved for:", user.email);
@@ -130,7 +132,8 @@ exports.updateUserSettings = async (req, res) => {
             geofenceAlertsEnabled,
             safeZoneAlertsEnabled,
             speedAlertsEnabled,
-            timeZoneAlertsEnabled
+            timeZoneAlertsEnabled,
+            batteryAlertsEnabled  // ✅ ADDED
         } = req.body;
 
         console.log("\n📌 [updateUserSettings] Request received");
@@ -140,7 +143,8 @@ exports.updateUserSettings = async (req, res) => {
             geofenceAlertsEnabled,
             safeZoneAlertsEnabled,
             speedAlertsEnabled,
-            timeZoneAlertsEnabled
+            timeZoneAlertsEnabled,
+            batteryAlertsEnabled  // ✅ ADDED
         });
 
         const user = await User.findByPk(userId);
@@ -168,6 +172,9 @@ exports.updateUserSettings = async (req, res) => {
         if (typeof timeZoneAlertsEnabled === "boolean") {
             user.time_zone_alerts_enabled = timeZoneAlertsEnabled;
         }
+        if (typeof batteryAlertsEnabled === "boolean") {  // ✅ ADDED
+            user.battery_alerts_enabled = batteryAlertsEnabled;
+        }
 
         await user.save();
 
@@ -183,7 +190,8 @@ exports.updateUserSettings = async (req, res) => {
                     geofenceAlertsEnabled: user.geofence_alerts_enabled,
                     safeZoneAlertsEnabled: user.safe_zone_alerts_enabled,
                     speedAlertsEnabled: user.speed_alerts_enabled,
-                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled
+                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled,
+                    batteryAlertsEnabled: user.battery_alerts_enabled  // ✅ ADDED
                 }
             }
         });
@@ -209,7 +217,8 @@ exports.updateAlertSettings = async (req, res) => {
             geofenceAlertsEnabled,
             safeZoneAlertsEnabled,
             speedAlertsEnabled,
-            timeZoneAlertsEnabled
+            timeZoneAlertsEnabled,
+            batteryAlertsEnabled  // ✅ ADDED
         } = req.body;
 
         console.log("\n📌 [updateAlertSettings] Request received");
@@ -218,6 +227,7 @@ exports.updateAlertSettings = async (req, res) => {
         console.log("➡ Safe Zone Alerts:", safeZoneAlertsEnabled);
         console.log("➡ Speed Alerts:", speedAlertsEnabled);
         console.log("➡ Time Zone Alerts:", timeZoneAlertsEnabled);
+        console.log("➡ Battery Alerts:", batteryAlertsEnabled);  // ✅ ADDED
 
         const user = await User.findByPk(userId);
 
@@ -241,6 +251,9 @@ exports.updateAlertSettings = async (req, res) => {
         if (typeof timeZoneAlertsEnabled === "boolean") {
             user.time_zone_alerts_enabled = timeZoneAlertsEnabled;
         }
+        if (typeof batteryAlertsEnabled === "boolean") {  // ✅ ADDED
+            user.battery_alerts_enabled = batteryAlertsEnabled;
+        }
 
         await user.save();
 
@@ -255,7 +268,8 @@ exports.updateAlertSettings = async (req, res) => {
                     geofenceAlertsEnabled: user.geofence_alerts_enabled,
                     safeZoneAlertsEnabled: user.safe_zone_alerts_enabled,
                     speedAlertsEnabled: user.speed_alerts_enabled,
-                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled
+                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled,
+                    batteryAlertsEnabled: user.battery_alerts_enabled  // ✅ ADDED
                 }
             }
         });

@@ -66,7 +66,12 @@ const User = sequelize.define("users", {
         defaultValue: true,
         field: 'time_zone_alerts_enabled'
     },
-    // ✅ NEW: Geofence alerts preference
+    battery_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: true,
+        allowNull: false,
+        comment: 'Enable/disable low battery alerts'
+    },
     geofence_alerts_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
