@@ -19,7 +19,11 @@ exports.getVehicleTrips = async (req, res) => {
             return res.status(404).json({ success: false, message: "Vehicle not found" });
         }
 
-        const whereClause = { vehicle_id: vehicleId };
+        const whereClause = {
+            vehicle_id: vehicleId,
+            status: 'completed'  // Only show completed trips
+        };
+
         if (startDate || endDate) {
             whereClause.start_time = {};
             if (startDate) {

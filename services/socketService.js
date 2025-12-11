@@ -296,10 +296,7 @@ class SocketService {
         return Array.from(this.connectedClients.keys());
     }
 
-    /**
-     * Get connection statistics
-     * @returns {Object}
-     */
+
     getStats() {
         return {
             totalConnections: this.io ? this.io.engine.clientsCount : 0,

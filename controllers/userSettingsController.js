@@ -73,7 +73,9 @@ exports.getUserSettings = async (req, res) => {
                 'phone',
                 'trip_tracking_enabled',
                 'geofence_alerts_enabled',
-                'safe_zone_alerts_enabled'
+                'safe_zone_alerts_enabled',
+                'speed_alerts_enabled',
+                'time_zone_alerts_enabled'
             ]
         });
 
@@ -86,8 +88,10 @@ exports.getUserSettings = async (req, res) => {
 
         const settings = {
             tripTrackingEnabled: user.trip_tracking_enabled || false,
-            geofenceAlertsEnabled: user.geofence_alerts_enabled !== false, // Default true
-            safeZoneAlertsEnabled: user.safe_zone_alerts_enabled !== false, // Default true
+            geofenceAlertsEnabled: user.geofence_alerts_enabled !== false,
+            safeZoneAlertsEnabled: user.safe_zone_alerts_enabled !== false,
+            speedAlertsEnabled: user.speed_alerts_enabled !== false,
+            timeZoneAlertsEnabled: user.time_zone_alerts_enabled !== false
         };
 
         console.log("✅ User settings retrieved for:", user.email);
@@ -121,11 +125,23 @@ exports.getUserSettings = async (req, res) => {
 exports.updateUserSettings = async (req, res) => {
     try {
         const { userId } = req.params;
-        const { tripTrackingEnabled, geofenceAlertsEnabled, safeZoneAlertsEnabled } = req.body;
+        const {
+            tripTrackingEnabled,
+            geofenceAlertsEnabled,
+            safeZoneAlertsEnabled,
+            speedAlertsEnabled,
+            timeZoneAlertsEnabled
+        } = req.body;
 
         console.log("\n📌 [updateUserSettings] Request received");
         console.log("➡ User ID:", userId);
-        console.log("➡ Settings:", { tripTrackingEnabled, geofenceAlertsEnabled, safeZoneAlertsEnabled });
+        console.log("➡ Settings:", {
+            tripTrackingEnabled,
+            geofenceAlertsEnabled,
+            safeZoneAlertsEnabled,
+            speedAlertsEnabled,
+            timeZoneAlertsEnabled
+        });
 
         const user = await User.findByPk(userId);
 
@@ -146,6 +162,12 @@ exports.updateUserSettings = async (req, res) => {
         if (typeof safeZoneAlertsEnabled === "boolean") {
             user.safe_zone_alerts_enabled = safeZoneAlertsEnabled;
         }
+        if (typeof speedAlertsEnabled === "boolean") {
+            user.speed_alerts_enabled = speedAlertsEnabled;
+        }
+        if (typeof timeZoneAlertsEnabled === "boolean") {
+            user.time_zone_alerts_enabled = timeZoneAlertsEnabled;
+        }
 
         await user.save();
 
@@ -159,7 +181,9 @@ exports.updateUserSettings = async (req, res) => {
                 settings: {
                     tripTrackingEnabled: user.trip_tracking_enabled,
                     geofenceAlertsEnabled: user.geofence_alerts_enabled,
-                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled
+                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled,
+                    speedAlertsEnabled: user.speed_alerts_enabled,
+                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled
                 }
             }
         });
@@ -175,18 +199,25 @@ exports.updateUserSettings = async (req, res) => {
 };
 
 /**
- * ✅ Update alert settings (geofence and safe zone)
+ * Update alert settings (all alert types)
  * PUT /api/users-settings/:userId/settings/alerts
  */
 exports.updateAlertSettings = async (req, res) => {
     try {
         const { userId } = req.params;
-        const { geofenceAlertsEnabled, safeZoneAlertsEnabled } = req.body;
+        const {
+            geofenceAlertsEnabled,
+            safeZoneAlertsEnabled,
+            speedAlertsEnabled,
+            timeZoneAlertsEnabled
+        } = req.body;
 
         console.log("\n📌 [updateAlertSettings] Request received");
         console.log("➡ User ID:", userId);
         console.log("➡ Geofence Alerts:", geofenceAlertsEnabled);
         console.log("➡ Safe Zone Alerts:", safeZoneAlertsEnabled);
+        console.log("➡ Speed Alerts:", speedAlertsEnabled);
+        console.log("➡ Time Zone Alerts:", timeZoneAlertsEnabled);
 
         const user = await User.findByPk(userId);
 
@@ -204,6 +235,12 @@ exports.updateAlertSettings = async (req, res) => {
         if (typeof safeZoneAlertsEnabled === "boolean") {
             user.safe_zone_alerts_enabled = safeZoneAlertsEnabled;
         }
+        if (typeof speedAlertsEnabled === "boolean") {
+            user.speed_alerts_enabled = speedAlertsEnabled;
+        }
+        if (typeof timeZoneAlertsEnabled === "boolean") {
+            user.time_zone_alerts_enabled = timeZoneAlertsEnabled;
+        }
 
         await user.save();
 
@@ -214,10 +251,11 @@ exports.updateAlertSettings = async (req, res) => {
             message: "Alert settings updated successfully",
             data: {
                 userId: user.id,
-                settings: {
-                    tripTrackingEnabled: user.trip_tracking_enabled,
+                alertSettings: {
                     geofenceAlertsEnabled: user.geofence_alerts_enabled,
-                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled
+                    safeZoneAlertsEnabled: user.safe_zone_alerts_enabled,
+                    speedAlertsEnabled: user.speed_alerts_enabled,
+                    timeZoneAlertsEnabled: user.time_zone_alerts_enabled
                 }
             }
         });

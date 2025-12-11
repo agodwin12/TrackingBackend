@@ -1,7 +1,7 @@
 // controllers/geofenceMonitorController.js
 
 const VehicleSecurity = require('../models/vehicleSecurity');
-const Alert = require('../models/alert');
+const Alert = require('../models/Alert');
 const notificationController = require('./notificationController');
 const sequelize = require('../config/database');
 const { isInsideGeofence } = require('../services/geofenceService');

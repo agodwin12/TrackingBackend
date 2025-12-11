@@ -76,7 +76,11 @@ const Trip = sequelize.define("trips", {
         type: DataTypes.DECIMAL(5, 2),
         allowNull: true
     },
-
+    status: {
+        type: DataTypes.ENUM('ongoing', 'completed'),
+        allowNull: false,
+        defaultValue: 'completed'
+    },
     // Metadata
     waypoint_count: {
         type: DataTypes.INTEGER,

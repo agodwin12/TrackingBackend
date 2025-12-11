@@ -5,19 +5,18 @@ const TripWaypoint = require("../models/tripWaypoint");
 const Voiture = require("../models/voiture");
 const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
-const GeocodingService = require("./GeocodingService");
+const GeocodingService = require("./geocodingService");
 const sequelize = require("../config/database");
 
 class TripDetectionService {
-    // ---- SETTINGS ----
-    static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 10); // ✅ Changed from 2 to 10 minutes
-    static END_GAP_MINUTES = Number(process.env.TRIP_END_GAP_MIN ?? 5);
+// ---- SETTINGS ----
+    static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 0.5);
     static MIN_SPEED_THRESHOLD = Number(process.env.TRIP_MIN_SPEED_KMH ?? 1);
     static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 1);
     static MIN_TRIP_DISTANCE_KM = Number(process.env.TRIP_MIN_DISTANCE_KM ?? 0.2);
 
     // ======================================================
-    // 🔍 Get vehicles with unprocessed location data
+    // 🔍 Main entry point
     // ======================================================
     static async detectAndCreateTrips() {
         console.log("\n🛰️ === TRIP DETECTION START ===");
@@ -38,7 +37,7 @@ class TripDetectionService {
         }
 
         console.log(`\n🏁 Trip Detection Finished`);
-        console.log(`Trips Created: ${totalTrips}`);
+        console.log(`Trips Created/Updated: ${totalTrips}`);
         console.log(`Vehicles Skipped: ${skipped}`);
     }
 
@@ -82,9 +81,7 @@ class TripDetectionService {
 
         console.log(`🚗 Vehicle ID: ${vehicle.id} | Plate: ${vehicle.immatriculation}`);
 
-        // ======================================================
-        // 🆕 FETCH USER USING association_user_voitures
-        // ======================================================
+        // Get user and check preferences
         const assoc = await AssocUserVoitures.findOne({
             where: { voiture_id: vehicle.id },
             attributes: ["user_id"],
@@ -98,177 +95,373 @@ class TripDetectionService {
         }
 
         const userId = assoc.user_id;
-        console.log(`👤 Vehicle belongs to User ID: ${userId}`);
-
-        // Fetch user preferences
         const user = await User.findByPk(userId, {
-            attributes: ["id", "nom", "prenom", "email", "trip_tracking_enabled"],
+            attributes: ["id", "trip_tracking_enabled"],
             raw: true
         });
 
-        if (!user) {
-            console.log("⚠️ User not found → Mark processed");
-            await Location.update({ processed: true }, { where: { mac_id_gps: macIdGps } });
-            return { skipped: false, tripsCreated: 0 };
-        }
-
-        if (!user.trip_tracking_enabled) {
-            console.log("🚫 Trip tracking disabled → Skipping");
+        if (!user || !user.trip_tracking_enabled) {
+            console.log("🚫 Trip tracking disabled → Mark processed");
             await Location.update({ processed: true }, { where: { mac_id_gps: macIdGps } });
             return { skipped: true, tripsCreated: 0 };
         }
 
         console.log("✅ Trip tracking ENABLED - Processing trips...");
 
-        const trips = this.detectTripsFromLocations(locations, vehicle.id, macIdGps);
+        // Check for ongoing trip
+        const ongoingTrip = await this.getOngoingTrip(vehicle.id, macIdGps);
 
-        let saved = 0;
-        for (const t of trips) {
-            if (await this.saveTripToDatabase(t)) saved++;
-        }
+        // Process locations and detect/update trips
+        const tripsProcessed = await this.detectAndProcessTrips(
+            locations,
+            vehicle.id,
+            macIdGps,
+            ongoingTrip
+        );
 
-        return { skipped: false, tripsCreated: saved };
+        return { skipped: false, tripsCreated: tripsProcessed };
     }
 
     // ======================================================
-    // 🧠 TRIP DETECTION ALGORITHM
+    // 🔍 GET ONGOING TRIP
     // ======================================================
-    static detectTripsFromLocations(locations, vehicleId, macIdGps) {
-        const trips = [];
-        let inTrip = false;
-        let current = null;
-        let lastMove = null;
+    static async getOngoingTrip(vehicleId, macIdGps) {
+        try {
+            const ongoingTrip = await Trip.findOne({
+                where: {
+                    vehicle_id: vehicleId,
+                    mac_id_gps: macIdGps,
+                    status: 'ongoing'
+                },
+                order: [["created_at", "DESC"]],
+                raw: true
+            });
 
-        console.log(`🔍 Analyzing ${locations.length} location points with ${this.IDLE_THRESHOLD_MINUTES} min idle threshold...`);
+            if (ongoingTrip) {
+                console.log(`🔄 Found ongoing trip (ID: ${ongoingTrip.id}) started at ${ongoingTrip.start_time}`);
+
+                // Get waypoint count for sequence ordering
+                const waypointCount = await TripWaypoint.count({
+                    where: { trip_id: ongoingTrip.id }
+                });
+
+                return {
+                    ...ongoingTrip,
+                    currentWaypointCount: waypointCount
+                };
+            }
+
+            console.log("📍 No ongoing trip found");
+            return null;
+
+        } catch (err) {
+            console.error("❌ Error fetching ongoing trip:", err);
+            return null;
+        }
+    }
+
+    // ======================================================
+    // 🧠 IMPROVED TRIP DETECTION
+    // ======================================================
+    static async detectAndProcessTrips(locations, vehicleId, macIdGps, ongoingTrip) {
+        let tripsProcessed = 0;
+        let currentTrip = ongoingTrip;
+        let lastMovingTime = null;
+        let newLocationIds = [];
+        let newWaypoints = [];
+
+        // If continuing trip, set the last moving time
+        if (currentTrip) {
+            lastMovingTime = new Date(currentTrip.end_time);
+            console.log(`📍 Continuing from last known time: ${lastMovingTime}`);
+        }
 
         for (let i = 0; i < locations.length; i++) {
             const loc = locations[i];
             const speed = Number(loc.speed || 0);
-            const moving = speed >= this.MIN_SPEED_THRESHOLD;
+            const isMoving = speed >= this.MIN_SPEED_THRESHOLD;
+            const locTime = new Date(loc.sys_time);
 
-            if (!inTrip && moving) {
-                // ✅ Start a new trip
-                inTrip = true;
-                current = {
-                    vehicleId,
-                    macIdGps,
-                    startLocation: loc,
-                    endLocation: loc,
-                    waypoints: [loc],
-                    locationIds: [loc.id],
-                    startTime: new Date(loc.sys_time),
-                    lastPointTime: new Date(loc.sys_time)
-                };
-                lastMove = loc;
-                console.log(`🚀 Trip started at ${loc.sys_time}`);
+            // START NEW TRIP
+            if (!currentTrip && isMoving) {
+                console.log(`🚀 Starting new trip at ${loc.sys_time}`);
+
+                currentTrip = await this.createNewTrip(vehicleId, macIdGps, loc);
+                newLocationIds = [loc.id];
+                newWaypoints = [this.prepareWaypoint(loc, 1)];
+                lastMovingTime = locTime;
                 continue;
             }
 
-            if (inTrip) {
-                current.endLocation = loc;
-                current.waypoints.push(loc);
-                current.locationIds.push(loc.id);
+            // CONTINUE EXISTING TRIP
+            if (currentTrip) {
+                newLocationIds.push(loc.id);
 
-                if (moving) {
-                    // Vehicle is still moving
-                    lastMove = loc;
+                const sequenceOrder = currentTrip.currentWaypointCount
+                    ? currentTrip.currentWaypointCount + newWaypoints.length + 1
+                    : newWaypoints.length + 1;
+
+                newWaypoints.push(this.prepareWaypoint(loc, sequenceOrder));
+
+                if (isMoving) {
+                    // Vehicle is moving - update last moving time
+                    lastMovingTime = locTime;
                 } else {
-                    // ✅ Vehicle stopped - check idle time
-                    const idleMin = (new Date(loc.sys_time) - new Date(lastMove.sys_time)) / 60000;
+                    // Vehicle is stopped - check if idle long enough
+                    const idleMinutes = (locTime - lastMovingTime) / 60000;
 
-                    if (idleMin >= this.IDLE_THRESHOLD_MINUTES) {
-                        // ✅ Vehicle has been stopped for 10+ minutes → End trip
-                        console.log(`🛑 Trip ended after ${idleMin.toFixed(1)} min idle at ${loc.sys_time}`);
-                        trips.push(current);
-                        inTrip = false;
-                        current = null;
-                        lastMove = null;
-                    } else {
-                        // Still within idle threshold - continue trip
-                        console.log(`⏳ Vehicle idle for ${idleMin.toFixed(1)} min (threshold: ${this.IDLE_THRESHOLD_MINUTES} min)`);
+                    if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
+                        // END TRIP - Vehicle has been idle too long
+                        console.log(`🛑 Ending trip after ${idleMinutes.toFixed(1)} min idle`);
+
+                        const saved = await this.finalizeTrip(
+                            currentTrip,
+                            loc,
+                            newWaypoints,
+                            newLocationIds
+                        );
+
+                        if (saved) tripsProcessed++;
+
+                        // Reset for next trip
+                        currentTrip = null;
+                        lastMovingTime = null;
+                        newLocationIds = [];
+                        newWaypoints = [];
                     }
                 }
             }
         }
 
-        // Flush last trip if still in progress
-        if (inTrip && current) {
-            console.log(`🏁 Final trip flushed (still in progress)`);
-            trips.push(current);
+        // HANDLE ONGOING TRIP AT END
+        if (currentTrip && newWaypoints.length > 0) {
+            const lastLoc = locations[locations.length - 1];
+            const lastLocTime = new Date(lastLoc.sys_time);
+            const idleMinutes = (lastLocTime - lastMovingTime) / 60000;
+
+            if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
+                // Trip should end
+                console.log(`🏁 Finalizing trip - idle for ${idleMinutes.toFixed(1)} min`);
+                const saved = await this.finalizeTrip(
+                    currentTrip,
+                    lastLoc,
+                    newWaypoints,
+                    newLocationIds
+                );
+                if (saved) tripsProcessed++;
+            } else {
+                // Trip is still ongoing - just update it
+                console.log(`⏸️ Trip ongoing - updating with new data (idle: ${idleMinutes.toFixed(1)} min)`);
+                await this.updateOngoingTrip(
+                    currentTrip,
+                    lastLoc,
+                    newWaypoints,
+                    newLocationIds
+                );
+                tripsProcessed++;
+            }
         }
 
-        console.log(`✅ Detected ${trips.length} trip(s)`);
-        return trips;
+        return tripsProcessed;
     }
 
     // ======================================================
-    // 💾 SAVE TRIP + WAYPOINTS
+    // 🆕 CREATE NEW TRIP
     // ======================================================
-    static async saveTripToDatabase(t) {
-        const trx = await sequelize.transaction();
+    static async createNewTrip(vehicleId, macIdGps, startLocation) {
         try {
-            const metrics = this.calculateTripMetrics(t.waypoints);
-
-            console.log(`📊 Trip Metrics: ${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km`);
-
-            if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
-                metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
-                console.log(`⚠️ Trip too short - skipped (min: ${this.MIN_TRIP_DURATION_MIN} min, ${this.MIN_TRIP_DISTANCE_KM} km)`);
-                await trx.rollback();
-                return false;
-            }
-
             const startAddress = await GeocodingService.getAddress(
-                t.startLocation.latitude, t.startLocation.longitude
-            );
-
-            const endAddress = await GeocodingService.getAddress(
-                t.endLocation.latitude, t.endLocation.longitude
+                startLocation.latitude,
+                startLocation.longitude
             );
 
             const trip = await Trip.create({
-                vehicle_id: t.vehicleId,
-                mac_id_gps: t.macIdGps,
-                start_time: t.startLocation.sys_time,
-                end_time: t.endLocation.sys_time,
-                duration_minutes: Math.round(metrics.durationMinutes),
-                start_latitude: t.startLocation.latitude,
-                start_longitude: t.startLocation.longitude,
+                vehicle_id: vehicleId,
+                mac_id_gps: macIdGps,
+                start_time: startLocation.sys_time,
+                end_time: startLocation.sys_time,
+                start_latitude: startLocation.latitude,
+                start_longitude: startLocation.longitude,
                 start_address: startAddress,
-                end_latitude: t.endLocation.latitude,
-                end_longitude: t.endLocation.longitude,
-                end_address: endAddress,
+                end_latitude: startLocation.latitude,
+                end_longitude: startLocation.longitude,
+                end_address: startAddress,
+                status: 'ongoing',
+                duration_minutes: 0,
+                total_distance_km: 0,
+                avg_speed_kmh: 0,
+                max_speed_kmh: 0,
+                waypoint_count: 0
+            });
+
+            console.log(`✅ Created new trip (ID: ${trip.id})`);
+
+            return {
+                id: trip.id,
+                vehicle_id: vehicleId,
+                mac_id_gps: macIdGps,
+                start_time: startLocation.sys_time,
+                end_time: startLocation.sys_time,
+                status: 'ongoing',
+                currentWaypointCount: 0
+            };
+
+        } catch (err) {
+            console.error("❌ Error creating trip:", err);
+            return null;
+        }
+    }
+
+    // ======================================================
+    // 📊 UPDATE ONGOING TRIP
+    // ======================================================
+    static async updateOngoingTrip(currentTrip, endLocation, newWaypoints, locationIds) {
+        const trx = await sequelize.transaction();
+
+        try {
+            // Add new waypoints
+            if (newWaypoints.length > 0) {
+                await TripWaypoint.bulkCreate(
+                    newWaypoints.map(w => ({ ...w, trip_id: currentTrip.id })),
+                    { transaction: trx }
+                );
+            }
+
+            // Calculate metrics for all waypoints
+            const allWaypoints = await TripWaypoint.findAll({
+                where: { trip_id: currentTrip.id },
+                order: [["sequence_order", "ASC"]],
+                raw: true,
+                transaction: trx
+            });
+
+            const metrics = this.calculateTripMetrics(allWaypoints);
+
+            // Update trip
+            await Trip.update({
+                end_time: endLocation.sys_time,
+                end_latitude: endLocation.latitude,
+                end_longitude: endLocation.longitude,
+                duration_minutes: Math.round(metrics.durationMinutes),
                 total_distance_km: metrics.totalDistanceKm,
                 avg_speed_kmh: metrics.avgSpeed,
                 max_speed_kmh: metrics.maxSpeed,
-                waypoint_count: t.waypoints.length
-            }, { transaction: trx });
+                waypoint_count: allWaypoints.length
+            }, {
+                where: { id: currentTrip.id },
+                transaction: trx
+            });
 
-            const waypoints = t.waypoints.map((w, i) => ({
-                trip_id: trip.id,
-                latitude: w.latitude,
-                longitude: w.longitude,
-                speed: w.speed,
-                recorded_at: w.sys_time,
-                sequence_order: i + 1
-            }));
-
-            await TripWaypoint.bulkCreate(waypoints, { transaction: trx });
-
+            // Mark locations as processed
             await Location.update(
-                { processed: true, trip_id: trip.id },
-                { where: { id: t.locationIds }, transaction: trx }
+                { processed: true, trip_id: currentTrip.id },
+                { where: { id: locationIds }, transaction: trx }
             );
 
             await trx.commit();
-            console.log(`✅ Trip saved: ID ${trip.id}`);
+            console.log(`✅ Updated ongoing trip (ID: ${currentTrip.id}) with ${newWaypoints.length} new waypoints`);
+
+        } catch (err) {
+            await trx.rollback();
+            console.error("❌ Error updating ongoing trip:", err);
+        }
+    }
+
+    // ======================================================
+    // 🏁 FINALIZE TRIP
+    // ======================================================
+    static async finalizeTrip(currentTrip, endLocation, newWaypoints, locationIds) {
+        const trx = await sequelize.transaction();
+
+        try {
+            // Add new waypoints
+            if (newWaypoints.length > 0) {
+                await TripWaypoint.bulkCreate(
+                    newWaypoints.map(w => ({ ...w, trip_id: currentTrip.id })),
+                    { transaction: trx }
+                );
+            }
+
+            // Get all waypoints for metrics
+            const allWaypoints = await TripWaypoint.findAll({
+                where: { trip_id: currentTrip.id },
+                order: [["sequence_order", "ASC"]],
+                raw: true,
+                transaction: trx
+            });
+
+            const metrics = this.calculateTripMetrics(allWaypoints);
+
+            // Check if trip meets minimum criteria
+            if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
+                metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
+                console.log(`⚠️ Trip too short - deleting (${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`);
+
+                // Delete trip and waypoints
+                await TripWaypoint.destroy({ where: { trip_id: currentTrip.id }, transaction: trx });
+                await Trip.destroy({ where: { id: currentTrip.id }, transaction: trx });
+
+                // Mark locations as processed but with no trip_id
+                await Location.update(
+                    { processed: true, trip_id: null },
+                    { where: { id: locationIds }, transaction: trx }
+                );
+
+                await trx.commit();
+                return false;
+            }
+
+            // Get end address
+            const endAddress = await GeocodingService.getAddress(
+                endLocation.latitude,
+                endLocation.longitude
+            );
+
+            // Finalize trip
+            await Trip.update({
+                end_time: endLocation.sys_time,
+                end_latitude: endLocation.latitude,
+                end_longitude: endLocation.longitude,
+                end_address: endAddress,
+                duration_minutes: Math.round(metrics.durationMinutes),
+                total_distance_km: metrics.totalDistanceKm,
+                avg_speed_kmh: metrics.avgSpeed,
+                max_speed_kmh: metrics.maxSpeed,
+                waypoint_count: allWaypoints.length,
+                status: 'completed'
+            }, {
+                where: { id: currentTrip.id },
+                transaction: trx
+            });
+
+            // Mark locations as processed
+            await Location.update(
+                { processed: true, trip_id: currentTrip.id },
+                { where: { id: locationIds }, transaction: trx }
+            );
+
+            await trx.commit();
+            console.log(`✅ Trip finalized (ID: ${currentTrip.id}): ${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km`);
             return true;
 
         } catch (err) {
             await trx.rollback();
-            console.error("❌ Save trip error:", err);
+            console.error("❌ Error finalizing trip:", err);
             return false;
         }
+    }
+
+    // ======================================================
+    // 🛠️ HELPER FUNCTIONS
+    // ======================================================
+    static prepareWaypoint(location, sequenceOrder) {
+        return {
+            latitude: location.latitude,
+            longitude: location.longitude,
+            speed: location.speed,
+            recorded_at: location.sys_time,
+            sequence_order: sequenceOrder
+        };
     }
 
     static calculateTripMetrics(waypoints) {
@@ -292,8 +485,8 @@ class TripDetectionService {
             if (s > 0) { sumSpeed += s; cntSpeed++; }
         }
 
-        const start = new Date(waypoints[0].sys_time);
-        const end = new Date(waypoints.at(-1).sys_time);
+        const start = new Date(waypoints[0].recorded_at);
+        const end = new Date(waypoints[waypoints.length - 1].recorded_at);
 
         return {
             totalDistanceKm: dist,

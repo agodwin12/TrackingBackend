@@ -1,10 +1,13 @@
-// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence)
+// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Battery)
 const axios = require('axios');
 const mysql = require('mysql2/promise');
 const cacheInvalidationService = require('./services/cacheInvalidationService');
 const socketService = require('./services/socketService');
 const { checkSafeZoneViolation } = require('./controllers/safeZoneController');
 const { checkGeofenceViolation } = require('./controllers/geofenceMonitorController');
+const SpeedAlertService = require('./services/speedAlertService');
+const TimeZoneAlertService = require('./services/timeZoneAlertService');
+const BatteryAlertService = require('./services/batteryAlertService'); // ✅ NEW
 require('dotenv').config();
 
 // ========== CONFIGURATION FROM ENV ==========
@@ -149,6 +152,7 @@ async function saveLocationsToDatabase(connection, locations) {
                     const formattedDatetime = convertToDatetime(record[6]);
                     const formattedHeartTime = convertToDatetime(record[7]);
                     const macIdGps = record[11];
+                    const statenumber = record[19] || ''; // ✅ Battery data is here
 
                     const values = [
                         formattedSysTime,   // sys_time
@@ -175,6 +179,7 @@ async function saveLocationsToDatabase(connection, locations) {
                             speed: parseFloat(record[8]),
                             status: record[9],
                             direction: record[10],
+                            statenumber: statenumber, // ✅ Store for battery check
                             timestamp: formattedDatetime || new Date().toISOString()
                         });
 
@@ -190,18 +195,19 @@ async function saveLocationsToDatabase(connection, locations) {
 
         console.log(`\n✅ Total records saved: ${totalRecords}`);
 
-        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + SAFE ZONE CHECK + GEOFENCE CHECK
+        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + ALL ALERT CHECKS
         if (invalidatedVehicles.size > 0) {
             for (const macId of invalidatedVehicles) {
                 try {
                     const [vehicles] = await connection.execute(
-                        'SELECT id, model FROM voitures WHERE mac_id_gps = ?',
+                        'SELECT id, model, nickname FROM voitures WHERE mac_id_gps = ?',
                         [macId]
                     );
 
                     if (vehicles.length > 0) {
                         const vehicleId = vehicles[0].id;
                         const carModel = vehicles[0].model;
+                        const vehicleNickname = vehicles[0].nickname || vehicles[0].model;
                         const gpsData = gpsUpdates.get(macId);
 
                         // Cache invalidation
@@ -230,7 +236,10 @@ async function saveLocationsToDatabase(connection, locations) {
                             vehicleStatus: gpsStatus === "Connected" ? "Active" : "Inactive"
                         });
 
-                        // ✅ Safe zone violation check
+                        // ========== ALERT CHECKS ==========
+                        console.log(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
+
+                        // ✅ 1. Safe zone violation check
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (safeZoneResult.violation) {
@@ -243,7 +252,7 @@ async function saveLocationsToDatabase(connection, locations) {
                             console.error(`❌ Safe zone check error:`, safeZoneError.message);
                         }
 
-                        // ✅ Geofence violation check
+                        // ✅ 2. Geofence violation check
                         try {
                             const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (geofenceResult.violation) {
@@ -259,6 +268,48 @@ async function saveLocationsToDatabase(connection, locations) {
                         } catch (geofenceError) {
                             console.error(`❌ Geofence check error:`, geofenceError.message);
                         }
+
+                        // ✅ 3. Speed violation check
+                        try {
+                            await SpeedAlertService.checkSpeedViolation(
+                                vehicleId,
+                                macId,
+                                gpsData.speed,
+                                {
+                                    latitude: gpsData.latitude,
+                                    longitude: gpsData.longitude
+                                }
+                            );
+                        } catch (speedError) {
+                            console.error(`❌ Speed check error:`, speedError.message);
+                        }
+
+                        // ✅ 4. Time zone violation check
+                        try {
+                            await TimeZoneAlertService.checkTimeZoneViolation(
+                                vehicleId,
+                                macId,
+                                gpsData.speed,
+                                {
+                                    latitude: gpsData.latitude,
+                                    longitude: gpsData.longitude
+                                }
+                            );
+                        } catch (timeZoneError) {
+                            console.error(`❌ Time zone check error:`, timeZoneError.message);
+                        }
+
+                        // ✅ 5. Battery level check (NEW)
+                        try {
+                            await BatteryAlertService.checkBatteryLevel(
+                                { id: vehicleId, nickname: vehicleNickname },
+                                gpsData.statenumber
+                            );
+                        } catch (batteryError) {
+                            console.error(`❌ Battery check error:`, batteryError.message);
+                        }
+
+                        console.log(`✅ All alert checks completed for vehicle ${vehicleId}`);
                     }
                 } catch (error) {
                     console.error(`❌ Processing error for MAC ${macId}:`, error.message);

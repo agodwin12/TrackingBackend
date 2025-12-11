@@ -54,6 +54,18 @@ const User = sequelize.define("users", {
         defaultValue: false,
         comment: 'Whether trip tracking is enabled for this user',
     },
+    speed_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        field: 'speed_alerts_enabled'
+    },
+    time_zone_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        field: 'time_zone_alerts_enabled'
+    },
     // ✅ NEW: Geofence alerts preference
     geofence_alerts_enabled: {
         type: DataTypes.BOOLEAN,
