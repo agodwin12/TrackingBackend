@@ -1,191 +1,276 @@
-// services/batteryAlertService.js
-const { Voiture } = require('../models/voiture');
-const { Alert } = require('../models/alert');
-const { User } = require('../models/userModel');
+// services/deviceAlertService.js
+const Voiture = require('../models/voiture');
+const Alert = require('../models/alert');
+const User = require('../models/userModel');
 const firebaseService = require('./notificationService');
+const sequelize = require('../config/database');
 
-class BatteryAlertService {
+class DeviceAlertService {
     constructor() {
-        this.LOW_BATTERY_PERCENTAGE = 20; // Alert when battery below 20%
-        this.LOW_BATTERY_VOLTAGE = 3.6;   // Alert when voltage below 3.6V
-        this.ALERT_COOLDOWN_MINUTES = 60; // Send alert only once per hour
+        // Alarm type codes from GPS API (using hex as shown in documentation)
+        this.ALARM_TYPES = {
+            LOW_BATTERY: 0x08,      // 8 in decimal
+            POWER_FAILURE: 0x23,    // 35 in decimal
+            OFFLINE: 0x25,          // 37 in decimal
+            REMOVAL: 0x26           // 38 in decimal
+        };
+
+        // Configuration for each alarm type
+        this.ALARM_CONFIG = {
+            [0x08]: {
+                type: 'low_battery',
+                title: 'Low Battery Alert',
+                getMessage: (vehicleName) => `Low battery alarm detected for vehicle ${vehicleName}`,
+                cooldownMinutes: 60,
+                emoji: '🔋',
+                severity: 'warning'
+            },
+            [0x23]: {
+                type: 'power_failure',
+                title: 'Power Failure Alert',
+                getMessage: (vehicleName) => `Power failure detected for vehicle ${vehicleName}. Device may have been disconnected.`,
+                cooldownMinutes: 30,
+                emoji: '⚡',
+                severity: 'critical'
+            },
+            [0x25]: {
+                type: 'offline',
+                title: 'Device Offline Alert',
+                getMessage: (vehicleName) => `Vehicle ${vehicleName} GPS device is offline. No communication with server.`,
+                cooldownMinutes: 60,
+                emoji: '📡',
+                severity: 'critical'
+            },
+            [0x26]: {
+                type: 'device_removal',
+                title: 'Device Removal Alert',
+                getMessage: (vehicleName) => `⚠️ CRITICAL: GPS device removal detected on vehicle ${vehicleName}!`,
+                cooldownMinutes: 15,
+                emoji: '🚨',
+                severity: 'critical'
+            }
+        };
     }
 
-
-    async checkBatteryLevel(vehicleData, statenumber) {
+    /**
+     * Process any device alarm from GPS API
+     * @param {Object} alarmData - Alarm data from GPS API with type_id
+     */
+    async processAlarm(alarmData) {
         try {
-            // Parse statenumber to get battery info
-            // Format: "mil,oil,weight,temp,batteryV,powerV,gpscount,gsmlevel,..."
-            const stateArray = statenumber.split(',');
+            // Parse type_id (could be decimal or hex string)
+            const typeId = parseInt(alarmData.type_id);
 
-            if (stateArray.length < 5) {
-                console.log('⚠️ Statenumber format invalid for battery check');
+            // Check if this is a supported alarm type
+            const alarmConfig = this.ALARM_CONFIG[typeId];
+
+            if (!alarmConfig) {
+                console.log(`ℹ️ Alarm type ${typeId} (0x${typeId.toString(16)}) is not configured, skipping`);
                 return;
             }
 
-            const batteryValue = parseFloat(stateArray[4]) || 0;
+            console.log(`\n${alarmConfig.emoji} ========== ${alarmConfig.type.toUpperCase()} ALARM CHECK STARTED ==========`);
+            console.log(`📊 Alarm Data:`, JSON.stringify(alarmData, null, 2));
+            console.log(`🔍 Type ID: 0x${typeId.toString(16).toUpperCase()} (${typeId} decimal)`);
+            console.log(`⚠️ ${alarmConfig.type.toUpperCase()} ALARM DETECTED!`);
 
-            if (batteryValue === 0) {
-                return; // No battery data available
-            }
-
-            // Determine if it's percentage or voltage
-            let batteryPercentage = 0;
-            let batteryVoltage = 0;
-            let isLowBattery = false;
-
-            if (batteryValue < 100) {
-                // It's a percentage
-                batteryPercentage = batteryValue;
-                isLowBattery = batteryPercentage < this.LOW_BATTERY_PERCENTAGE;
-            } else {
-                // It's voltage (subtract 100 to get actual voltage)
-                batteryVoltage = batteryValue - 100;
-                isLowBattery = batteryVoltage < this.LOW_BATTERY_VOLTAGE;
-            }
-
-            if (!isLowBattery) {
-                return; // Battery level is good
-            }
-
-            // Check if user has battery alerts enabled
-            const vehicle = await Voiture.findByPk(vehicleData.id);
-            if (!vehicle) return;
-
-            const user = await User.findOne({ where: { id: vehicle.utilisateur_id } });
-            if (!user || !user.battery_alerts_enabled) {
-                console.log(`⚠️ Battery alerts disabled for vehicle ${vehicle.nickname}`);
+            // Get vehicle information
+            const macId = alarmData.macid || alarmData.mac_id;
+            if (!macId) {
+                console.log('❌ No MAC ID found in alarm data');
+                console.log(`${alarmConfig.emoji} ========== ALARM CHECK ENDED ==========\n`);
                 return;
             }
+
+            console.log(`🔍 Looking up vehicle with MAC ID: ${macId}`);
+
+            // Find vehicle by MAC ID
+            const vehicle = await Voiture.findOne({
+                where: { mac_id_gps: macId }
+            });
+
+            if (!vehicle) {
+                console.log(`❌ Vehicle not found with MAC ID: ${macId}`);
+                console.log(`${alarmConfig.emoji} ========== ALARM CHECK ENDED ==========\n`);
+                return;
+            }
+
+            console.log(`✅ Vehicle found: ${vehicle.nickname} (ID: ${vehicle.id})`);
+
+            // Find the user associated with this vehicle
+            console.log('🔍 Fetching user from association table...');
+            const [user] = await sequelize.query(`
+                SELECT u.*
+                FROM users u
+                INNER JOIN association_user_voitures auv ON u.id = auv.user_id
+                WHERE auv.voiture_id = ?
+                LIMIT 1
+            `, {
+                replacements: [vehicle.id],
+                type: sequelize.QueryTypes.SELECT
+            });
+
+            if (!user) {
+                console.log(`❌ No user found for vehicle ${vehicle.id}`);
+                console.log(`${alarmConfig.emoji} ========== ALARM CHECK ENDED ==========\n`);
+                return;
+            }
+
+            console.log(`✅ User found: ${user.nom} ${user.prenom} (ID: ${user.id})`);
+            console.log(`📱 User FCM Token: ${user.fcm_token ? 'Present' : 'Missing'}`);
 
             // Check cooldown - don't spam alerts
-            const lastAlert = await this.getLastBatteryAlert(vehicleData.id);
+            console.log('⏱️ Checking alert cooldown...');
+            const lastAlert = await this.getLastAlert(vehicle.id, alarmConfig.type);
+
             if (lastAlert) {
                 const minutesSinceLastAlert = (Date.now() - new Date(lastAlert.alerted_at).getTime()) / (1000 * 60);
-                if (minutesSinceLastAlert < this.ALERT_COOLDOWN_MINUTES) {
-                    console.log(`⏳ Battery alert cooldown active for vehicle ${vehicle.nickname} (${Math.round(minutesSinceLastAlert)}min ago)`);
+                console.log(`📅 Last alert was ${Math.round(minutesSinceLastAlert)} minutes ago`);
+                console.log(`⏰ Cooldown period: ${alarmConfig.cooldownMinutes} minutes`);
+
+                if (minutesSinceLastAlert < alarmConfig.cooldownMinutes) {
+                    console.log(`⏳ ${alarmConfig.type} alert cooldown active for vehicle ${vehicle.nickname}`);
+                    console.log(`⏳ Time remaining: ${Math.round(alarmConfig.cooldownMinutes - minutesSinceLastAlert)} minutes`);
+                    console.log(`${alarmConfig.emoji} ========== ALARM CHECK ENDED ==========\n`);
                     return;
                 }
+                console.log('✅ Cooldown period expired, proceeding with alert');
+            } else {
+                console.log('✅ No previous alert found, proceeding with alert');
             }
 
-            // Create battery alert
-            await this.createBatteryAlert(vehicle, batteryPercentage, batteryVoltage);
+            // Create alert
+            console.log(`🚨 Creating ${alarmConfig.type} alert...`);
+            await this.createAlert(vehicle, user, alarmData, alarmConfig);
 
-            console.log(`🔋 Low battery alert created for vehicle ${vehicle.nickname}`);
+            console.log(`${alarmConfig.emoji} ${alarmConfig.type} alert created for vehicle ${vehicle.nickname}`);
+            console.log(`${alarmConfig.emoji} ========== ALARM CHECK ENDED ==========\n`);
 
         } catch (error) {
-            console.error('🔥 Error checking battery level:', error);
+            console.error('🔥 Error processing alarm:', error);
+            console.error('🔥 Stack trace:', error.stack);
+            console.log('========== ALARM CHECK ENDED (ERROR) ==========\n');
         }
     }
 
     /**
-     * Get the last battery alert for a vehicle
+     * Get the last alert of a specific type for a vehicle
      */
-    async getLastBatteryAlert(vehicleId) {
+    async getLastAlert(vehicleId, alertType) {
         try {
+            console.log(`🔍 Querying last ${alertType} alert for vehicle ${vehicleId}...`);
             const alert = await Alert.findOne({
                 where: {
                     voiture_id: vehicleId,
-                    alert_type: 'battery'
+                    alert_type: alertType
                 },
                 order: [['alerted_at', 'DESC']]
             });
 
+            if (alert) {
+                console.log(`✅ Found last alert: ID ${alert.id}, created at ${alert.alerted_at}`);
+            } else {
+                console.log(`ℹ️ No previous ${alertType} alert found`);
+            }
+
             return alert;
         } catch (error) {
-            console.error('🔥 Error getting last battery alert:', error);
+            console.error(`🔥 Error getting last ${alertType} alert:`, error);
             return null;
         }
     }
 
     /**
-     * Create a low battery alert
+     * Create a device alert and send notification
      */
-    async createBatteryAlert(vehicle, batteryPercentage, batteryVoltage) {
+    async createAlert(vehicle, user, alarmData, alarmConfig) {
         try {
-            // Format message based on whether we have percentage or voltage
-            let message;
-            if (batteryPercentage > 0) {
-                message = `Vehicle ${vehicle.nickname} has low battery: ${batteryPercentage}% remaining`;
-            } else {
-                message = `Vehicle ${vehicle.nickname} has low battery: ${batteryVoltage.toFixed(1)}V`;
-            }
+            console.log('💾 Creating alert in database...');
+
+            const message = alarmConfig.getMessage(vehicle.nickname);
+            console.log(`📝 Alert Message: ${message}`);
+
+            // Get location from alarm data if available
+            const latitude = alarmData.weidu || alarmData.latitude || null;
+            const longitude = alarmData.jingdu || alarmData.longitude || null;
+
+            console.log(`📍 Location: ${latitude}, ${longitude}`);
 
             // Create alert in database
             const alert = await Alert.create({
                 voiture_id: vehicle.id,
-                alert_type: 'battery',
+                alert_type: alarmConfig.type,
                 message: message,
-                alert_status: 'active',
+                alert_status: 'ACTIVE',
+                latitude: latitude,
+                longitude: longitude,
                 alerted_at: new Date(),
                 read: false
             });
 
+            console.log(`✅ ✅ ✅ ${alarmConfig.type} alert saved to database with ID: ${alert.id}`);
+            console.log(`📊 Alert Details:`, {
+                id: alert.id,
+                voiture_id: alert.voiture_id,
+                alert_type: alert.alert_type,
+                message: alert.message,
+                severity: alarmConfig.severity,
+                alert_status: alert.alert_status,
+                latitude: alert.latitude,
+                longitude: alert.longitude,
+                alerted_at: alert.alerted_at
+            });
+
             // Send push notification via Firebase
-            const user = await User.findOne({ where: { id: vehicle.utilisateur_id } });
-            if (user && user.fcm_token) {
+            if (user.fcm_token) {
+                console.log('📲 Sending Firebase notification...');
                 await firebaseService.sendNotification(
                     user.fcm_token,
-                    'Low Battery Alert',
+                    alarmConfig.title,
                     message,
                     {
-                        type: 'battery',
+                        type: alarmConfig.type,
+                        severity: alarmConfig.severity,
                         vehicleId: vehicle.id.toString(),
                         alertId: alert.id.toString(),
-                        batteryLevel: batteryPercentage > 0 ? `${batteryPercentage}%` : `${batteryVoltage}V`
+                        latitude: latitude ? latitude.toString() : '',
+                        longitude: longitude ? longitude.toString() : ''
                     }
                 );
+                console.log('✅ Firebase notification sent successfully');
+            } else {
+                console.log('⚠️ No FCM token found, skipping push notification');
             }
 
             return alert;
         } catch (error) {
-            console.error('🔥 Error creating battery alert:', error);
+            console.error(`🔥 Error creating ${alarmConfig.type} alert:`, error);
+            console.error('🔥 Error details:', error.message);
             return null;
         }
     }
 
     /**
-     * Parse battery info from statenumber string
-     * @param {string} statenumber - Status string from GPS device
-     * @returns {Object} - { percentage, voltage, isLow }
+     * Check if an alarm type is supported
      */
-    static parseBatteryInfo(statenumber) {
-        try {
-            if (!statenumber) return { percentage: 0, voltage: 0, isLow: false };
+    isAlarmSupported(typeId) {
+        const parsedTypeId = parseInt(typeId);
+        return this.ALARM_CONFIG.hasOwnProperty(parsedTypeId);
+    }
 
-            const stateArray = statenumber.split(',');
-            if (stateArray.length < 5) return { percentage: 0, voltage: 0, isLow: false };
+    /**
+     * Get all supported alarm type IDs
+     */
+    getSupportedAlarmTypes() {
+        return Object.values(this.ALARM_TYPES);
+    }
 
-            const batteryValue = parseFloat(stateArray[4]) || 0;
-
-            if (batteryValue === 0) {
-                return { percentage: 0, voltage: 0, isLow: false };
-            }
-
-            let percentage = 0;
-            let voltage = 0;
-
-            if (batteryValue < 100) {
-                percentage = batteryValue;
-            } else {
-                voltage = batteryValue - 100;
-                // Estimate percentage from voltage (rough approximation)
-                // 4.2V = 100%, 3.7V = 50%, 3.3V = 0%
-                percentage = Math.max(0, Math.min(100, ((voltage - 3.3) / (4.2 - 3.3)) * 100));
-            }
-
-            const isLow = percentage < 20 || voltage < 3.6;
-
-            return {
-                percentage: Math.round(percentage),
-                voltage: voltage,
-                isLow
-            };
-        } catch (error) {
-            console.error('🔥 Error parsing battery info:', error);
-            return { percentage: 0, voltage: 0, isLow: false };
-        }
+    /**
+     * Get alarm configuration by type ID
+     */
+    getAlarmConfig(typeId) {
+        return this.ALARM_CONFIG[parseInt(typeId)] || null;
     }
 }
 
-module.exports = new BatteryAlertService();
+module.exports = new DeviceAlertService();

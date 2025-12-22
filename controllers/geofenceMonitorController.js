@@ -11,12 +11,9 @@ const axios = require('axios');
 // Google Maps API key for geocoding
 const GOOGLE_MAPS_API_KEY = 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
 
-// ✅ Track previous geofence state per vehicle (in-memory)
-const vehicleGeofenceState = new Map(); // vehicleId → { isInside: boolean, lastChecked: timestamp }
+// ✅ Cooldown period for geofence alerts (in minutes)
+const GEOFENCE_ALERT_COOLDOWN_MINUTES = 30; // Send alert every 30 minutes if still outside
 
-/**
- * ✅ Get user alert settings
- */
 /**
  * ✅ Get user alert settings from users table
  */
@@ -115,6 +112,39 @@ const reverseGeocode = async (latitude, longitude) => {
 };
 
 /**
+ * Get the last geofence alert for a vehicle
+ */
+const getLastGeofenceAlert = async (vehicleId) => {
+    try {
+        console.log(`🔍 Querying last geofence alert for vehicle ${vehicleId}...`);
+
+        const [alert] = await sequelize.query(
+            `SELECT id, alerted_at, message
+             FROM alerts
+             WHERE voiture_id = ?
+               AND alert_type = 'geofence'
+             ORDER BY alerted_at DESC
+                 LIMIT 1`,
+            {
+                replacements: [vehicleId],
+                type: sequelize.QueryTypes.SELECT
+            }
+        );
+
+        if (alert) {
+            console.log(`✅ Found last alert: ID ${alert.id}, created at ${alert.alerted_at}`);
+        } else {
+            console.log(`ℹ️ No previous geofence alert found`);
+        }
+
+        return alert;
+    } catch (error) {
+        console.error('🔥 Error getting last geofence alert:', error);
+        return null;
+    }
+};
+
+/**
  * Check if vehicle has left its geofence zone
  */
 const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
@@ -146,13 +176,6 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
 
         if (!security || !security.is_active) {
             console.log(`ℹ️ Geofencing not active for vehicle ${vehicleId}`);
-
-            // Clear state when geofencing is disabled
-            if (vehicleGeofenceState.has(vehicleId)) {
-                vehicleGeofenceState.delete(vehicleId);
-                console.log(`🗑️ Cleared geofence state for vehicle ${vehicleId}`);
-            }
-
             return { violation: false, reason: 'Geofencing not active' };
         }
 
@@ -184,63 +207,34 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
 
         console.log(`📍 Vehicle ${vehicleId} is ${isInside ? 'INSIDE' : 'OUTSIDE'} geofence`);
 
-        // ✅ Get previous state
-        const previousState = vehicleGeofenceState.get(vehicleId);
-        const wasInside = previousState ? previousState.isInside : null;
-
-        // ✅ Update current state
-        vehicleGeofenceState.set(vehicleId, {
-            isInside: isInside,
-            lastChecked: new Date()
-        });
-
-        // ✅ DETECT STATE CHANGE
-        if (wasInside === null) {
-            // First check - initialize state, no alert
-            console.log(`🆕 Initial geofence state for vehicle ${vehicleId}: ${isInside ? 'INSIDE' : 'OUTSIDE'}`);
-            return { violation: false, reason: 'Initial state recorded' };
+        // ✅ If vehicle is INSIDE, no violation - clear any active alerts
+        if (isInside) {
+            console.log(`✅ Vehicle ${vehicleId} is INSIDE geofence - no violation`);
+            return { violation: false, reason: 'Vehicle inside geofence' };
         }
 
-        // Check if state changed
-        const stateChanged = (wasInside !== isInside);
+        // ✅ Vehicle is OUTSIDE - check cooldown before creating alert
+        console.log(`🚨 Vehicle ${vehicleId} is OUTSIDE geofence - checking cooldown...`);
 
-        if (!stateChanged) {
-            // No state change - do nothing
-            console.log(`✅ Geofence state unchanged for vehicle ${vehicleId}: ${isInside ? 'INSIDE' : 'OUTSIDE'}`);
-            return { violation: false, reason: 'No state change' };
-        }
+        const lastAlert = await getLastGeofenceAlert(vehicleId);
 
-        // ✅ STATE CHANGED! Process alert
-        const alertType = isInside ? 'RETURN' : 'EXIT';
+        if (lastAlert) {
+            const minutesSinceLastAlert = (Date.now() - new Date(lastAlert.alerted_at).getTime()) / (1000 * 60);
+            console.log(`📅 Last geofence alert was ${Math.round(minutesSinceLastAlert)} minutes ago`);
+            console.log(`⏰ Cooldown period: ${GEOFENCE_ALERT_COOLDOWN_MINUTES} minutes`);
 
-        if (!isInside) {
-            console.log(`🚨 GEOFENCE EXIT detected for vehicle ${vehicleId} (LEFT the safe area)`);
-        } else {
-            console.log(`✅ GEOFENCE RETURN detected for vehicle ${vehicleId} (RETURNED to safe area)`);
-        }
-
-        // Check if unread alert already exists
-        const [existingAlert] = await sequelize.query(
-            `SELECT id, created_at FROM alerts 
-             WHERE voiture_id = ? 
-             AND alert_type = 'geofence' 
-             AND \`read\` = 0 
-             AND alert_status = 'ACTIVE'
-             ORDER BY created_at DESC 
-             LIMIT 1`,
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
+            if (minutesSinceLastAlert < GEOFENCE_ALERT_COOLDOWN_MINUTES) {
+                console.log(`⏳ Geofence alert cooldown active for vehicle ${vehicleId}`);
+                console.log(`⏳ Time remaining: ${Math.round(GEOFENCE_ALERT_COOLDOWN_MINUTES - minutesSinceLastAlert)} minutes`);
+                return {
+                    violation: true,
+                    reason: 'Cooldown active',
+                    isFirstAlert: false
+                };
             }
-        );
-
-        if (existingAlert) {
-            console.log(`⏳ Unread ${alertType} alert already exists for vehicle ${vehicleId}`);
-            return {
-                violation: alertType === 'EXIT',
-                reason: 'Unread alert exists',
-                existingAlertId: existingAlert.id
-            };
+            console.log('✅ Cooldown period expired, proceeding with alert');
+        } else {
+            console.log('✅ No previous geofence alert found, proceeding with alert');
         }
 
         // Get vehicle name
@@ -257,7 +251,7 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
 
         if (!vehicleOwner || !vehicleOwner.user_id) {
             console.warn(`⚠️ No owner found for vehicle ${vehicleId}`);
-            return { violation: alertType === 'EXIT', reason: 'No owner found' };
+            return { violation: true, reason: 'No owner found' };
         }
 
         const userId = vehicleOwner.user_id;
@@ -273,18 +267,18 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
             const locationInfo = await reverseGeocode(latitude, longitude);
 
             // Create alert in database (for history) but DON'T send notification
-            await createGeofenceAlert(vehicleId, vehicleName, latitude, longitude, locationInfo, alertType, false);
+            await createGeofenceAlert(vehicleId, vehicleName, latitude, longitude, locationInfo, false);
 
             return {
-                violation: alertType === 'EXIT',
+                violation: true,
                 reason: 'Alert created but notifications disabled',
                 alertsSent: false,
-                alertType: alertType,
                 vehicleName,
                 latitude,
                 longitude,
                 locationName: locationInfo.locality,
-                userId
+                userId,
+                isFirstAlert: true
             };
         }
 
@@ -292,24 +286,18 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
         const locationInfo = await reverseGeocode(latitude, longitude);
 
         // Create alert in database
-        await createGeofenceAlert(vehicleId, vehicleName, latitude, longitude, locationInfo, alertType, true);
+        await createGeofenceAlert(vehicleId, vehicleName, latitude, longitude, locationInfo, true);
 
         // Send push notification (alerts enabled)
-        await sendGeofencePushNotification(userId, vehicleId, vehicleName, latitude, longitude, locationInfo, alertType);
+        await sendGeofencePushNotification(userId, vehicleId, vehicleName, latitude, longitude, locationInfo);
 
         // Emit via Socket.IO
         try {
             if (socketService.isInitialized()) {
-                const socketEventType = alertType === 'EXIT' ? 'geofence_exit' : 'geofence_return';
-                const socketTitle = alertType === 'EXIT' ? '⚠️ Geofence Alert' : '✅ Geofence Alert';
-                const socketMessage = alertType === 'EXIT'
-                    ? `${vehicleName} has LEFT your defined geofence area`
-                    : `${vehicleName} has RETURNED to your defined geofence area`;
-
                 socketService.emitToVehicle(vehicleId, 'geofence_alert', {
-                    type: socketEventType,
-                    title: socketTitle,
-                    message: socketMessage,
+                    type: 'geofence_violation',
+                    title: '⚠️ Geofence Violation',
+                    message: `${vehicleName} is OUTSIDE your defined geofence area`,
                     vehicleId: vehicleId,
                     vehicleName: vehicleName,
                     latitude: latitude,
@@ -318,15 +306,14 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
                     formattedAddress: locationInfo.formattedAddress,
                     timestamp: new Date().toISOString()
                 });
-                console.log(`✅ Socket.IO ${alertType} alert emitted to vehicle ${vehicleId}`);
+                console.log(`✅ Socket.IO geofence alert emitted to vehicle ${vehicleId}`);
             }
         } catch (socketError) {
             console.error(`⚠️ Socket.IO emit failed:`, socketError.message);
         }
 
         return {
-            violation: alertType === 'EXIT',
-            alertType: alertType,
+            violation: true,
             vehicleName,
             latitude,
             longitude,
@@ -346,11 +333,9 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
 /**
  * Create an alert record in the database
  */
-const createGeofenceAlert = async (vehicleId, vehicleName, latitude, longitude, locationInfo, alertType, notificationSent) => {
+const createGeofenceAlert = async (vehicleId, vehicleName, latitude, longitude, locationInfo, notificationSent) => {
     try {
-        const message = alertType === 'EXIT'
-            ? `${vehicleName} has LEFT your defined geofence area near ${locationInfo.locality}`
-            : `${vehicleName} has RETURNED to your defined geofence area near ${locationInfo.locality}`;
+        const message = `${vehicleName} is OUTSIDE your defined geofence area near ${locationInfo.locality}`;
 
         await Alert.create({
             voiture_id: vehicleId,
@@ -360,11 +345,11 @@ const createGeofenceAlert = async (vehicleId, vehicleName, latitude, longitude, 
             longitude: longitude,
             alert_status: 'ACTIVE',
             alerted_at: new Date(),
-            sent: notificationSent ? false : false, // Will be updated after notification sent
+            sent: notificationSent,
             read: false
         });
 
-        console.log(`✅ Geofence ${alertType} alert created for vehicle ${vehicleId} at ${locationInfo.locality}`);
+        console.log(`✅ ✅ ✅ Geofence alert created for vehicle ${vehicleId} at ${locationInfo.locality}`);
     } catch (error) {
         console.error(`❌ Error creating geofence alert:`, error);
     }
@@ -373,20 +358,18 @@ const createGeofenceAlert = async (vehicleId, vehicleName, latitude, longitude, 
 /**
  * Send push notification via Firebase Cloud Messaging
  */
-const sendGeofencePushNotification = async (userId, vehicleId, vehicleName, latitude, longitude, locationInfo, alertType) => {
+const sendGeofencePushNotification = async (userId, vehicleId, vehicleName, latitude, longitude, locationInfo) => {
     try {
-        console.log(`📤 Sending geofence ${alertType} FCM notification to user ${userId}`);
+        console.log(`📤 Sending geofence FCM notification to user ${userId}`);
 
-        const title = alertType === 'EXIT' ? '⚠️ Geofence Alert' : '✅ Geofence Alert';
-        const body = alertType === 'EXIT'
-            ? `${vehicleName} has LEFT your defined geofence area near ${locationInfo.locality}`
-            : `${vehicleName} has RETURNED to your defined geofence area near ${locationInfo.locality}`;
+        const title = '⚠️ Geofence Violation';
+        const body = `${vehicleName} is OUTSIDE your defined geofence area near ${locationInfo.locality}`;
 
         await notificationController.sendToUser(userId, {
             title: title,
             body: body,
             data: {
-                type: alertType === 'EXIT' ? 'geofence_exit' : 'geofence_return',
+                type: 'geofence_violation',
                 vehicleId: String(vehicleId),
                 vehicleName: vehicleName,
                 latitude: String(latitude),
@@ -397,21 +380,7 @@ const sendGeofencePushNotification = async (userId, vehicleId, vehicleName, lati
             }
         });
 
-        // Mark alert as sent
-        await sequelize.query(
-            `UPDATE alerts
-             SET \`sent\` = 1, updated_at = NOW()
-             WHERE voiture_id = ?
-               AND alert_type = 'geofence'
-               AND \`sent\` = 0
-                 ORDER BY created_at DESC 
-             LIMIT 1`,
-            {
-                replacements: [vehicleId]
-            }
-        );
-
-        console.log(`✅ Geofence ${alertType} FCM notification sent for vehicle ${vehicleId}`);
+        console.log(`✅ Geofence FCM notification sent for vehicle ${vehicleId}`);
 
     } catch (error) {
         console.error(`❌ Error sending geofence FCM notification:`, error);

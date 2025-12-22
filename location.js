@@ -1,4 +1,4 @@
-// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Battery)
+// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Device Alarms)
 const axios = require('axios');
 const mysql = require('mysql2/promise');
 const cacheInvalidationService = require('./services/cacheInvalidationService');
@@ -7,7 +7,8 @@ const { checkSafeZoneViolation } = require('./controllers/safeZoneController');
 const { checkGeofenceViolation } = require('./controllers/geofenceMonitorController');
 const SpeedAlertService = require('./services/speedAlertService');
 const TimeZoneAlertService = require('./services/timeZoneAlertService');
-const BatteryAlertService = require('./services/batteryAlertService'); // ✅ NEW
+const DeviceAlertService = require('./services/batteryAlertService');
+const logger = require('./utils/logger'); // ✅ NEW: Import logger
 require('dotenv').config();
 
 // ========== CONFIGURATION FROM ENV ==========
@@ -34,14 +35,14 @@ const DB_CONFIG = {
 async function connectToDatabase() {
     try {
         const connection = await mysql.createConnection(DB_CONFIG);
-        console.log('✅ Connected to the database');
+        logger.debug('✅ Connected to the database');
 
         // Disable strict mode for this session to allow '0000-00-00 00:00:00'
         await connection.query("SET SESSION sql_mode='ALLOW_INVALID_DATES';");
 
         return connection;
     } catch (error) {
-        console.error('🔥 Database connection failed:', error.message);
+        logger.error('🔥 Database connection failed:', error.message);
         throw error;
     }
 }
@@ -85,16 +86,16 @@ async function login(loginName, loginPassword) {
         const data = response.data;
 
         if (data.success === 'true') {
-            console.log('✅ Login successful');
-            console.log('🔑 Token:', data.mds);
-            console.log('👤 User ID:', data.id);
+            logger.debug('✅ Login successful');
+            logger.debug('🔑 Token:', data.mds);
+            logger.debug('👤 User ID:', data.id);
             return { token: data.mds, userId: data.id };
         } else {
-            console.log('❌ Login failed:', data.msg || 'User name or password error');
+            logger.warn('❌ Login failed:', data.msg || 'User name or password error');
             return null;
         }
     } catch (error) {
-        console.error('🔥 Login API error:', error.message);
+        logger.error('🔥 Login API error:', error.message);
         return null;
     }
 }
@@ -117,21 +118,115 @@ async function fetchLocations(token, userId) {
         const data = response.data;
 
         if (data.success === 'true') {
-            console.log('✅ Locations fetched successfully');
+            logger.debug('✅ Locations fetched successfully');
             return data;
         } else {
-            console.log('❌ Failed to fetch locations:', data.errorDescribe);
+            logger.warn('❌ Failed to fetch locations:', data.errorDescribe);
             return null;
         }
     } catch (error) {
-        console.error('🔥 Fetch locations API error:', error.message);
+        logger.error('🔥 Fetch locations API error:', error.message);
         return null;
     }
 }
 
+// ========== FETCH ALARM DATA ==========
+async function fetchAlarmData(token, userId) {
+    const method = 'getCustomAlarm';
+    const url = `${GPS_CONFIG.apiUrl}/GetDate`;
+
+    try {
+        logger.debug('🔔 Fetching alarm data...');
+
+        // Get alarms from the last 2 minutes
+        const maxTime = Date.now();
+        const minTime = maxTime - (2 * 60 * 1000); // 2 minutes ago
+
+        const response = await axios.get(url, {
+            params: {
+                method: method,
+                type: 'custom',
+                id: userId,
+                mds: token,
+                max_time: maxTime,
+                timestamp: Date.now()
+            },
+            timeout: 10000
+        });
+
+        const data = response.data;
+
+        if (data.success === 'true' || data.success === true) {
+            logger.debug('✅ Alarm data fetched successfully');
+            logger.debug(`📊 Total alarms: ${data.total || 0}`);
+            return data;
+        } else {
+            logger.debug('⚠️ No alarm data available');
+            return null;
+        }
+    } catch (error) {
+        logger.error('🔥 Fetch alarm data error:', error.message);
+        return null;
+    }
+}
+
+// ========== PROCESS ALARM DATA ==========
+async function processAlarmData(alarmData) {
+    if (!alarmData || !alarmData.rows || alarmData.rows.length === 0) {
+        logger.debug('ℹ️ No alarms to process');
+        return;
+    }
+
+    logger.debug('\n🚨 ========== PROCESSING ALARM DATA ==========');
+    logger.debug(`📊 Processing ${alarmData.rows.length} alarms...`);
+
+    for (const alarm of alarmData.rows) {
+        try {
+            const typeId = parseInt(alarm.type_id);
+
+            logger.debug(`\n🔍 Processing alarm:`, {
+                type_id: alarm.type_id,
+                type_id_hex: `0x${typeId.toString(16).toUpperCase()}`,
+                macid: alarm.macid,
+                speed: alarm.speed,
+                latitude: alarm.weidu,
+                longitude: alarm.jingdu
+            });
+
+            // Check if this is a supported device alarm
+            // Supported types: 0x08 (Low Battery), 0x23 (Power Failure), 0x25 (Offline), 0x26 (Removal)
+            if (DeviceAlertService.isAlarmSupported(typeId)) {
+                logger.debug(`✅ Supported device alarm detected: 0x${typeId.toString(16).toUpperCase()}`);
+
+                // Process the alarm using the unified device alert service
+                await DeviceAlertService.processAlarm({
+                    type_id: alarm.type_id,
+                    macid: alarm.macid,
+                    mac_id: alarm.macid,
+                    weidu: alarm.weidu,
+                    jingdu: alarm.jingdu,
+                    latitude: alarm.weidu,
+                    longitude: alarm.jingdu,
+                    speed: alarm.speed,
+                    gps_time: alarm.gps_time,
+                    send_time: alarm.send_time
+                });
+            } else {
+                logger.debug(`ℹ️ Alarm type 0x${typeId.toString(16).toUpperCase()} (${typeId}) is not a device alarm, skipping`);
+            }
+
+        } catch (error) {
+            logger.error('🔥 Error processing alarm:', error.message);
+            logger.error('🔥 Stack trace:', error.stack);
+        }
+    }
+
+    logger.debug('🚨 ========== ALARM DATA PROCESSING COMPLETE ==========\n');
+}
+
 // ========== DATA PROCESSING ==========
 async function saveLocationsToDatabase(connection, locations) {
-    console.log('\n📡 ========== GPS DATA PROCESSING ==========');
+    logger.debug('\n📡 ========== GPS DATA PROCESSING ==========');
 
     const invalidatedVehicles = new Set();
     const gpsUpdates = new Map();
@@ -152,7 +247,7 @@ async function saveLocationsToDatabase(connection, locations) {
                     const formattedDatetime = convertToDatetime(record[6]);
                     const formattedHeartTime = convertToDatetime(record[7]);
                     const macIdGps = record[11];
-                    const statenumber = record[19] || ''; // ✅ Battery data is here
+                    const statenumber = record[19] || '';
 
                     const values = [
                         formattedSysTime,   // sys_time
@@ -179,21 +274,21 @@ async function saveLocationsToDatabase(connection, locations) {
                             speed: parseFloat(record[8]),
                             status: record[9],
                             direction: record[10],
-                            statenumber: statenumber, // ✅ Store for battery check
+                            statenumber: statenumber,
                             timestamp: formattedDatetime || new Date().toISOString()
                         });
 
-                        console.log(`💾 Location saved: MAC=${macIdGps}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
+                        logger.debug(`💾 Location saved: MAC=${macIdGps}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
                     } catch (error) {
-                        console.error('❌ Error saving location:', error.message);
+                        logger.error('❌ Error saving location:', error.message);
                     }
                 }
             } else {
-                console.log('⚠️ No records to save for this device.');
+                logger.debug('⚠️ No records to save for this device.');
             }
         }
 
-        console.log(`\n✅ Total records saved: ${totalRecords}`);
+        logger.debug(`\n✅ Total records saved: ${totalRecords}`);
 
         // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + ALL ALERT CHECKS
         if (invalidatedVehicles.size > 0) {
@@ -237,19 +332,19 @@ async function saveLocationsToDatabase(connection, locations) {
                         });
 
                         // ========== ALERT CHECKS ==========
-                        console.log(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
+                        logger.debug(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
 
                         // ✅ 1. Safe zone violation check
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (safeZoneResult.violation) {
-                                console.log(`⚠️ SAFE ZONE VIOLATION DETECTED!`);
+                                logger.info(`⚠️ SAFE ZONE VIOLATION DETECTED!`);
                                 if (safeZoneResult.isFirstAlert) {
-                                    console.log(`📧 Safe zone alert created and notification sent`);
+                                    logger.info(`📧 Safe zone alert created and notification sent`);
                                 }
                             }
                         } catch (safeZoneError) {
-                            console.error(`❌ Safe zone check error:`, safeZoneError.message);
+                            logger.error(`❌ Safe zone check error:`, safeZoneError.message);
                         }
 
                         // ✅ 2. Geofence violation check
@@ -257,16 +352,16 @@ async function saveLocationsToDatabase(connection, locations) {
                             const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (geofenceResult.violation) {
                                 if (geofenceResult.isFirstAlert) {
-                                    console.log(`🚨 GEOFENCE VIOLATION DETECTED!`);
-                                    console.log(`   Vehicle: ${geofenceResult.vehicleName}`);
-                                    console.log(`   Location: ${geofenceResult.locationName || `[${geofenceResult.latitude}, ${geofenceResult.longitude}]`}`);
-                                    console.log(`📧 Geofence alert created and notification sent`);
-                                } else if (geofenceResult.reason === 'Unread alert exists') {
-                                    console.log(`⏳ Geofence violation ongoing (waiting for user to read alert)`);
+                                    logger.info(`🚨 GEOFENCE VIOLATION DETECTED!`);
+                                    logger.info(`   Vehicle: ${geofenceResult.vehicleName}`);
+                                    logger.info(`   Location: ${geofenceResult.locationName || `[${geofenceResult.latitude}, ${geofenceResult.longitude}]`}`);
+                                    logger.info(`📧 Geofence alert created and notification sent`);
+                                } else if (geofenceResult.reason === 'Cooldown active') {
+                                    logger.debug(`⏳ Geofence violation ongoing (cooldown active)`);
                                 }
                             }
                         } catch (geofenceError) {
-                            console.error(`❌ Geofence check error:`, geofenceError.message);
+                            logger.error(`❌ Geofence check error:`, geofenceError.message);
                         }
 
                         // ✅ 3. Speed violation check
@@ -281,7 +376,7 @@ async function saveLocationsToDatabase(connection, locations) {
                                 }
                             );
                         } catch (speedError) {
-                            console.error(`❌ Speed check error:`, speedError.message);
+                            logger.error(`❌ Speed check error:`, speedError.message);
                         }
 
                         // ✅ 4. Time zone violation check
@@ -296,61 +391,67 @@ async function saveLocationsToDatabase(connection, locations) {
                                 }
                             );
                         } catch (timeZoneError) {
-                            console.error(`❌ Time zone check error:`, timeZoneError.message);
+                            logger.error(`❌ Time zone check error:`, timeZoneError.message);
                         }
 
-                        // ✅ 5. Battery level check (NEW)
-                        try {
-                            await BatteryAlertService.checkBatteryLevel(
-                                { id: vehicleId, nickname: vehicleNickname },
-                                gpsData.statenumber
-                            );
-                        } catch (batteryError) {
-                            console.error(`❌ Battery check error:`, batteryError.message);
-                        }
+                        // ✅ 5. Device alarms (Battery, Power Failure, Offline, Removal)
+                        // These are now handled separately via alarm data processing
+                        // See processAlarmData() function which processes all device alarms
 
-                        console.log(`✅ All alert checks completed for vehicle ${vehicleId}`);
+                        logger.debug(`✅ All alert checks completed for vehicle ${vehicleId}`);
                     }
                 } catch (error) {
-                    console.error(`❌ Processing error for MAC ${macId}:`, error.message);
+                    logger.error(`❌ Processing error for MAC ${macId}:`, error.message);
                 }
             }
         }
     } else {
-        console.log('❌ No valid location data to save:', locations.errorDescribe || 'Unknown error');
+        logger.warn('❌ No valid location data to save:', locations.errorDescribe || 'Unknown error');
     }
 
-    console.log('\n========== GPS DATA PROCESSING COMPLETE ==========\n');
+    logger.debug('\n========== GPS DATA PROCESSING COMPLETE ==========\n');
 }
 
 // ========== MAIN GPS FETCH CYCLE ==========
 async function fetchGPSData() {
     try {
-        console.log(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle...`);
+        logger.info(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle...`);
 
         const connection = await connectToDatabase();
         const loginData = await login(GPS_CONFIG.loginName, GPS_CONFIG.loginPassword);
 
         if (loginData) {
             const { token, userId } = loginData;
-            const locations = await fetchLocations(token, userId);
 
+            // ✅ 1. Fetch and save location data
+            const locations = await fetchLocations(token, userId);
             if (locations) {
                 await saveLocationsToDatabase(connection, locations);
             } else {
-                console.log('❌ Failed to fetch locations');
+                logger.warn('❌ Failed to fetch locations');
             }
+
+            // ✅ 2. Fetch and process alarm data (includes all device alarms)
+            try {
+                const alarmData = await fetchAlarmData(token, userId);
+                if (alarmData) {
+                    await processAlarmData(alarmData);
+                }
+            } catch (alarmError) {
+                logger.error('🔥 Error fetching/processing alarms:', alarmError.message);
+            }
+
         } else {
-            console.log('❌ Login failed, cannot fetch locations');
+            logger.warn('❌ Login failed, cannot fetch data');
         }
 
         await connection.end();
-        console.log('✅ Database connection closed');
-        console.log(`⏰ Next fetch in ${GPS_CONFIG.fetchInterval / 1000} seconds...\n`);
+        logger.debug('✅ Database connection closed');
+        logger.debug(`⏰ Next fetch in ${GPS_CONFIG.fetchInterval / 1000} seconds...\n`);
 
     } catch (error) {
-        console.error('🔥 Error in GPS fetch cycle:', error.message);
-        console.error('Stack trace:', error.stack);
+        logger.error('🔥 Error in GPS fetch cycle:', error.message);
+        logger.error('Stack trace:', error.stack);
     }
 }
 
@@ -359,23 +460,23 @@ let fetchInterval = null;
 
 function startGPSFetchCycle() {
     if (fetchInterval) {
-        console.log('⚠️ GPS fetch cycle is already running');
+        logger.warn('⚠️ GPS fetch cycle is already running');
         return;
     }
 
-    console.log('🚀 Starting GPS fetch cycle...');
+    logger.info('🚀 Starting GPS fetch cycle...');
     fetchGPSData(); // Run immediately
     fetchInterval = setInterval(fetchGPSData, GPS_CONFIG.fetchInterval);
-    console.log(`⏰ GPS fetch cycle started (every ${GPS_CONFIG.fetchInterval / 1000} seconds)`);
+    logger.info(`⏰ GPS fetch cycle started (every ${GPS_CONFIG.fetchInterval / 1000} seconds)`);
 }
 
 function stopGPSFetchCycle() {
     if (fetchInterval) {
         clearInterval(fetchInterval);
         fetchInterval = null;
-        console.log('🛑 GPS fetch cycle stopped');
+        logger.info('🛑 GPS fetch cycle stopped');
     } else {
-        console.log('⚠️ GPS fetch cycle is not running');
+        logger.warn('⚠️ GPS fetch cycle is not running');
     }
 }
 

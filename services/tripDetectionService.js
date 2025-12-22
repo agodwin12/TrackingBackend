@@ -1,3 +1,4 @@
+// services/tripDetectionService.js
 const { Op } = require("sequelize");
 const Location = require("../models/location");
 const Trip = require("../models/trip");
@@ -7,9 +8,10 @@ const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
 const GeocodingService = require("./geocodingService");
 const sequelize = require("../config/database");
+const logger = require("../utils/logger"); // ✅ NEW: Import logger
 
 class TripDetectionService {
-// ---- SETTINGS ----
+    // ---- SETTINGS ----
     static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 0.5);
     static MIN_SPEED_THRESHOLD = Number(process.env.TRIP_MIN_SPEED_KMH ?? 1);
     static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 1);
@@ -19,11 +21,11 @@ class TripDetectionService {
     // 🔍 Main entry point
     // ======================================================
     static async detectAndCreateTrips() {
-        console.log("\n🛰️ === TRIP DETECTION START ===");
+        logger.info("\n🛰️ === TRIP DETECTION START ===");
 
         const macs = await this.getVehiclesWithUnprocessedData();
         if (macs.length === 0) {
-            console.log("✅ No vehicles with unprocessed data.");
+            logger.debug("✅ No vehicles with unprocessed data.");
             return;
         }
 
@@ -36,9 +38,9 @@ class TripDetectionService {
             totalTrips += res.tripsCreated;
         }
 
-        console.log(`\n🏁 Trip Detection Finished`);
-        console.log(`Trips Created/Updated: ${totalTrips}`);
-        console.log(`Vehicles Skipped: ${skipped}`);
+        logger.info(`\n🏁 Trip Detection Finished`);
+        logger.info(`Trips Created/Updated: ${totalTrips}`);
+        logger.info(`Vehicles Skipped: ${skipped}`);
     }
 
     static async getVehiclesWithUnprocessedData() {
@@ -56,7 +58,7 @@ class TripDetectionService {
     // 🚗 MAIN VEHICLE PROCESSING
     // ======================================================
     static async processVehicleLocations(macIdGps) {
-        console.log(`\n⚙️ Processing: ${macIdGps}`);
+        logger.debug(`\n⚙️ Processing: ${macIdGps}`);
 
         const locations = await Location.findAll({
             where: { mac_id_gps: macIdGps, processed: false },
@@ -74,12 +76,12 @@ class TripDetectionService {
         });
 
         if (!vehicle) {
-            console.log("⚠️ Vehicle NOT FOUND → Mark processed");
+            logger.warn("⚠️ Vehicle NOT FOUND → Mark processed");
             await Location.update({ processed: true }, { where: { mac_id_gps: macIdGps } });
             return { skipped: false, tripsCreated: 0 };
         }
 
-        console.log(`🚗 Vehicle ID: ${vehicle.id} | Plate: ${vehicle.immatriculation}`);
+        logger.debug(`🚗 Vehicle ID: ${vehicle.id} | Plate: ${vehicle.immatriculation}`);
 
         // Get user and check preferences
         const assoc = await AssocUserVoitures.findOne({
@@ -89,7 +91,7 @@ class TripDetectionService {
         });
 
         if (!assoc) {
-            console.log("⚠️ No user mapped to this vehicle → Mark processed");
+            logger.warn("⚠️ No user mapped to this vehicle → Mark processed");
             await Location.update({ processed: true }, { where: { mac_id_gps: macIdGps } });
             return { skipped: false, tripsCreated: 0 };
         }
@@ -101,12 +103,12 @@ class TripDetectionService {
         });
 
         if (!user || !user.trip_tracking_enabled) {
-            console.log("🚫 Trip tracking disabled → Mark processed");
+            logger.debug("🚫 Trip tracking disabled → Mark processed");
             await Location.update({ processed: true }, { where: { mac_id_gps: macIdGps } });
             return { skipped: true, tripsCreated: 0 };
         }
 
-        console.log("✅ Trip tracking ENABLED - Processing trips...");
+        logger.debug("✅ Trip tracking ENABLED - Processing trips...");
 
         // Check for ongoing trip
         const ongoingTrip = await this.getOngoingTrip(vehicle.id, macIdGps);
@@ -138,7 +140,7 @@ class TripDetectionService {
             });
 
             if (ongoingTrip) {
-                console.log(`🔄 Found ongoing trip (ID: ${ongoingTrip.id}) started at ${ongoingTrip.start_time}`);
+                logger.debug(`🔄 Found ongoing trip (ID: ${ongoingTrip.id}) started at ${ongoingTrip.start_time}`);
 
                 // Get waypoint count for sequence ordering
                 const waypointCount = await TripWaypoint.count({
@@ -151,11 +153,11 @@ class TripDetectionService {
                 };
             }
 
-            console.log("📍 No ongoing trip found");
+            logger.debug("📍 No ongoing trip found");
             return null;
 
         } catch (err) {
-            console.error("❌ Error fetching ongoing trip:", err);
+            logger.error("❌ Error fetching ongoing trip:", err);
             return null;
         }
     }
@@ -173,7 +175,7 @@ class TripDetectionService {
         // If continuing trip, set the last moving time
         if (currentTrip) {
             lastMovingTime = new Date(currentTrip.end_time);
-            console.log(`📍 Continuing from last known time: ${lastMovingTime}`);
+            logger.debug(`📍 Continuing from last known time: ${lastMovingTime}`);
         }
 
         for (let i = 0; i < locations.length; i++) {
@@ -184,7 +186,7 @@ class TripDetectionService {
 
             // START NEW TRIP
             if (!currentTrip && isMoving) {
-                console.log(`🚀 Starting new trip at ${loc.sys_time}`);
+                logger.info(`🚀 Starting new trip at ${loc.sys_time}`);
 
                 currentTrip = await this.createNewTrip(vehicleId, macIdGps, loc);
                 newLocationIds = [loc.id];
@@ -212,7 +214,7 @@ class TripDetectionService {
 
                     if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
                         // END TRIP - Vehicle has been idle too long
-                        console.log(`🛑 Ending trip after ${idleMinutes.toFixed(1)} min idle`);
+                        logger.debug(`🛑 Ending trip after ${idleMinutes.toFixed(1)} min idle`);
 
                         const saved = await this.finalizeTrip(
                             currentTrip,
@@ -241,7 +243,7 @@ class TripDetectionService {
 
             if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
                 // Trip should end
-                console.log(`🏁 Finalizing trip - idle for ${idleMinutes.toFixed(1)} min`);
+                logger.debug(`🏁 Finalizing trip - idle for ${idleMinutes.toFixed(1)} min`);
                 const saved = await this.finalizeTrip(
                     currentTrip,
                     lastLoc,
@@ -251,7 +253,7 @@ class TripDetectionService {
                 if (saved) tripsProcessed++;
             } else {
                 // Trip is still ongoing - just update it
-                console.log(`⏸️ Trip ongoing - updating with new data (idle: ${idleMinutes.toFixed(1)} min)`);
+                logger.debug(`⏸️ Trip ongoing - updating with new data (idle: ${idleMinutes.toFixed(1)} min)`);
                 await this.updateOngoingTrip(
                     currentTrip,
                     lastLoc,
@@ -294,7 +296,7 @@ class TripDetectionService {
                 waypoint_count: 0
             });
 
-            console.log(`✅ Created new trip (ID: ${trip.id})`);
+            logger.info(`✅ Created new trip (ID: ${trip.id})`);
 
             return {
                 id: trip.id,
@@ -307,7 +309,7 @@ class TripDetectionService {
             };
 
         } catch (err) {
-            console.error("❌ Error creating trip:", err);
+            logger.error("❌ Error creating trip:", err);
             return null;
         }
     }
@@ -359,11 +361,11 @@ class TripDetectionService {
             );
 
             await trx.commit();
-            console.log(`✅ Updated ongoing trip (ID: ${currentTrip.id}) with ${newWaypoints.length} new waypoints`);
+            logger.debug(`✅ Updated ongoing trip (ID: ${currentTrip.id}) with ${newWaypoints.length} new waypoints`);
 
         } catch (err) {
             await trx.rollback();
-            console.error("❌ Error updating ongoing trip:", err);
+            logger.error("❌ Error updating ongoing trip:", err);
         }
     }
 
@@ -395,7 +397,7 @@ class TripDetectionService {
             // Check if trip meets minimum criteria
             if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
-                console.log(`⚠️ Trip too short - deleting (${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`);
+                logger.warn(`⚠️ Trip too short - deleting (${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`);
 
                 // Delete trip and waypoints
                 await TripWaypoint.destroy({ where: { trip_id: currentTrip.id }, transaction: trx });
@@ -441,12 +443,12 @@ class TripDetectionService {
             );
 
             await trx.commit();
-            console.log(`✅ Trip finalized (ID: ${currentTrip.id}): ${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km`);
+            logger.info(`✅ Trip finalized (ID: ${currentTrip.id}): ${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km`);
             return true;
 
         } catch (err) {
             await trx.rollback();
-            console.error("❌ Error finalizing trip:", err);
+            logger.error("❌ Error finalizing trip:", err);
             return false;
         }
     }

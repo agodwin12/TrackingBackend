@@ -1,3 +1,4 @@
+// models/alert.js
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
@@ -16,7 +17,19 @@ const Alert = sequelize.define("alerts", {
         }
     },
     alert_type: {
-        type: DataTypes.ENUM('geofence', 'safe_zone', 'speed', 'engine', 'general', 'stolen'), // 🆕 Added 'stolen'
+        type: DataTypes.ENUM(
+            'geofence',
+            'safe_zone',
+            'speed',
+            'engine',
+            'general',
+            'stolen',
+            'time_zone',
+            'low_battery',
+            'power_failure',    // 🆕 NEW: Power failure alarm (0x23)
+            'offline',          // 🆕 NEW: Device offline alarm (0x25)
+            'device_removal'    // 🆕 NEW: Device removal alarm (0x26)
+        ),
         allowNull: false,
         defaultValue: 'general'
     },
@@ -37,7 +50,6 @@ const Alert = sequelize.define("alerts", {
         type: DataTypes.BOOLEAN,
         defaultValue: false,
     },
-    // 🆕 Additional fields for stolen alerts
     latitude: {
         type: DataTypes.DECIMAL(10, 8),
         allowNull: true,
