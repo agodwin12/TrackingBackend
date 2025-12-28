@@ -41,9 +41,24 @@ const TripWaypoint = sequelize.define("trip_waypoints", {
     }
 }, {
     timestamps: false,
+
+    // ✅ ALL PERFORMANCE INDEXES
     indexes: [
-        { fields: ['trip_id', 'sequence_order'] },
-        { fields: ['recorded_at'] }
+        // Individual index
+        {
+            name: 'idx_trip_waypoints_trip_id',
+            fields: ['trip_id']
+        },
+        {
+            name: 'idx_trip_waypoints_recorded_at',
+            fields: ['recorded_at']
+        },
+
+        // Composite index (CRITICAL for route fetching performance!)
+        {
+            name: 'idx_trip_waypoints_trip_sequence',
+            fields: ['trip_id', 'sequence_order']
+        }
     ]
 });
 

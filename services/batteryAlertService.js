@@ -9,10 +9,10 @@ class DeviceAlertService {
     constructor() {
         // Alarm type codes from GPS API (using hex as shown in documentation)
         this.ALARM_TYPES = {
-            LOW_BATTERY: 0x08,      // 8 in decimal
-            POWER_FAILURE: 0x23,    // 35 in decimal
-            OFFLINE: 0x25,          // 37 in decimal
-            REMOVAL: 0x26           // 38 in decimal
+            LOW_BATTERY: 8,      // 8 in decimal
+            POWER_FAILURE: 35,    // 35 in decimal
+            OFFLINE: 37,          // 37 in decimal
+            REMOVAL: 38          // 38 in decimal
         };
 
         // Configuration for each alarm type

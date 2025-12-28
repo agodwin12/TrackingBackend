@@ -1,6 +1,7 @@
 // services/geofenceService.js
 
 const turf = require('@turf/turf');
+const logger = require('../utils/logger');
 
 /**
  * Check if a point (latitude, longitude) is inside a geofence polygon
@@ -11,15 +12,15 @@ const turf = require('@turf/turf');
  */
 const isInsideGeofence = (lat, lng, geofenceZone) => {
     try {
-        console.log(`🔍 Checking if point [${lat}, ${lng}] is inside geofence...`);
+        logger.debug(`Checking if point [${lat}, ${lng}] is inside geofence...`);
 
         // Validate input
         if (!geofenceZone || !Array.isArray(geofenceZone) || geofenceZone.length < 3) {
-            console.warn('⚠️ Invalid geofence zone data - polygon must have at least 3 points');
+            logger.warn('Invalid geofence zone data - polygon must have at least 3 points');
             return true; // If no valid geofence, assume inside to avoid false alarms
         }
 
-        console.log(`📐 Geofence has ${geofenceZone.length} points`);
+        logger.debug(`Geofence has ${geofenceZone.length} points`);
 
         // Create a point from current location [lng, lat] for turf
         const point = turf.point([lng, lat]);
@@ -30,15 +31,15 @@ const isInsideGeofence = (lat, lng, geofenceZone) => {
         const firstCoord = geofenceZone[0];
         let polygonCoords;
 
-        console.log(`🔍 First coordinate in geofence: [${firstCoord[0]}, ${firstCoord[1]}]`);
+        logger.debug(`First coordinate in geofence: [${firstCoord[0]}, ${firstCoord[1]}]`);
 
         // If first value is > 90 or < -90, it's longitude (so format is [lng, lat])
         if (Math.abs(firstCoord[0]) > 90) {
-            console.log('✅ Detected [lng, lat] format in geofence data (no conversion needed)');
+            logger.debug('Detected [lng, lat] format in geofence data (no conversion needed)');
             // Already in correct [lng, lat] format for turf
             polygonCoords = geofenceZone.map(coord => [coord[0], coord[1]]);
         } else {
-            console.log('✅ Detected [lat, lng] format - converting to [lng, lat] for turf');
+            logger.debug('Detected [lat, lng] format - converting to [lng, lat] for turf');
             // Convert from [lat, lng] to [lng, lat]
             polygonCoords = geofenceZone.map(coord => [coord[1], coord[0]]);
         }
@@ -49,12 +50,12 @@ const isInsideGeofence = (lat, lng, geofenceZone) => {
 
         if (first[0] !== last[0] || first[1] !== last[1]) {
             polygonCoords.push([first[0], first[1]]);
-            console.log('✅ Closed polygon by adding first point at end');
+            logger.debug('Closed polygon by adding first point at end');
         } else {
-            console.log('✅ Polygon is already closed');
+            logger.debug('Polygon is already closed');
         }
 
-        console.log(`📐 Final polygon has ${polygonCoords.length} points`);
+        logger.debug(`Final polygon has ${polygonCoords.length} points`);
 
         // Create turf polygon
         const polygon = turf.polygon([polygonCoords]);
@@ -62,13 +63,14 @@ const isInsideGeofence = (lat, lng, geofenceZone) => {
         // Check if point is inside polygon
         const inside = turf.booleanPointInPolygon(point, polygon);
 
-        console.log(`📍 Result: Point [lat: ${lat}, lng: ${lng}] is ${inside ? '✅ INSIDE' : '❌ OUTSIDE'} the geofence polygon`);
+        // ✅ Important: Log result even in production for monitoring
+        logger.info(`Geofence check: Point [lat: ${lat}, lng: ${lng}] is ${inside ? 'INSIDE' : 'OUTSIDE'} the geofence`);
 
         return inside;
 
     } catch (error) {
-        console.error('❌ Error checking geofence:', error);
-        console.error('❌ Error stack:', error.stack);
+        logger.error('Error checking geofence:', error.message);
+        logger.error('Error stack:', error.stack);
         return true; // On error, assume inside to avoid false alarms
     }
 };

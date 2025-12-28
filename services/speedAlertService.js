@@ -129,14 +129,13 @@ class SpeedAlertService {
 
             console.log(`✅ Speed alert created: ${alert.id}`);
 
-            // Send notification
-            await NotificationService.sendAlertNotification(userId, {
-                type: 'speed',
-                title: '⚠️ Speed Limit Exceeded',
-                body: message,
-                vehicleId: vehicle.id,
-                alertId: alert.id
-            });
+            // ✅ FIXED: Use the correct method from NotificationService
+            await NotificationService.sendSpeedingAlert(
+                userId,
+                vehicleName,
+                actualSpeed,
+                speedLimit
+            );
 
             // Mark as sent
             await alert.update({ sent: true });

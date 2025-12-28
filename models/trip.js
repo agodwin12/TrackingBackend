@@ -8,14 +8,13 @@ const Trip = sequelize.define("trips", {
         primaryKey: true
     },
     vehicle_id: {
-        type: DataTypes.BIGINT.UNSIGNED, // <-- must match voitures.id
+        type: DataTypes.BIGINT.UNSIGNED,
         allowNull: false,
         references: {
             model: 'voitures',
             key: 'id'
         }
     },
-
     mac_id_gps: {
         type: DataTypes.STRING,
         allowNull: false
@@ -81,6 +80,7 @@ const Trip = sequelize.define("trips", {
         allowNull: false,
         defaultValue: 'completed'
     },
+
     // Metadata
     waypoint_count: {
         type: DataTypes.INTEGER,
@@ -92,10 +92,36 @@ const Trip = sequelize.define("trips", {
     }
 }, {
     timestamps: false,
+
+    // ✅ ALL PERFORMANCE INDEXES
     indexes: [
-        { fields: ['vehicle_id', 'start_time', 'end_time'] },
-        { fields: ['mac_id_gps', 'start_time'] },
-        { fields: ['start_time'] }
+        // Individual indexes
+        {
+            name: 'idx_trips_vehicle_id',
+            fields: ['vehicle_id']
+        },
+        {
+            name: 'idx_trips_status',
+            fields: ['status']
+        },
+        {
+            name: 'idx_trips_start_time',
+            fields: ['start_time']
+        },
+        {
+            name: 'idx_trips_mac_id_gps',
+            fields: ['mac_id_gps']
+        },
+        {
+            name: 'idx_trips_created_at',
+            fields: ['created_at']
+        },
+
+        // Composite index (CRITICAL for getVehicleTrips performance!)
+        {
+            name: 'idx_trips_vehicle_status_time',
+            fields: ['vehicle_id', 'status', 'start_time']
+        }
     ]
 });
 

@@ -1,4 +1,4 @@
-// location.js - GPS TRACKING SERVICE (Integrated with Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Device Alarms)
+// location.js - GPS TRACKING SERVICE (Multi-Account + Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Device Alarms)
 const axios = require('axios');
 const mysql = require('mysql2/promise');
 const cacheInvalidationService = require('./services/cacheInvalidationService');
@@ -8,13 +8,24 @@ const { checkGeofenceViolation } = require('./controllers/geofenceMonitorControl
 const SpeedAlertService = require('./services/speedAlertService');
 const TimeZoneAlertService = require('./services/timeZoneAlertService');
 const DeviceAlertService = require('./services/batteryAlertService');
-const logger = require('./utils/logger'); // ✅ NEW: Import logger
+const logger = require('./utils/logger');
 require('dotenv').config();
 
-// ========== CONFIGURATION FROM ENV ==========
+// ========== MULTI-ACCOUNT GPS CONFIGURATION ==========
+const GPS_ACCOUNTS = [
+    {
+        name: 'Account 1 (Proxym_tracking)',
+        loginName: process.env.GPS_LOGIN_NAME_1 || 'Proxym_tracking',
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_1 || 'proxym123',
+    },
+    {
+        name: 'Account 2',
+        loginName: process.env.GPS_LOGIN_NAME_2 || 'SecondAccount',
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_2 || 'password123',
+    }
+];
+
 const GPS_CONFIG = {
-    loginName: process.env.GPS_LOGIN_NAME || 'Proxym_tracking',
-    loginPassword: process.env.GPS_LOGIN_PASSWORD || 'proxym123',
     loginUrl: process.env.GPS_LOGIN_URL || 'http://appzzl.18gps.net/',
     apiUrl: process.env.GPS_API_URL || 'http://apitest.18gps.net/GetDateServices.asmx',
     fetchInterval: parseInt(process.env.GPS_FETCH_INTERVAL) || 10000, // 10 seconds
@@ -225,8 +236,8 @@ async function processAlarmData(alarmData) {
 }
 
 // ========== DATA PROCESSING ==========
-async function saveLocationsToDatabase(connection, locations) {
-    logger.debug('\n📡 ========== GPS DATA PROCESSING ==========');
+async function saveLocationsToDatabase(connection, locations, accountName) {
+    logger.debug(`\n📡 ========== GPS DATA PROCESSING [${accountName}] ==========`);
 
     const invalidatedVehicles = new Set();
     const gpsUpdates = new Map();
@@ -278,17 +289,17 @@ async function saveLocationsToDatabase(connection, locations) {
                             timestamp: formattedDatetime || new Date().toISOString()
                         });
 
-                        logger.debug(`💾 Location saved: MAC=${macIdGps}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
+                        logger.debug(`💾 [${accountName}] Location saved: MAC=${macIdGps}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
                     } catch (error) {
-                        logger.error('❌ Error saving location:', error.message);
+                        logger.error(`❌ [${accountName}] Error saving location:`, error.message);
                     }
                 }
             } else {
-                logger.debug('⚠️ No records to save for this device.');
+                logger.debug(`⚠️ [${accountName}] No records to save for this device.`);
             }
         }
 
-        logger.debug(`\n✅ Total records saved: ${totalRecords}`);
+        logger.debug(`\n✅ [${accountName}] Total records saved: ${totalRecords}`);
 
         // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + ALL ALERT CHECKS
         if (invalidatedVehicles.size > 0) {
@@ -406,47 +417,81 @@ async function saveLocationsToDatabase(connection, locations) {
             }
         }
     } else {
-        logger.warn('❌ No valid location data to save:', locations.errorDescribe || 'Unknown error');
+        logger.warn(`❌ [${accountName}] No valid location data to save:`, locations.errorDescribe || 'Unknown error');
     }
 
-    logger.debug('\n========== GPS DATA PROCESSING COMPLETE ==========\n');
+    logger.debug(`\n========== GPS DATA PROCESSING COMPLETE [${accountName}] ==========\n`);
 }
 
-// ========== MAIN GPS FETCH CYCLE ==========
+// ========== MAIN GPS FETCH CYCLE (MULTI-ACCOUNT) ==========
 async function fetchGPSData() {
     try {
-        logger.info(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle...`);
+        logger.info(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle for ${GPS_ACCOUNTS.length} accounts...`);
 
         const connection = await connectToDatabase();
-        const loginData = await login(GPS_CONFIG.loginName, GPS_CONFIG.loginPassword);
 
-        if (loginData) {
-            const { token, userId } = loginData;
+        let totalAccountsProcessed = 0;
+        let totalAccountsFailed = 0;
 
-            // ✅ 1. Fetch and save location data
-            const locations = await fetchLocations(token, userId);
-            if (locations) {
-                await saveLocationsToDatabase(connection, locations);
-            } else {
-                logger.warn('❌ Failed to fetch locations');
-            }
+        // ✅ Process each account sequentially
+        for (let i = 0; i < GPS_ACCOUNTS.length; i++) {
+            const account = GPS_ACCOUNTS[i];
 
-            // ✅ 2. Fetch and process alarm data (includes all device alarms)
             try {
-                const alarmData = await fetchAlarmData(token, userId);
-                if (alarmData) {
-                    await processAlarmData(alarmData);
-                }
-            } catch (alarmError) {
-                logger.error('🔥 Error fetching/processing alarms:', alarmError.message);
-            }
+                logger.info(`\n🔐 ========== Processing ${account.name} (${i + 1}/${GPS_ACCOUNTS.length}) ==========`);
+                logger.debug(`📧 Login: ${account.loginName}`);
 
-        } else {
-            logger.warn('❌ Login failed, cannot fetch data');
+                const loginData = await login(account.loginName, account.loginPassword);
+
+                if (loginData) {
+                    const { token, userId } = loginData;
+
+                    // ✅ 1. Fetch and save location data for this account
+                    const locations = await fetchLocations(token, userId);
+                    if (locations) {
+                        logger.info(`📍 Processing locations for ${account.name}...`);
+                        await saveLocationsToDatabase(connection, locations, account.name);
+                    } else {
+                        logger.warn(`❌ Failed to fetch locations for ${account.name}`);
+                    }
+
+                    // ✅ 2. Fetch and process alarm data for this account
+                    try {
+                        const alarmData = await fetchAlarmData(token, userId);
+                        if (alarmData) {
+                            logger.info(`🚨 Processing alarms for ${account.name}...`);
+                            await processAlarmData(alarmData);
+                        }
+                    } catch (alarmError) {
+                        logger.error(`🔥 Error fetching/processing alarms for ${account.name}:`, alarmError.message);
+                    }
+
+                    logger.info(`✅ ${account.name} processing complete`);
+                    totalAccountsProcessed++;
+                } else {
+                    logger.warn(`❌ Login failed for ${account.name}`);
+                    totalAccountsFailed++;
+                }
+
+                // Small delay between accounts to avoid rate limiting
+                if (i < GPS_ACCOUNTS.length - 1) {
+                    logger.debug('⏸️ Waiting 500ms before next account...');
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+
+            } catch (accountError) {
+                logger.error(`🔥 Error processing ${account.name}:`, accountError.message);
+                logger.error('Stack trace:', accountError.stack);
+                totalAccountsFailed++;
+                // Continue to next account even if one fails
+            }
         }
 
         await connection.end();
         logger.debug('✅ Database connection closed');
+
+        logger.info(`\n✅ ========== ALL ACCOUNTS PROCESSED ==========`);
+        logger.info(`📊 Summary: ${totalAccountsProcessed} successful, ${totalAccountsFailed} failed`);
         logger.debug(`⏰ Next fetch in ${GPS_CONFIG.fetchInterval / 1000} seconds...\n`);
 
     } catch (error) {
@@ -464,7 +509,12 @@ function startGPSFetchCycle() {
         return;
     }
 
-    logger.info('🚀 Starting GPS fetch cycle...');
+    logger.info(`🚀 Starting GPS fetch cycle with ${GPS_ACCOUNTS.length} accounts...`);
+    logger.info(`📋 Accounts configured:`);
+    GPS_ACCOUNTS.forEach((account, index) => {
+        logger.info(`   ${index + 1}. ${account.name} (${account.loginName})`);
+    });
+
     fetchGPSData(); // Run immediately
     fetchInterval = setInterval(fetchGPSData, GPS_CONFIG.fetchInterval);
     logger.info(`⏰ GPS fetch cycle started (every ${GPS_CONFIG.fetchInterval / 1000} seconds)`);
