@@ -1,4 +1,4 @@
-// services/tripDetectionService.js
+// services/tripDetectionService.js - FIXED: Sequelize Association Error
 const { Op } = require("sequelize");
 const Location = require("../models/location");
 const Trip = require("../models/trip");
@@ -26,17 +26,17 @@ class TripDetectionService {
      * Main function to detect and create trips from unprocessed locations
      */
     static async detectAndCreateTrips() {
-        logger.info("=== TRIP DETECTION START ===");
+        logger.info("=== 🚀 TRIP DETECTION START ===");
 
         try {
             const macs = await this.getVehiclesWithUnprocessedData();
 
             if (macs.length === 0) {
-                logger.debug("No vehicles with unprocessed data");
+                logger.debug("✅ No vehicles with unprocessed data");
                 return { success: true, tripsCreated: 0, vehiclesProcessed: 0 };
             }
 
-            logger.info(`Found ${macs.length} vehicles with unprocessed data`);
+            logger.info(`📍 Found ${macs.length} vehicles with unprocessed data`);
 
             let totalTrips = 0;
             let skipped = 0;
@@ -48,12 +48,12 @@ class TripDetectionService {
                     if (res.skipped) skipped++;
                     totalTrips += res.tripsCreated;
                 } catch (error) {
-                    logger.error(`Error processing vehicle ${mac}:`, error);
+                    logger.error(`🔥 Error processing vehicle ${mac}:`, error);
                     errors++;
                 }
             }
 
-            logger.info("=== TRIP DETECTION COMPLETE ===", {
+            logger.info("=== ✅ TRIP DETECTION COMPLETE ===", {
                 tripsCreated: totalTrips,
                 vehiclesProcessed: macs.length - skipped,
                 vehiclesSkipped: skipped,
@@ -69,7 +69,7 @@ class TripDetectionService {
             };
 
         } catch (error) {
-            logger.error("Fatal error in trip detection:", error);
+            logger.error("🔥 Fatal error in trip detection:", error);
             return { success: false, error: error.message };
         }
     }
@@ -89,7 +89,7 @@ class TripDetectionService {
             });
             return rows.map(r => r.mac_id_gps);
         } catch (error) {
-            logger.error("Error fetching vehicles with unprocessed data:", error);
+            logger.error("🔥 Error fetching vehicles with unprocessed data:", error);
             return [];
         }
     }
@@ -100,7 +100,7 @@ class TripDetectionService {
      * Uses index: idx_locations_mac_processed_time
      */
     static async processVehicleLocations(macIdGps) {
-        logger.debug(`Processing vehicle: ${macIdGps}`);
+        logger.debug(`🔍 Processing vehicle: ${macIdGps}`);
 
         try {
             // 🆕 Count unprocessed locations first to determine batching strategy
@@ -109,11 +109,11 @@ class TripDetectionService {
             });
 
             if (locationCount === 0) {
-                logger.debug(`No unprocessed locations for ${macIdGps}`);
+                logger.debug(`✅ No unprocessed locations for ${macIdGps}`);
                 return { skipped: false, tripsCreated: 0 };
             }
 
-            logger.debug(`Found ${locationCount} unprocessed locations for ${macIdGps}`);
+            logger.debug(`🔍 Found ${locationCount} unprocessed locations for ${macIdGps}`);
 
             // 🆕 OPTIMIZED: Fetch vehicle with only needed attributes
             const vehicle = await Voiture.findOne({
@@ -123,7 +123,7 @@ class TripDetectionService {
             });
 
             if (!vehicle) {
-                logger.warn(`Vehicle not found for MAC: ${macIdGps} - marking locations as processed`);
+                logger.warn(`⚠️ Vehicle not found for MAC: ${macIdGps} - marking locations as processed`);
                 await Location.update(
                     { processed: true },
                     { where: { mac_id_gps: macIdGps, processed: false } }
@@ -131,13 +131,13 @@ class TripDetectionService {
                 return { skipped: false, tripsCreated: 0 };
             }
 
-            logger.debug(`Vehicle found: ${vehicle.immatriculation} (ID: ${vehicle.id})`);
+            logger.debug(`🔍 Vehicle found: ${vehicle.immatriculation} (ID: ${vehicle.id})`);
 
-            // 🆕 OPTIMIZED: Check trip tracking with minimal query
+            // ✅ FIXED: Check trip tracking with corrected query
             const userCheck = await this.checkUserTripTracking(vehicle.id);
 
             if (!userCheck.enabled) {
-                logger.debug(`Trip tracking disabled for vehicle ${vehicle.id} - ${userCheck.reason}`);
+                logger.debug(`🔍 Trip tracking disabled for vehicle ${vehicle.id} - ${userCheck.reason}`);
                 await Location.update(
                     { processed: true },
                     { where: { mac_id_gps: macIdGps, processed: false } }
@@ -145,7 +145,7 @@ class TripDetectionService {
                 return { skipped: true, tripsCreated: 0 };
             }
 
-            logger.debug(`Trip tracking enabled for vehicle ${vehicle.id} - processing trips`);
+            logger.debug(`✅ Trip tracking enabled for vehicle ${vehicle.id} - processing trips`);
 
             // 🆕 Get ongoing trip if exists (uses new indexes)
             const ongoingTrip = await this.getOngoingTrip(vehicle.id, macIdGps);
@@ -154,7 +154,7 @@ class TripDetectionService {
             let totalTripsProcessed = 0;
 
             if (locationCount > this.MAX_LOCATIONS_PER_BATCH) {
-                logger.info(`Large location set (${locationCount}), using batch processing`);
+                logger.info(`📊 Large location set (${locationCount}), using batch processing`);
 
                 let offset = 0;
                 let currentTrip = ongoingTrip;
@@ -201,46 +201,61 @@ class TripDetectionService {
                 );
             }
 
-            logger.info(`Processed ${totalTripsProcessed} trips for vehicle ${vehicle.immatriculation}`);
+            if (totalTripsProcessed > 0) {
+                logger.info(`✅ Processed ${totalTripsProcessed} trips for vehicle ${vehicle.immatriculation}`);
+            }
+
             return { skipped: false, tripsCreated: totalTripsProcessed };
 
         } catch (error) {
-            logger.error(`Error processing vehicle locations for ${macIdGps}:`, error);
+            logger.error(`🔥 Error processing vehicle locations for ${macIdGps}:`, error);
             throw error;
         }
     }
 
     /**
-     * 🆕 OPTIMIZED: Check if user has trip tracking enabled
+     * ✅ FIXED: Check if user has trip tracking enabled
+     * Queries association table first, then user table separately to avoid association errors
      */
     static async checkUserTripTracking(vehicleId) {
         try {
-            // 🆕 Single optimized query with JOIN
-            const result = await AssocUserVoitures.findOne({
+            // Step 1: Get user_id from association table
+            const association = await AssocUserVoitures.findOne({
                 where: { voiture_id: vehicleId },
-                include: [{
-                    model: User,
-                    as: 'user',
-                    attributes: ['id', 'trip_tracking_enabled'],
-                    required: true
-                }],
-                attributes: ['user_id'],
-                raw: true,
-                nest: true
+                attributes: ['user_id', 'voiture_id'],
+                raw: true
             });
 
-            if (!result) {
-                return { enabled: false, reason: "No user associated with vehicle" };
+            if (!association) {
+                logger.debug(`⚠️ No user association found for vehicle ${vehicleId}`);
+                return { enabled: true, reason: "No user associated - default enabled" };
             }
 
-            if (!result.user || !result.user.trip_tracking_enabled) {
+            // Step 2: Get user settings from users table
+            const user = await User.findByPk(association.user_id, {
+                attributes: ['id', 'trip_tracking_enabled'],
+                raw: true
+            });
+
+            if (!user) {
+                logger.debug(`⚠️ User not found for association (vehicle ${vehicleId})`);
+                return { enabled: true, reason: "User not found - default enabled" };
+            }
+
+            // Check if trip tracking is explicitly disabled
+            const isEnabled = user.trip_tracking_enabled !== false;
+
+            if (!isEnabled) {
+                logger.debug(`🔍 Trip tracking disabled by user ${user.id} for vehicle ${vehicleId}`);
                 return { enabled: false, reason: "Trip tracking disabled by user" };
             }
 
-            return { enabled: true, userId: result.user.id };
+            logger.debug(`✅ Trip tracking enabled for vehicle ${vehicleId}`);
+            return { enabled: true, userId: user.id };
 
         } catch (error) {
-            logger.error(`Error checking user trip tracking for vehicle ${vehicleId}:`, error);
+            logger.error(`🔥 Error checking user trip tracking for vehicle ${vehicleId}:`, error);
+            // Default to disabled on error to be safe
             return { enabled: false, reason: "Error checking settings" };
         }
     }
@@ -263,7 +278,7 @@ class TripDetectionService {
             });
 
             if (ongoingTrip) {
-                logger.debug(`Found ongoing trip ${ongoingTrip.id} started at ${ongoingTrip.start_time}`);
+                logger.debug(`🔍 Found ongoing trip ${ongoingTrip.id} started at ${ongoingTrip.start_time}`);
 
                 // 🆕 OPTIMIZED: Get waypoint count (uses idx_trip_waypoints_trip_id)
                 const waypointCount = await TripWaypoint.count({
@@ -276,11 +291,11 @@ class TripDetectionService {
                 };
             }
 
-            logger.debug("No ongoing trip found");
+            logger.debug("✅ No ongoing trip found");
             return null;
 
         } catch (error) {
-            logger.error("Error fetching ongoing trip:", error);
+            logger.error("🔥 Error fetching ongoing trip:", error);
             return null;
         }
     }
@@ -300,7 +315,7 @@ class TripDetectionService {
         // If continuing trip, set the last moving time
         if (currentTrip) {
             lastMovingTime = new Date(currentTrip.end_time);
-            logger.debug(`Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
+            logger.debug(`🔄 Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
         }
 
         for (let i = 0; i < locations.length; i++) {
@@ -311,12 +326,12 @@ class TripDetectionService {
 
             // START NEW TRIP
             if (!currentTrip && isMoving) {
-                logger.info(`Starting new trip at ${loc.sys_time} (speed: ${speed} km/h)`);
+                logger.info(`🚗 Starting new trip at ${loc.sys_time} (speed: ${speed} km/h)`);
 
                 currentTrip = await this.createNewTrip(vehicleId, macIdGps, loc);
 
                 if (!currentTrip) {
-                    logger.error("Failed to create new trip - skipping location");
+                    logger.error("🔥 Failed to create new trip - skipping location");
                     continue;
                 }
 
@@ -345,7 +360,7 @@ class TripDetectionService {
 
                     if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
                         // END TRIP - Vehicle has been idle too long
-                        logger.debug(`Ending trip ${currentTrip.id} after ${idleMinutes.toFixed(1)} min idle`);
+                        logger.debug(`🛑 Ending trip ${currentTrip.id} after ${idleMinutes.toFixed(1)} min idle`);
 
                         const saved = await this.finalizeTrip(
                             currentTrip,
@@ -374,7 +389,7 @@ class TripDetectionService {
 
             if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
                 // Trip should end
-                logger.debug(`Finalizing trip ${currentTrip.id} - idle for ${idleMinutes.toFixed(1)} min`);
+                logger.debug(`🏁 Finalizing trip ${currentTrip.id} - idle for ${idleMinutes.toFixed(1)} min`);
                 const saved = await this.finalizeTrip(
                     currentTrip,
                     lastLoc,
@@ -384,7 +399,7 @@ class TripDetectionService {
                 if (saved) tripsProcessed++;
             } else {
                 // Trip is still ongoing - just update it
-                logger.debug(`Trip ${currentTrip.id} still ongoing - updating (idle: ${idleMinutes.toFixed(1)} min)`);
+                logger.debug(`🔄 Trip ${currentTrip.id} still ongoing - updating (idle: ${idleMinutes.toFixed(1)} min)`);
                 const updated = await this.updateOngoingTrip(
                     currentTrip,
                     lastLoc,
@@ -404,7 +419,7 @@ class TripDetectionService {
      */
     static async createNewTrip(vehicleId, macIdGps, startLocation) {
         try {
-            // 🆕 Geocoding can be slow - do it async or cache results
+            // 🆕 Geocoding can be slow - do it async with timeout
             let startAddress = "Unknown location";
             try {
                 startAddress = await Promise.race([
@@ -413,7 +428,7 @@ class TripDetectionService {
                 ]);
                 startAddress = startAddress || "Unknown location";
             } catch (geocodeError) {
-                logger.warn(`Geocoding failed for trip start, using default: ${geocodeError.message}`);
+                logger.warn(`⚠️ Geocoding failed for trip start: ${geocodeError.message}`);
             }
 
             const trip = await Trip.create({
@@ -435,7 +450,7 @@ class TripDetectionService {
                 waypoint_count: 0
             });
 
-            logger.info(`Created new trip ${trip.id} for vehicle ${vehicleId}`);
+            logger.info(`✅ Created new trip ${trip.id} for vehicle ${vehicleId}`);
 
             return {
                 id: trip.id,
@@ -448,7 +463,7 @@ class TripDetectionService {
             };
 
         } catch (error) {
-            logger.error("Error creating trip:", error);
+            logger.error("🔥 Error creating trip:", error);
             return null;
         }
     }
@@ -473,10 +488,10 @@ class TripDetectionService {
                         const batch = waypointsToInsert.slice(i, i + this.WAYPOINT_BATCH_SIZE);
                         await TripWaypoint.bulkCreate(batch, { transaction });
                     }
-                    logger.debug(`Added ${waypointsToInsert.length} waypoints in ${Math.ceil(waypointsToInsert.length / this.WAYPOINT_BATCH_SIZE)} batches`);
+                    logger.debug(`📊 Added ${waypointsToInsert.length} waypoints in ${Math.ceil(waypointsToInsert.length / this.WAYPOINT_BATCH_SIZE)} batches`);
                 } else {
                     await TripWaypoint.bulkCreate(waypointsToInsert, { transaction });
-                    logger.debug(`Added ${newWaypoints.length} waypoints to trip ${currentTrip.id}`);
+                    logger.debug(`📍 Added ${newWaypoints.length} waypoints to trip ${currentTrip.id}`);
                 }
             }
 
@@ -517,7 +532,7 @@ class TripDetectionService {
 
             await transaction.commit();
 
-            logger.info(`Updated ongoing trip ${currentTrip.id}:`, {
+            logger.info(`✅ Updated ongoing trip ${currentTrip.id}:`, {
                 waypoints: allWaypoints.length,
                 duration: `${Math.round(metrics.durationMinutes)} min`,
                 distance: `${metrics.totalDistanceKm.toFixed(2)} km`
@@ -527,7 +542,7 @@ class TripDetectionService {
 
         } catch (error) {
             await transaction.rollback();
-            logger.error(`Error updating ongoing trip ${currentTrip.id}:`, error);
+            logger.error(`🔥 Error updating ongoing trip ${currentTrip.id}:`, error);
             return false;
         }
     }
@@ -571,7 +586,7 @@ class TripDetectionService {
             if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
 
-                logger.warn(`Trip ${currentTrip.id} too short - deleting`, {
+                logger.warn(`⚠️ Trip ${currentTrip.id} too short - deleting`, {
                     duration: `${metrics.durationMinutes.toFixed(1)} min`,
                     distance: `${metrics.totalDistanceKm.toFixed(2)} km`,
                     minDuration: `${this.MIN_TRIP_DURATION_MIN} min`,
@@ -600,7 +615,7 @@ class TripDetectionService {
                 );
 
                 await transaction.commit();
-                logger.info(`Trip ${currentTrip.id} deleted successfully (too short)`);
+                logger.info(`🗑️ Trip ${currentTrip.id} deleted successfully (too short)`);
                 return false;
             }
 
@@ -613,7 +628,7 @@ class TripDetectionService {
                 ]);
                 endAddress = endAddress || "Unknown location";
             } catch (geocodeError) {
-                logger.warn(`Geocoding failed for trip end, using default: ${geocodeError.message}`);
+                logger.warn(`⚠️ Geocoding failed for trip end: ${geocodeError.message}`);
             }
 
             // Finalize trip
@@ -641,7 +656,7 @@ class TripDetectionService {
 
             await transaction.commit();
 
-            logger.info(`Trip ${currentTrip.id} finalized:`, {
+            logger.info(`✅ Trip ${currentTrip.id} finalized:`, {
                 duration: `${Math.round(metrics.durationMinutes)} min`,
                 distance: `${metrics.totalDistanceKm.toFixed(2)} km`,
                 avgSpeed: `${metrics.avgSpeed.toFixed(2)} km/h`,
@@ -653,7 +668,7 @@ class TripDetectionService {
 
         } catch (error) {
             await transaction.rollback();
-            logger.error(`Error finalizing trip ${currentTrip.id}:`, error);
+            logger.error(`🔥 Error finalizing trip ${currentTrip.id}:`, error);
             return false;
         }
     }

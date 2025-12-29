@@ -15,55 +15,76 @@ const STATS_TRIP_LIMIT = 1000; // Maximum trips to calculate stats from
 
 /**
  * Get cached data from Redis
+ * ✅ Enhanced: Gracefully handles Redis being down
  */
 async function getCachedData(key) {
     try {
+        // Check if Redis is connected
+        if (!redisClient.isConnected) {
+            logger.debug('Redis not connected, skipping cache');
+            return null;
+        }
+
         const cached = await redisClient.get(key);
         if (cached) {
-            logger.debug(`Cache HIT: ${key}`);
+            logger.debug(`✅ Cache HIT: ${key}`);
             return JSON.parse(cached);
         }
-        logger.debug(`Cache MISS: ${key}`);
+        logger.debug(`❌ Cache MISS: ${key}`);
         return null;
     } catch (error) {
-        logger.error(`Redis GET error for key ${key}:`, error);
+        logger.error(`🔥 Redis GET error for key ${key}:`, error.message);
         return null; // Fail gracefully, fetch from DB
     }
 }
 
 /**
  * Set data in Redis cache
+ * ✅ Enhanced: Gracefully handles Redis being down
  * Cache automatically expires after TTL - next request will fetch fresh data from database
  */
 async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
     try {
+        // Check if Redis is connected
+        if (!redisClient.isConnected) {
+            logger.debug('Redis not connected, skipping cache set');
+            return;
+        }
+
         await redisClient.setEx(key, ttl, JSON.stringify(data));
-        logger.debug(`Cached data: ${key} (TTL: ${ttl}s)`);
+        logger.debug(`✅ Cached data: ${key} (TTL: ${ttl}s)`);
     } catch (error) {
-        logger.error(`Redis SET error for key ${key}:`, error);
+        logger.error(`🔥 Redis SET error for key ${key}:`, error.message);
         // Don't throw - caching is optional
     }
 }
 
 /**
  * Delete cached data from Redis
+ * ✅ Enhanced: Gracefully handles Redis being down
  */
 async function deleteCachedData(pattern) {
     try {
+        // Check if Redis is connected
+        if (!redisClient.isConnected) {
+            logger.debug('Redis not connected, skipping cache deletion');
+            return;
+        }
+
         if (pattern.includes('*')) {
             // Pattern-based deletion
             const keys = await redisClient.keys(pattern);
             if (keys.length > 0) {
-                await redisClient.del(keys);
-                logger.info(`Deleted ${keys.length} cached keys matching: ${pattern}`);
+                await redisClient.del(...keys); // ✅ Spread array for multiple keys
+                logger.info(`✅ Deleted ${keys.length} cached keys matching: ${pattern}`);
             }
         } else {
             // Single key deletion
             await redisClient.del(pattern);
-            logger.debug(`Deleted cached key: ${pattern}`);
+            logger.debug(`✅ Deleted cached key: ${pattern}`);
         }
     } catch (error) {
-        logger.error(`Redis DELETE error for pattern ${pattern}:`, error);
+        logger.error(`🔥 Redis DELETE error for pattern ${pattern}:`, error.message);
     }
 }
 
@@ -72,10 +93,10 @@ async function deleteCachedData(pattern) {
  */
 function formatDuration(minutes) {
     if (!minutes || minutes < 0) return "0 min";
-    if (minutes < 60) return `${minutes} min`;
+    if (minutes < 60) return `${Math.round(minutes)} min`;
 
     const hours = Math.floor(minutes / 60);
-    const mins = minutes % 60;
+    const mins = Math.round(minutes % 60);
 
     if (hours >= 24) {
         const days = Math.floor(hours / 24);
@@ -91,9 +112,8 @@ function formatDuration(minutes) {
  * Always keeps first and last waypoint, samples the middle ones
  */
 function sampleWaypoints(waypoints, maxPoints = MAX_WAYPOINTS_FOR_MAP) {
-    if (waypoints.length <= maxPoints) {
-        return waypoints; // No sampling needed
-    }
+    if (!waypoints || waypoints.length === 0) return [];
+    if (waypoints.length <= maxPoints) return waypoints;
 
     const sampled = [];
     const step = Math.floor(waypoints.length / (maxPoints - 1));
@@ -109,7 +129,7 @@ function sampleWaypoints(waypoints, maxPoints = MAX_WAYPOINTS_FOR_MAP) {
     // Always include last waypoint
     sampled.push(waypoints[waypoints.length - 1]);
 
-    logger.info(`Sampled waypoints: ${waypoints.length} -> ${sampled.length}`);
+    logger.info(`📊 Sampled waypoints: ${waypoints.length} → ${sampled.length}`);
     return sampled;
 }
 
@@ -122,7 +142,7 @@ exports.getVehicleTrips = async (req, res) => {
         const { vehicleId } = req.params;
         const { startDate, endDate, page = 1, limit = 50 } = req.query;
 
-        logger.info(`Fetching trips for vehicle: ${vehicleId}`, {
+        logger.info(`ℹ️ Fetching trips for vehicle: ${vehicleId}`, {
             vehicleId,
             startDate,
             endDate,
@@ -144,6 +164,7 @@ exports.getVehicleTrips = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info(`✅ Returning cached trips for vehicle ${vehicleId}`);
             return res.json(cachedData);
         }
 
@@ -153,7 +174,7 @@ exports.getVehicleTrips = async (req, res) => {
         });
 
         if (!vehicle) {
-            logger.warn(`Vehicle not found: ${vehicleId}`);
+            logger.warn(`⚠️ Vehicle not found: ${vehicleId}`);
             return res.status(404).json({
                 success: false,
                 message: "Vehicle not found"
@@ -191,7 +212,7 @@ exports.getVehicleTrips = async (req, res) => {
             offset: parseInt(offset)
         });
 
-        logger.info(`Fetched ${result.rows.length} trips out of ${result.count} total for vehicle ${vehicleId}`);
+        logger.info(`✅ Fetched ${result.rows.length} trips out of ${result.count} total for vehicle ${vehicleId}`);
 
         // Format trips
         const trips = result.rows.map(t => ({
@@ -246,7 +267,7 @@ exports.getVehicleTrips = async (req, res) => {
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getVehicleTrips:", error);
+        logger.error("🔥 Error in getVehicleTrips:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch vehicle trips",
@@ -263,7 +284,7 @@ exports.getTripDetails = async (req, res) => {
     try {
         const { tripId } = req.params;
 
-        logger.info(`Fetching trip details: ${tripId}`);
+        logger.info(`ℹ️ Fetching trip details: ${tripId}`);
 
         // Validate trip ID
         if (!tripId || isNaN(tripId)) {
@@ -278,6 +299,7 @@ exports.getTripDetails = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info(`✅ Returning cached trip details for ${tripId}`);
             return res.json(cachedData);
         }
 
@@ -290,7 +312,7 @@ exports.getTripDetails = async (req, res) => {
         });
 
         if (!trip) {
-            logger.warn(`Trip not found: ${tripId}`);
+            logger.warn(`⚠️ Trip not found: ${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
@@ -328,11 +350,11 @@ exports.getTripDetails = async (req, res) => {
         // Cache the response
         await setCachedData(cacheKey, responseData);
 
-        logger.info(`Trip details fetched successfully: ${tripId}`);
+        logger.info(`✅ Trip details fetched successfully: ${tripId}`);
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getTripDetails:", error);
+        logger.error("🔥 Error in getTripDetails:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch trip details",
@@ -348,9 +370,9 @@ exports.getTripDetails = async (req, res) => {
 exports.getTripRoute = async (req, res) => {
     try {
         const { tripId } = req.params;
-        const { maxPoints } = req.query; // Optional: client can request specific limit
+        const { maxPoints } = req.query;
 
-        logger.info(`Fetching trip route: ${tripId}`);
+        logger.info(`ℹ️ Fetching trip route: ${tripId}`);
 
         // Validate trip ID
         if (!tripId || isNaN(tripId)) {
@@ -366,6 +388,7 @@ exports.getTripRoute = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info(`✅ Returning cached route for trip ${tripId}`);
             return res.json(cachedData);
         }
 
@@ -374,7 +397,7 @@ exports.getTripRoute = async (req, res) => {
         });
 
         if (!trip) {
-            logger.warn(`Trip not found: ${tripId}`);
+            logger.warn(`⚠️ Trip not found: ${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
@@ -388,9 +411,9 @@ exports.getTripRoute = async (req, res) => {
             attributes: ['latitude', 'longitude', 'speed', 'recorded_at', 'sequence_order']
         });
 
-        logger.info(`Fetched ${waypoints.length} waypoints for trip ${tripId}`);
+        logger.info(`📍 Fetched ${waypoints.length} waypoints for trip ${tripId}`);
 
-        // 🆕 Sample waypoints if too many
+        // Sample waypoints if too many
         const sampledWaypoints = sampleWaypoints(waypoints, limit);
 
         const responseData = {
@@ -413,8 +436,8 @@ exports.getTripRoute = async (req, res) => {
                         longitude: parseFloat(waypoints[0]?.longitude)
                     },
                     end: {
-                        latitude: parseFloat(waypoints.at(-1)?.latitude),
-                        longitude: parseFloat(waypoints.at(-1)?.longitude)
+                        latitude: parseFloat(waypoints[waypoints.length - 1]?.latitude),
+                        longitude: parseFloat(waypoints[waypoints.length - 1]?.longitude)
                     }
                 }
             }
@@ -426,7 +449,7 @@ exports.getTripRoute = async (req, res) => {
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getTripRoute:", error);
+        logger.error("🔥 Error in getTripRoute:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch trip route",
@@ -436,17 +459,15 @@ exports.getTripRoute = async (req, res) => {
 };
 
 /**
- * 🆕 OPTIMIZED: Get trip details with sampled route (CORRECT ENDPOINT for Flutter)
+ * 🆕 OPTIMIZED: Get trip details with sampled route
  * GET /api/trips/:tripId/details-with-route
- *
- * This endpoint combines trip details with SAMPLED waypoints for fast loading
  */
 exports.getTripDetailsWithRoute = async (req, res) => {
     try {
         const { tripId } = req.params;
-        const { maxPoints } = req.query; // Optional waypoint limit
+        const { maxPoints } = req.query;
 
-        logger.info(`Fetching trip details with route: ${tripId}`);
+        logger.info(`ℹ️ Fetching trip details with route: ${tripId}`);
 
         // Validate trip ID
         if (!tripId || isNaN(tripId)) {
@@ -462,7 +483,7 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
-            logger.info(`Returning cached trip details with route for ${tripId}`);
+            logger.info(`✅ Returning cached trip details with route for ${tripId}`);
             return res.json(cachedData);
         }
 
@@ -476,26 +497,26 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         });
 
         if (!trip) {
-            logger.warn(`Trip not found: ${tripId}`);
+            logger.warn(`⚠️ Trip not found: ${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
             });
         }
 
-        // Fetch waypoints with optimized query
+        // Fetch waypoints
         const waypoints = await TripWaypoint.findAll({
             where: { trip_id: tripId },
             order: [['sequence_order', 'ASC']],
             attributes: ['latitude', 'longitude', 'speed', 'recorded_at', 'sequence_order']
         });
 
-        logger.info(`Fetched trip ${tripId} with ${waypoints.length} waypoints`);
+        logger.info(`📍 Fetched trip ${tripId} with ${waypoints.length} waypoints`);
 
-        // 🆕 Sample waypoints for performance
+        // Sample waypoints for performance
         const sampledWaypoints = sampleWaypoints(waypoints, limit);
 
-        logger.info(`Sampled to ${sampledWaypoints.length} waypoints for mobile app`);
+        logger.info(`📊 Returning ${sampledWaypoints.length}/${waypoints.length} waypoints`);
 
         // Format response
         const responseData = {
@@ -532,7 +553,6 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     timestamp: w.recorded_at,
                     order: w.sequence_order
                 })),
-                // Metadata about sampling
                 metadata: {
                     totalWaypoints: waypoints.length,
                     returnedWaypoints: sampledWaypoints.length,
@@ -547,11 +567,10 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         // Cache the response
         await setCachedData(cacheKey, responseData);
 
-        logger.info(`Returning trip ${tripId} with ${sampledWaypoints.length}/${waypoints.length} waypoints`);
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getTripDetailsWithRoute:", error);
+        logger.error("🔥 Error in getTripDetailsWithRoute:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch trip details with route",
@@ -561,7 +580,7 @@ exports.getTripDetailsWithRoute = async (req, res) => {
 };
 
 /**
- * 🆕 OPTIMIZED: Get vehicle trip statistics with limit
+ * 🆕 OPTIMIZED: Get vehicle trip statistics
  * GET /api/trips/vehicle/:vehicleId/stats
  */
 exports.getVehicleTripStats = async (req, res) => {
@@ -569,7 +588,7 @@ exports.getVehicleTripStats = async (req, res) => {
         const { vehicleId } = req.params;
         const { startDate, endDate } = req.query;
 
-        logger.info(`Fetching trip stats for vehicle: ${vehicleId}`, {
+        logger.info(`ℹ️ Fetching trip stats for vehicle: ${vehicleId}`, {
             vehicleId,
             startDate,
             endDate
@@ -588,6 +607,7 @@ exports.getVehicleTripStats = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info(`✅ Returning cached stats for vehicle ${vehicleId}`);
             return res.json(cachedData);
         }
 
@@ -596,7 +616,7 @@ exports.getVehicleTripStats = async (req, res) => {
         });
 
         if (!vehicle) {
-            logger.warn(`Vehicle not found: ${vehicleId}`);
+            logger.warn(`⚠️ Vehicle not found: ${vehicleId}`);
             return res.status(404).json({
                 success: false,
                 message: "Vehicle not found"
@@ -605,7 +625,7 @@ exports.getVehicleTripStats = async (req, res) => {
 
         const whereClause = {
             vehicle_id: vehicleId,
-            status: 'completed' // Only completed trips
+            status: 'completed'
         };
 
         if (startDate || endDate) {
@@ -618,7 +638,7 @@ exports.getVehicleTripStats = async (req, res) => {
             }
         }
 
-        // 🆕 LIMIT trips to prevent memory issues
+        // Limit trips to prevent memory issues
         const trips = await Trip.findAll({
             where: whereClause,
             attributes: [
@@ -632,7 +652,7 @@ exports.getVehicleTripStats = async (req, res) => {
             raw: true
         });
 
-        logger.info(`Calculated stats from ${trips.length} trips for vehicle ${vehicleId}`);
+        logger.info(`📊 Calculated stats from ${trips.length} trips for vehicle ${vehicleId}`);
 
         if (!trips.length) {
             const responseData = {
@@ -680,7 +700,7 @@ exports.getVehicleTripStats = async (req, res) => {
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getVehicleTripStats:", error);
+        logger.error("🔥 Error in getVehicleTripStats:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch trip statistics",
@@ -697,13 +717,14 @@ exports.getAllTrips = async (req, res) => {
     try {
         const { startDate, endDate, page = 1, limit = 50 } = req.query;
 
-        logger.info("Fetching all trips", { startDate, endDate, page, limit });
+        logger.info("ℹ️ Fetching all trips", { startDate, endDate, page, limit });
 
         const cacheKey = `trips:all:page:${page}:limit:${limit}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
 
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info('✅ Returning cached trips list');
             return res.json(cachedData);
         }
 
@@ -732,7 +753,7 @@ exports.getAllTrips = async (req, res) => {
             offset: parseInt(offset)
         });
 
-        logger.info(`Fetched ${result.rows.length} trips out of ${result.count} total`);
+        logger.info(`✅ Fetched ${result.rows.length} trips out of ${result.count} total`);
 
         const responseData = { success: true, data: result };
 
@@ -742,7 +763,7 @@ exports.getAllTrips = async (req, res) => {
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getAllTrips:", error);
+        logger.error("🔥 Error in getAllTrips:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch trips",
@@ -759,7 +780,7 @@ exports.deleteTrip = async (req, res) => {
     try {
         const { tripId } = req.params;
 
-        logger.info(`Deleting trip: ${tripId}`);
+        logger.info(`ℹ️ Deleting trip: ${tripId}`);
 
         // Validate trip ID
         if (!tripId || isNaN(tripId)) {
@@ -771,7 +792,7 @@ exports.deleteTrip = async (req, res) => {
 
         const trip = await Trip.findByPk(tripId);
         if (!trip) {
-            logger.warn(`Trip not found for deletion: ${tripId}`);
+            logger.warn(`⚠️ Trip not found for deletion: ${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
@@ -781,7 +802,7 @@ exports.deleteTrip = async (req, res) => {
         const vehicleId = trip.vehicle_id;
 
         await trip.destroy();
-        logger.info(`Trip deleted successfully: ${tripId}`);
+        logger.info(`✅ Trip deleted successfully: ${tripId}`);
 
         // Invalidate all related caches
         await deleteCachedData(`trip:details:${tripId}`);
@@ -792,7 +813,7 @@ exports.deleteTrip = async (req, res) => {
         await deleteCachedData(`trip:stats:${vehicleId}:*`);
         await deleteCachedData(`trips:all:*`);
 
-        logger.info(`Cleared all related caches for trip ${tripId} and vehicle ${vehicleId}`);
+        logger.info(`✅ Cleared all related caches for trip ${tripId}`);
 
         res.json({
             success: true,
@@ -800,7 +821,7 @@ exports.deleteTrip = async (req, res) => {
         });
 
     } catch (error) {
-        logger.error("Error in deleteTrip:", error);
+        logger.error("🔥 Error in deleteTrip:", error);
         res.status(500).json({
             success: false,
             message: "Failed to delete trip",
@@ -810,16 +831,15 @@ exports.deleteTrip = async (req, res) => {
 };
 
 /**
- * Get trip details with full route (legacy endpoint - kept for backwards compatibility)
+ * Get trip details with full route (legacy endpoint)
  * GET /api/trips/:tripId/full
- *
- * Note: This returns ALL waypoints. For mobile apps, use /details-with-route instead
+ * ⚠️ Returns ALL waypoints - use /details-with-route for mobile apps
  */
 exports.getTripFull = async (req, res) => {
     try {
         const { tripId } = req.params;
 
-        logger.info(`Fetching FULL trip details (all waypoints): ${tripId}`);
+        logger.info(`ℹ️ Fetching FULL trip details (all waypoints): ${tripId}`);
 
         // Validate trip ID
         if (!tripId || isNaN(tripId)) {
@@ -834,6 +854,7 @@ exports.getTripFull = async (req, res) => {
         // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
+            logger.info(`✅ Returning cached full trip for ${tripId}`);
             return res.json(cachedData);
         }
 
@@ -847,7 +868,7 @@ exports.getTripFull = async (req, res) => {
         });
 
         if (!trip) {
-            logger.warn(`Trip not found: ${tripId}`);
+            logger.warn(`⚠️ Trip not found: ${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
@@ -861,7 +882,7 @@ exports.getTripFull = async (req, res) => {
             attributes: ['latitude', 'longitude', 'speed', 'recorded_at', 'sequence_order']
         });
 
-        logger.info(`Fetched trip ${tripId} with ${waypoints.length} waypoints (FULL)`);
+        logger.info(`📍 Fetched trip ${tripId} with ${waypoints.length} waypoints (FULL)`);
 
         // Format response
         const responseData = {
@@ -907,7 +928,7 @@ exports.getTripFull = async (req, res) => {
         res.json(responseData);
 
     } catch (error) {
-        logger.error("Error in getTripFull:", error);
+        logger.error("🔥 Error in getTripFull:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch full trip details",
