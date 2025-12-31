@@ -108,6 +108,8 @@ exports.issueCommandToVehicle = async (req, res) => {
     }
 };
 
+
+
 exports.getRealtimeVehicleStatus = async (req, res) => {
     console.log("\n📥 ========== GET REALTIME STATUS ==========");
 

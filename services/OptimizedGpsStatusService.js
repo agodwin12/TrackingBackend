@@ -14,22 +14,22 @@ const axios = require("axios");
  * @returns {Object} - Parsed status object
  */
 function parseGpsStatus(statusString) {
-    // Ensure we have an 8-character string
-    const status = String(statusString || "00000000").padEnd(8, "0");
+    // Ensure we have a 9-character string
+    const status = String(statusString || "000000000").padEnd(9, "0");
 
     return {
         accOn: status[0] === "1",           // Position 0: ACC state
         defenseOn: status[1] === "1",       // Position 1: Defense state
-        gpsSignal: status[2] === "1",       // Position 2: GPS signal (1=valid)
-        engineOn: status[3] === "1",        // Position 3: RELAY/ENGINE ⭐ KEY FIELD
+        engineOn: status[2] === "1",        // Position 2: RELAY/ENGINE ⭐ CORRECT!
+        gpsSignal: status[3] === "1",       // Position 3: GPS signal (1=valid, 0=invalid)
         oilPowerOn: status[4] === "1",      // Position 4: Oil/power state
         doorOpen: status[5] === "1",        // Position 5: Door state
         reserved: status[6] === "1",        // Position 6: Reserved
-        customAlarm: status[7] === "1",     // Position 7: Custom alarm
+        reserved2: status[7] === "1",       // Position 7: Reserved
+        customAlarm: status[8] === "1",     // Position 8: Custom alarm
         rawStatus: status,
     };
 }
-
 /**
  * Get vehicle status with 3-tier optimization:
  * 1. Check Redis cache (fastest)

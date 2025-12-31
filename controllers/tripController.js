@@ -10,7 +10,7 @@ const TRIP_CACHE_TTL = 300; // 5 minutes (300 seconds)
 const EMPTY_RESULT_TTL = 60; // 1 minute for empty results
 
 // 🆕 Waypoint limits for performance
-const MAX_WAYPOINTS_FOR_MAP = 200; // Maximum waypoints to send to mobile app
+const MAX_WAYPOINTS_FOR_MAP = 500; // Maximum waypoints to send to mobile app
 const STATS_TRIP_LIMIT = 1000; // Maximum trips to calculate stats from
 
 /**
@@ -19,7 +19,6 @@ const STATS_TRIP_LIMIT = 1000; // Maximum trips to calculate stats from
  */
 async function getCachedData(key) {
     try {
-        // Check if Redis is connected
         if (!redisClient.isConnected) {
             logger.debug('Redis not connected, skipping cache');
             return null;
@@ -34,18 +33,16 @@ async function getCachedData(key) {
         return null;
     } catch (error) {
         logger.error(`🔥 Redis GET error for key ${key}:`, error.message);
-        return null; // Fail gracefully, fetch from DB
+        return null;
     }
 }
 
 /**
  * Set data in Redis cache
  * ✅ Enhanced: Gracefully handles Redis being down
- * Cache automatically expires after TTL - next request will fetch fresh data from database
  */
 async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
     try {
-        // Check if Redis is connected
         if (!redisClient.isConnected) {
             logger.debug('Redis not connected, skipping cache set');
             return;
@@ -55,7 +52,6 @@ async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
         logger.debug(`✅ Cached data: ${key} (TTL: ${ttl}s)`);
     } catch (error) {
         logger.error(`🔥 Redis SET error for key ${key}:`, error.message);
-        // Don't throw - caching is optional
     }
 }
 
@@ -65,21 +61,18 @@ async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
  */
 async function deleteCachedData(pattern) {
     try {
-        // Check if Redis is connected
         if (!redisClient.isConnected) {
             logger.debug('Redis not connected, skipping cache deletion');
             return;
         }
 
         if (pattern.includes('*')) {
-            // Pattern-based deletion
             const keys = await redisClient.keys(pattern);
             if (keys.length > 0) {
-                await redisClient.del(...keys); // ✅ Spread array for multiple keys
+                await redisClient.del(...keys);
                 logger.info(`✅ Deleted ${keys.length} cached keys matching: ${pattern}`);
             }
         } else {
-            // Single key deletion
             await redisClient.del(pattern);
             logger.debug(`✅ Deleted cached key: ${pattern}`);
         }
@@ -108,28 +101,128 @@ function formatDuration(minutes) {
 }
 
 /**
- * 🆕 Sample waypoints intelligently to reduce data transfer
- * Always keeps first and last waypoint, samples the middle ones
+ * Convert degrees to radians
  */
-function sampleWaypoints(waypoints, maxPoints = MAX_WAYPOINTS_FOR_MAP) {
-    if (!waypoints || waypoints.length === 0) return [];
+function toRadians(degrees) {
+    return degrees * Math.PI / 180;
+}
+
+/**
+ * Convert radians to degrees
+ */
+function toDegrees(radians) {
+    return radians * 180 / Math.PI;
+}
+
+/**
+ * 🆕 Calculate bearing between two points
+ */
+function calculateBearing(lat1, lon1, lat2, lon2) {
+    const dLon = toRadians(lon2 - lon1);
+    const y = Math.sin(dLon) * Math.cos(toRadians(lat2));
+    const x = Math.cos(toRadians(lat1)) * Math.sin(toRadians(lat2)) -
+        Math.sin(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.cos(dLon);
+    const bearing = toDegrees(Math.atan2(y, x));
+    return (bearing + 360) % 360;
+}
+
+/**
+ * 🆕 Detect if a waypoint represents a significant turn
+ */
+function isSignificantTurn(prev, curr, next) {
+    try {
+        const bearing1 = calculateBearing(
+            parseFloat(prev.latitude),
+            parseFloat(prev.longitude),
+            parseFloat(curr.latitude),
+            parseFloat(curr.longitude)
+        );
+
+        const bearing2 = calculateBearing(
+            parseFloat(curr.latitude),
+            parseFloat(curr.longitude),
+            parseFloat(next.latitude),
+            parseFloat(next.longitude)
+        );
+
+        // Calculate angle difference
+        let angleDiff = Math.abs(bearing2 - bearing1);
+        if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+        // Consider it a turn if angle change is > 15 degrees
+        return angleDiff > 15;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * 🆕 SMART SAMPLING: Preserves important points (turns, speed changes)
+ */
+function smartSample(waypoints, maxPoints) {
     if (waypoints.length <= maxPoints) return waypoints;
 
     const sampled = [];
-    const step = Math.floor(waypoints.length / (maxPoints - 1));
 
-    // Always include first waypoint
+    // Always keep first point
     sampled.push(waypoints[0]);
 
-    // Sample middle waypoints
+    // Calculate base sampling rate
+    const step = Math.max(1, Math.floor(waypoints.length / (maxPoints - 2)));
+
     for (let i = step; i < waypoints.length - 1; i += step) {
-        sampled.push(waypoints[i]);
+        const prevIndex = Math.max(0, i - step);
+        const nextIndex = Math.min(waypoints.length - 1, i + step);
+
+        const prev = waypoints[prevIndex];
+        const curr = waypoints[i];
+        const next = waypoints[nextIndex];
+
+        // Check if this is a turn
+        const isTurn = isSignificantTurn(prev, curr, next);
+
+        // Always keep turns, or keep based on sampling rate
+        if (isTurn || sampled.length < maxPoints - 1) {
+            sampled.push(curr);
+        }
     }
 
-    // Always include last waypoint
+    // Always keep last point
     sampled.push(waypoints[waypoints.length - 1]);
 
-    logger.info(`📊 Sampled waypoints: ${waypoints.length} → ${sampled.length}`);
+    return sampled;
+}
+
+/**
+ * 🆕 SMART WAYPOINT SAMPLING: Preserves route shape for all trip lengths
+ * - Short trips (< 1 km): Keep ALL waypoints
+ * - Medium trips (1-5 km): Adaptive sampling based on distance
+ * - Long trips (> 5 km): More aggressive sampling with turn preservation
+ */
+function sampleWaypoints(waypoints, tripDistanceKm = 0, maxPoints = MAX_WAYPOINTS_FOR_MAP) {
+    if (!waypoints || waypoints.length === 0) return [];
+
+    // ✅ CRITICAL: For short trips, keep ALL waypoints to show curves
+    if (tripDistanceKm < 1.0) {
+        logger.info(`📍 Short trip (${tripDistanceKm.toFixed(2)} km) - keeping ALL ${waypoints.length} waypoints`);
+        return waypoints;
+    }
+
+    // ✅ For medium trips, use less aggressive sampling
+    if (tripDistanceKm < 5.0) {
+        maxPoints = 400; // Increase limit for medium trips
+        logger.info(`📍 Medium trip (${tripDistanceKm.toFixed(2)} km) - using ${maxPoints} point limit`);
+    }
+
+    if (waypoints.length <= maxPoints) {
+        logger.info(`📍 Trip has ${waypoints.length} waypoints - no sampling needed`);
+        return waypoints;
+    }
+
+    // ✅ Use smart sampling to preserve shape
+    const sampled = smartSample(waypoints, maxPoints);
+
+    logger.info(`📊 Sampled waypoints: ${waypoints.length} → ${sampled.length} (${tripDistanceKm.toFixed(2)} km trip)`);
     return sampled;
 }
 
@@ -150,7 +243,6 @@ exports.getVehicleTrips = async (req, res) => {
             limit
         });
 
-        // Validate vehicle ID
         if (!vehicleId || isNaN(vehicleId)) {
             return res.status(400).json({
                 success: false,
@@ -158,19 +250,16 @@ exports.getVehicleTrips = async (req, res) => {
             });
         }
 
-        // Create cache key with all parameters
         const cacheKey = `trips:vehicle:${vehicleId}:page:${page}:limit:${limit}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached trips for vehicle ${vehicleId}`);
             return res.json(cachedData);
         }
 
-        // Verify vehicle exists
         const vehicle = await Voiture.findByPk(vehicleId, {
-            attributes: ['id'] // Only need ID for existence check
+            attributes: ['id']
         });
 
         if (!vehicle) {
@@ -181,7 +270,6 @@ exports.getVehicleTrips = async (req, res) => {
             });
         }
 
-        // Build query conditions
         const whereClause = {
             vehicle_id: vehicleId,
             status: 'completed'
@@ -214,7 +302,6 @@ exports.getVehicleTrips = async (req, res) => {
 
         logger.info(`✅ Fetched ${result.rows.length} trips out of ${result.count} total for vehicle ${vehicleId}`);
 
-        // Format trips
         const trips = result.rows.map(t => ({
             id: t.id,
             vehicleId: t.vehicle_id,
@@ -261,7 +348,6 @@ exports.getVehicleTrips = async (req, res) => {
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
@@ -286,7 +372,6 @@ exports.getTripDetails = async (req, res) => {
 
         logger.info(`ℹ️ Fetching trip details: ${tripId}`);
 
-        // Validate trip ID
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
                 success: false,
@@ -296,7 +381,6 @@ exports.getTripDetails = async (req, res) => {
 
         const cacheKey = `trip:details:${tripId}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached trip details for ${tripId}`);
@@ -347,7 +431,6 @@ exports.getTripDetails = async (req, res) => {
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         logger.info(`✅ Trip details fetched successfully: ${tripId}`);
@@ -374,7 +457,6 @@ exports.getTripRoute = async (req, res) => {
 
         logger.info(`ℹ️ Fetching trip route: ${tripId}`);
 
-        // Validate trip ID
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
                 success: false,
@@ -385,7 +467,6 @@ exports.getTripRoute = async (req, res) => {
         const limit = maxPoints ? parseInt(maxPoints) : MAX_WAYPOINTS_FOR_MAP;
         const cacheKey = `trip:route:${tripId}:limit:${limit}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached route for trip ${tripId}`);
@@ -393,7 +474,7 @@ exports.getTripRoute = async (req, res) => {
         }
 
         const trip = await Trip.findByPk(tripId, {
-            attributes: ['id', 'waypoint_count']
+            attributes: ['id', 'waypoint_count', 'total_distance_km']
         });
 
         if (!trip) {
@@ -404,7 +485,6 @@ exports.getTripRoute = async (req, res) => {
             });
         }
 
-        // Fetch ALL waypoints
         const waypoints = await TripWaypoint.findAll({
             where: { trip_id: tripId },
             order: [['sequence_order', 'ASC']],
@@ -413,8 +493,8 @@ exports.getTripRoute = async (req, res) => {
 
         logger.info(`📍 Fetched ${waypoints.length} waypoints for trip ${tripId}`);
 
-        // Sample waypoints if too many
-        const sampledWaypoints = sampleWaypoints(waypoints, limit);
+        const tripDistance = parseFloat(trip.total_distance_km || 0);
+        const sampledWaypoints = sampleWaypoints(waypoints, tripDistance, limit);
 
         const responseData = {
             success: true,
@@ -443,7 +523,6 @@ exports.getTripRoute = async (req, res) => {
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
@@ -459,7 +538,7 @@ exports.getTripRoute = async (req, res) => {
 };
 
 /**
- * 🆕 OPTIMIZED: Get trip details with sampled route
+ * 🆕 OPTIMIZED: Get trip details with smart sampled route
  * GET /api/trips/:tripId/details-with-route
  */
 exports.getTripDetailsWithRoute = async (req, res) => {
@@ -469,7 +548,6 @@ exports.getTripDetailsWithRoute = async (req, res) => {
 
         logger.info(`ℹ️ Fetching trip details with route: ${tripId}`);
 
-        // Validate trip ID
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
                 success: false,
@@ -480,14 +558,12 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         const limit = maxPoints ? parseInt(maxPoints) : MAX_WAYPOINTS_FOR_MAP;
         const cacheKey = `trip:details-route:${tripId}:limit:${limit}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached trip details with route for ${tripId}`);
             return res.json(cachedData);
         }
 
-        // Fetch trip details
         const trip = await Trip.findByPk(tripId, {
             include: [{
                 model: Voiture,
@@ -504,7 +580,6 @@ exports.getTripDetailsWithRoute = async (req, res) => {
             });
         }
 
-        // Fetch waypoints
         const waypoints = await TripWaypoint.findAll({
             where: { trip_id: tripId },
             order: [['sequence_order', 'ASC']],
@@ -513,12 +588,12 @@ exports.getTripDetailsWithRoute = async (req, res) => {
 
         logger.info(`📍 Fetched trip ${tripId} with ${waypoints.length} waypoints`);
 
-        // Sample waypoints for performance
-        const sampledWaypoints = sampleWaypoints(waypoints, limit);
+        // ✅ Pass trip distance to smart sampling
+        const tripDistance = parseFloat(trip.total_distance_km || 0);
+        const sampledWaypoints = sampleWaypoints(waypoints, tripDistance, limit);
 
         logger.info(`📊 Returning ${sampledWaypoints.length}/${waypoints.length} waypoints`);
 
-        // Format response
         const responseData = {
             success: true,
             data: {
@@ -559,12 +634,12 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     isSampled: sampledWaypoints.length < waypoints.length,
                     samplingRatio: waypoints.length > 0
                         ? (sampledWaypoints.length / waypoints.length).toFixed(2)
-                        : 1
+                        : 1,
+                    tripDistanceKm: tripDistance
                 }
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
@@ -594,7 +669,6 @@ exports.getVehicleTripStats = async (req, res) => {
             endDate
         });
 
-        // Validate vehicle ID
         if (!vehicleId || isNaN(vehicleId)) {
             return res.status(400).json({
                 success: false,
@@ -604,7 +678,6 @@ exports.getVehicleTripStats = async (req, res) => {
 
         const cacheKey = `trip:stats:${vehicleId}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached stats for vehicle ${vehicleId}`);
@@ -638,7 +711,6 @@ exports.getVehicleTripStats = async (req, res) => {
             }
         }
 
-        // Limit trips to prevent memory issues
         const trips = await Trip.findAll({
             where: whereClause,
             attributes: [
@@ -667,7 +739,6 @@ exports.getVehicleTripStats = async (req, res) => {
                 }
             };
 
-            // Cache empty result with shorter TTL
             await setCachedData(cacheKey, responseData, EMPTY_RESULT_TTL);
 
             return res.json(responseData);
@@ -694,7 +765,6 @@ exports.getVehicleTripStats = async (req, res) => {
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
@@ -721,7 +791,6 @@ exports.getAllTrips = async (req, res) => {
 
         const cacheKey = `trips:all:page:${page}:limit:${limit}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info('✅ Returning cached trips list');
@@ -757,7 +826,6 @@ exports.getAllTrips = async (req, res) => {
 
         const responseData = { success: true, data: result };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
@@ -782,7 +850,6 @@ exports.deleteTrip = async (req, res) => {
 
         logger.info(`ℹ️ Deleting trip: ${tripId}`);
 
-        // Validate trip ID
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
                 success: false,
@@ -804,7 +871,6 @@ exports.deleteTrip = async (req, res) => {
         await trip.destroy();
         logger.info(`✅ Trip deleted successfully: ${tripId}`);
 
-        // Invalidate all related caches
         await deleteCachedData(`trip:details:${tripId}`);
         await deleteCachedData(`trip:route:${tripId}:*`);
         await deleteCachedData(`trip:details-route:${tripId}:*`);
@@ -841,7 +907,6 @@ exports.getTripFull = async (req, res) => {
 
         logger.info(`ℹ️ Fetching FULL trip details (all waypoints): ${tripId}`);
 
-        // Validate trip ID
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
                 success: false,
@@ -851,14 +916,12 @@ exports.getTripFull = async (req, res) => {
 
         const cacheKey = `trip:full:${tripId}`;
 
-        // Try to get from cache
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             logger.info(`✅ Returning cached full trip for ${tripId}`);
             return res.json(cachedData);
         }
 
-        // Fetch trip details
         const trip = await Trip.findByPk(tripId, {
             include: [{
                 model: Voiture,
@@ -875,7 +938,6 @@ exports.getTripFull = async (req, res) => {
             });
         }
 
-        // Fetch ALL waypoints (no sampling)
         const waypoints = await TripWaypoint.findAll({
             where: { trip_id: tripId },
             order: [['sequence_order', 'ASC']],
@@ -884,7 +946,6 @@ exports.getTripFull = async (req, res) => {
 
         logger.info(`📍 Fetched trip ${tripId} with ${waypoints.length} waypoints (FULL)`);
 
-        // Format response
         const responseData = {
             success: true,
             data: {
@@ -922,7 +983,6 @@ exports.getTripFull = async (req, res) => {
             }
         };
 
-        // Cache the response
         await setCachedData(cacheKey, responseData);
 
         res.json(responseData);
