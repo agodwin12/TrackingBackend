@@ -5,6 +5,8 @@ const { Op } = require("sequelize");
 const cacheService = require("./cacheService");
 const { loginGps } = require("./GpsService");
 const axios = require("axios");
+const db = require("../models");
+
 
 /**
  * Parse GPS status string (8-character binary string)
@@ -59,8 +61,7 @@ async function getVehicleStatus(vehicleId, macIdGps) {
 
         console.log("⚠️ Cache MISS - Querying database");
 
-        // ========== TIER 2: QUERY DATABASE (🗄️ ~10-50ms) ==========
-        const db = require("../models");
+
         const Location = db.Location;
 
         const latestLocation = await Location.findOne({
@@ -132,12 +133,12 @@ async function getVehicleStatus(vehicleId, macIdGps) {
 
         console.log("🔑 GPS login successful, fetching device data...");
 
-        // ⭐ CORRECT API METHOD: getUserAndGpsInfoByIDsUtc
+
         const response = await axios.get(
             "http://apitest.18gps.net/GetDateServices.asmx/GetDate",
             {
                 params: {
-                    method: "getUserAndGpsInfoByIDsUtc",  // ⭐ CORRECT METHOD
+                    method: "getUserAndGpsInfoByIDsUtc",
                     mds: token,
                     simlist: macIdGps,
                 },
@@ -271,6 +272,7 @@ async function getVehicleStatus(vehicleId, macIdGps) {
  *
  * @param {number} vehicleId - Vehicle ID
  */
+
 async function invalidateStatusCache(vehicleId) {
     const cacheKey = `vehicle:${vehicleId}:status`;
     await cacheService.del(cacheKey);
@@ -283,6 +285,7 @@ async function invalidateStatusCache(vehicleId) {
  * @param {Array<Object>} vehicles - Array of {vehicleId, macIdGps}
  * @returns {Promise<Object>} - Map of vehicleId to status
  */
+
 async function batchGetVehicleStatus(vehicles) {
     console.log(`📦 Batch fetching status for ${vehicles.length} vehicles`);
 

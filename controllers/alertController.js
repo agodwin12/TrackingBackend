@@ -1,317 +1,33 @@
 // controllers/alertController.js
+const { Alert, Voiture, User } = require("../models");
+const axios = require('axios');
 
-const { Alert, Voiture } = require("../models");
-const { Op } = require("sequelize");
-
-/**
- * Get alerts for a specific vehicle with pagination and filters
- * GET /api/alerts/vehicle/:vehicleId
- */
+// ========== GET ALERTS BY VEHICLE ==========
 exports.getAlertsByVehicle = async (req, res) => {
     try {
         const { vehicleId } = req.params;
-        const {
-            page = 1,
-            limit = 20,
-            alertType,      // Filter by type: 'geofence', 'safe_zone', 'speed', 'time_zone', 'engine'
-            read,           // Filter by read status: true/false
-            status,         // Filter by alert_status: 'ACTIVE', 'RESOLVED', 'FALSE_ALARM'
-            startDate,      // Filter from date
-            endDate         // Filter to date
-        } = req.query;
 
-        console.log(`\n📌 [getAlertsByVehicle] Vehicle ID: ${vehicleId}`);
-        console.log(`➡ Pagination: page=${page}, limit=${limit}`);
-        console.log(`➡ Filters:`, { alertType, read, status, startDate, endDate });
-
-        // Build where clause
-        const whereClause = { voiture_id: vehicleId };
-
-        // Filter by alert type
-        if (alertType) {
-            whereClause.alert_type = alertType;
-        }
-
-        // Filter by read status
-        if (read !== undefined) {
-            whereClause.read = read === 'true';
-        }
-
-        // Filter by alert status
-        if (status) {
-            whereClause.alert_status = status;
-        }
-
-        // Filter by date range
-        if (startDate || endDate) {
-            whereClause.alerted_at = {};
-            if (startDate) {
-                whereClause.alerted_at[Op.gte] = new Date(startDate);
-            }
-            if (endDate) {
-                const endDatePlusOne = new Date(endDate);
-                endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-                whereClause.alerted_at[Op.lt] = endDatePlusOne;
-            }
-        }
-
-        // Calculate offset
-        const offset = (page - 1) * limit;
-
-        // Fetch alerts with pagination
-        const result = await Alert.findAndCountAll({
-            where: whereClause,
+        const alerts = await Alert.findAll({
+            where: { voiture_id: vehicleId },
             order: [["alerted_at", "DESC"]],
-            limit: parseInt(limit),
-            offset: parseInt(offset),
-            attributes: [
-                'id',
-                'voiture_id',
-                'alert_type',
-                'message',
-                'alerted_at',
-                'sent',
-                'read',
-                'processed',
-                'latitude',
-                'longitude',
-                'alert_status',
-                'created_at'
-            ]
         });
 
-        const totalPages = Math.ceil(result.count / limit);
-
-        console.log(`✅ Fetched ${result.rows.length} alerts (Total: ${result.count})`);
-
-        return res.status(200).json({
+        res.json({
             success: true,
-            data: {
-                alerts: result.rows,
-                pagination: {
-                    currentPage: parseInt(page),
-                    totalPages,
-                    totalAlerts: result.count,
-                    alertsPerPage: parseInt(limit),
-                    hasNextPage: page < totalPages,
-                    hasPreviousPage: page > 1
-                }
-            }
+            count: alerts.length,
+            alerts,
         });
-
     } catch (error) {
-        console.error("🔥 Error fetching alerts:", error);
-        return res.status(500).json({
+        console.error("Error fetching alerts:", error);
+        res.status(500).json({
             success: false,
-            message: "Server error while fetching alerts",
-            error: error.message
+            message: "Error fetching alerts",
+            error: error.message,
         });
     }
 };
 
-/**
- * Get all alerts across all vehicles (admin view) with pagination
- * GET /api/alerts
- */
-exports.getAllAlerts = async (req, res) => {
-    try {
-        const {
-            page = 1,
-            limit = 50,
-            alertType,
-            read,
-            status,
-            startDate,
-            endDate
-        } = req.query;
-
-        console.log(`\n📌 [getAllAlerts] Request received`);
-        console.log(`➡ Pagination: page=${page}, limit=${limit}`);
-
-        // Build where clause
-        const whereClause = {};
-
-        if (alertType) {
-            whereClause.alert_type = alertType;
-        }
-
-        if (read !== undefined) {
-            whereClause.read = read === 'true';
-        }
-
-        if (status) {
-            whereClause.alert_status = status;
-        }
-
-        if (startDate || endDate) {
-            whereClause.alerted_at = {};
-            if (startDate) {
-                whereClause.alerted_at[Op.gte] = new Date(startDate);
-            }
-            if (endDate) {
-                const endDatePlusOne = new Date(endDate);
-                endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-                whereClause.alerted_at[Op.lt] = endDatePlusOne;
-            }
-        }
-
-        const offset = (page - 1) * limit;
-
-        const result = await Alert.findAndCountAll({
-            where: whereClause,
-            include: [
-                {
-                    model: Voiture,
-                    as: 'vehicle',
-                    attributes: ['id', 'immatriculation', 'marque', 'model', 'nickname']
-                }
-            ],
-            order: [["alerted_at", "DESC"]],
-            limit: parseInt(limit),
-            offset: parseInt(offset)
-        });
-
-        const totalPages = Math.ceil(result.count / limit);
-
-        console.log(`✅ Fetched ${result.rows.length} alerts (Total: ${result.count})`);
-
-        return res.status(200).json({
-            success: true,
-            data: {
-                alerts: result.rows,
-                pagination: {
-                    currentPage: parseInt(page),
-                    totalPages,
-                    totalAlerts: result.count,
-                    alertsPerPage: parseInt(limit),
-                    hasNextPage: page < totalPages,
-                    hasPreviousPage: page > 1
-                }
-            }
-        });
-
-    } catch (error) {
-        console.error("🔥 Error fetching all alerts:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Server error while fetching alerts",
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get unread alert count for a vehicle
- * GET /api/alerts/vehicle/:vehicleId/unread-count
- */
-exports.getUnreadCount = async (req, res) => {
-    try {
-        const { vehicleId } = req.params;
-
-        const count = await Alert.count({
-            where: {
-                voiture_id: vehicleId,
-                read: false
-            }
-        });
-
-        return res.status(200).json({
-            success: true,
-            data: {
-                vehicleId: parseInt(vehicleId),
-                unreadCount: count
-            }
-        });
-
-    } catch (error) {
-        console.error("🔥 Error fetching unread count:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Server error while fetching unread count",
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get alert statistics for a vehicle
- * GET /api/alerts/vehicle/:vehicleId/stats
- */
-exports.getAlertStats = async (req, res) => {
-    try {
-        const { vehicleId } = req.params;
-        const { startDate, endDate } = req.query;
-
-        console.log(`\n📌 [getAlertStats] Vehicle ID: ${vehicleId}`);
-
-        const whereClause = { voiture_id: vehicleId };
-
-        if (startDate || endDate) {
-            whereClause.alerted_at = {};
-            if (startDate) {
-                whereClause.alerted_at[Op.gte] = new Date(startDate);
-            }
-            if (endDate) {
-                const endDatePlusOne = new Date(endDate);
-                endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-                whereClause.alerted_at[Op.lt] = endDatePlusOne;
-            }
-        }
-
-        // Get counts by type
-        const totalAlerts = await Alert.count({ where: whereClause });
-
-        const geofenceCount = await Alert.count({
-            where: { ...whereClause, alert_type: 'geofence' }
-        });
-
-        const safeZoneCount = await Alert.count({
-            where: { ...whereClause, alert_type: 'safe_zone' }
-        });
-
-        const speedCount = await Alert.count({
-            where: { ...whereClause, alert_type: 'speed' }
-        });
-
-        const timeZoneCount = await Alert.count({
-            where: { ...whereClause, alert_type: 'time_zone' }
-        });
-
-        const unreadCount = await Alert.count({
-            where: { ...whereClause, read: false }
-        });
-
-        console.log(`✅ Stats calculated for vehicle ${vehicleId}`);
-
-        return res.status(200).json({
-            success: true,
-            data: {
-                vehicleId: parseInt(vehicleId),
-                totalAlerts,
-                unreadAlerts: unreadCount,
-                byType: {
-                    geofence: geofenceCount,
-                    safeZone: safeZoneCount,
-                    speed: speedCount,
-                    timeZone: timeZoneCount
-                }
-            }
-        });
-
-    } catch (error) {
-        console.error("🔥 Error fetching alert stats:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Server error while fetching alert stats",
-            error: error.message
-        });
-    }
-};
-
-/**
- * Mark single alert as read
- * PATCH /api/alerts/:id/read
- */
+// ========== MARK ALERT AS READ ==========
 exports.markAlertAsRead = async (req, res) => {
     try {
         const { id } = req.params;
@@ -321,119 +37,63 @@ exports.markAlertAsRead = async (req, res) => {
         if (!alert) {
             return res.status(404).json({
                 success: false,
-                message: "Alert not found"
+                message: "Alert not found",
             });
         }
 
         alert.read = true;
         await alert.save();
 
-        console.log(`✅ Alert ${id} marked as read`);
-
-        return res.status(200).json({
+        res.json({
             success: true,
             message: "Alert marked as read",
-            data: alert
+            alert,
         });
-
     } catch (error) {
-        console.error("🔥 Error marking alert as read:", error);
-        return res.status(500).json({
+        console.error("Error marking alert as read:", error);
+        res.status(500).json({
             success: false,
-            message: "Server error while updating alert",
-            error: error.message
+            message: "Error marking alert as read",
+            error: error.message,
         });
     }
 };
 
-/**
- * Mark all alerts as read for a vehicle
- * PATCH /api/alerts/vehicle/:vehicleId/read-all
- */
+// ========== MARK ALL ALERTS AS READ ==========
 exports.markAllAsRead = async (req, res) => {
     try {
         const { vehicleId } = req.params;
 
-        const [count] = await Alert.update(
+        await Alert.update(
             { read: true },
-            {
-                where: {
-                    voiture_id: vehicleId,
-                    read: false  // Only update unread alerts
-                }
-            }
+            { where: { voiture_id: vehicleId, read: false } }
         );
 
-        console.log(`✅ ${count} alerts marked as read for vehicle ${vehicleId}`);
-
-        return res.status(200).json({
+        res.json({
             success: true,
-            message: `${count} alert(s) marked as read`
+            message: "All alerts marked as read",
         });
-
     } catch (error) {
-        console.error("🔥 Error marking all alerts as read:", error);
-        return res.status(500).json({
+        console.error("Error marking all alerts as read:", error);
+        res.status(500).json({
             success: false,
-            message: "Server error while marking alerts as read",
-            error: error.message
+            message: "Error marking all alerts as read",
+            error: error.message,
         });
     }
 };
 
-/**
- * Delete old read alerts (cleanup)
- * DELETE /api/alerts/cleanup
- */
-exports.cleanupOldAlerts = async (req, res) => {
-    try {
-        const { daysOld = 30 } = req.query;
 
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - parseInt(daysOld));
+// controllers/alertController.js
 
-        const count = await Alert.destroy({
-            where: {
-                read: true,
-                alerted_at: {
-                    [Op.lt]: cutoffDate
-                },
-                alert_status: {
-                    [Op.or]: [null, 'RESOLVED', 'FALSE_ALARM']
-                }
-            }
-        });
-
-        console.log(`✅ Deleted ${count} old alerts (older than ${daysOld} days)`);
-
-        return res.status(200).json({
-            success: true,
-            message: `Deleted ${count} old alert(s)`,
-            deletedCount: count
-        });
-
-    } catch (error) {
-        console.error("🔥 Error cleaning up alerts:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Server error while cleaning up alerts",
-            error: error.message
-        });
-    }
-};
-
-/**
- * Report stolen vehicle
- * POST /api/alerts/stolen/report
- */
 exports.reportStolenVehicle = async (req, res) => {
     try {
         console.log("🚨 [REPORT STOLEN] Request received");
-        console.log("📝 Request Body:", req.body);
+        console.log("📝 Request Body:", JSON.stringify(req.body, null, 2));
 
         const { vehicleId, userId, latitude, longitude } = req.body;
 
-        if (!vehicleId || !userId) {
+        if (vehicleId === undefined || vehicleId === null || userId === undefined || userId === null) {
             console.error("❌ Validation failed: Missing required fields");
             return res.status(400).json({
                 success: false,
@@ -441,7 +101,16 @@ exports.reportStolenVehicle = async (req, res) => {
             });
         }
 
+        if (latitude === undefined || latitude === null || longitude === undefined || longitude === null) {
+            console.error("❌ Validation failed: Missing location");
+            return res.status(400).json({
+                success: false,
+                message: "Vehicle location is required to find nearby police"
+            });
+        }
+
         console.log(`🚨 Reporting vehicle ${vehicleId} as STOLEN by user ${userId}`);
+        console.log(`📍 Location: ${latitude}, ${longitude}`);
 
         // Check for existing active stolen alert
         const existingAlert = await Alert.findOne({
@@ -452,38 +121,65 @@ exports.reportStolenVehicle = async (req, res) => {
             }
         });
 
+        // ✅ NEW: If alert exists, return it with fresh police data
         if (existingAlert) {
-            console.log("⚠️ Active stolen alert already exists");
-            return res.status(400).json({
-                success: false,
-                message: "This vehicle already has an active stolen alert",
-                alert: existingAlert
+            console.log("⚠️ Active stolen alert already exists - returning with fresh police data");
+
+            // Use current location or existing alert location
+            const alertLat = parseFloat(latitude);
+            const alertLng = parseFloat(longitude);
+
+            // Find nearby police with current location
+            const nearbyPolice = await findNearbyPolice(alertLat, alertLng);
+
+            console.log(`🚔 Found ${nearbyPolice.length} nearby police stations`);
+
+            return res.status(200).json({ // ✅ Changed from 400 to 200
+                success: true, // ✅ Changed from false to true
+                message: "Active stolen alert already exists",
+                alert: existingAlert,
+                nearbyPolice: nearbyPolice,
+                vehicleLocation: {
+                    latitude: alertLat,
+                    longitude: alertLng
+                },
+                alreadyReported: true // ✅ Flag to show it was already reported
             });
         }
 
-        // Create stolen alert
+        // Create new stolen alert
         const stolenAlert = await Alert.create({
             voiture_id: vehicleId,
             alert_type: 'stolen',
-            message: `🚨 VEHICLE REPORTED STOLEN - Engine has been disabled remotely`,
+            message: `🚨 VEHICLE REPORTED STOLEN - Engine disabled at ${new Date().toLocaleString()}`,
             alerted_at: new Date(),
-            latitude: latitude || null,
-            longitude: longitude || null,
+            latitude: parseFloat(latitude),
+            longitude: parseFloat(longitude),
             alert_status: 'ACTIVE',
             sent: false,
             read: false
         });
 
-        console.log("✅ Stolen alert created successfully");
+        console.log("✅ Stolen alert created successfully:", stolenAlert.id);
+
+        const nearbyPolice = await findNearbyPolice(latitude, longitude);
+
+        console.log(`🚔 Found ${nearbyPolice.length} nearby police stations`);
 
         return res.status(201).json({
             success: true,
             message: "Vehicle reported as stolen successfully",
-            alert: stolenAlert
+            alert: stolenAlert,
+            nearbyPolice: nearbyPolice,
+            vehicleLocation: {
+                latitude: parseFloat(latitude),
+                longitude: parseFloat(longitude)
+            }
         });
 
     } catch (error) {
         console.error("🔥 Error reporting stolen vehicle:", error);
+        console.error("🔥 Stack trace:", error.stack);
         return res.status(500).json({
             success: false,
             message: "Server error while reporting stolen vehicle",
@@ -492,15 +188,90 @@ exports.reportStolenVehicle = async (req, res) => {
     }
 };
 
-/**
- * Get active stolen alert for vehicle
- * GET /api/alerts/stolen/vehicle/:vehicleId
- */
+// Keep the helper functions the same...
+async function findNearbyPolice(latitude, longitude, radiusMeters = 5000) {
+    try {
+        const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
+
+        const url = 'https://maps.googleapis.com/maps/api/place/nearbysearch/json';
+
+        const response = await axios.get(url, {
+            params: {
+                location: `${latitude},${longitude}`,
+                radius: radiusMeters,
+                type: 'police',
+                key: GOOGLE_MAPS_API_KEY
+            },
+            timeout: 10000
+        });
+
+        console.log(`📡 Google Places API status: ${response.data.status}`);
+
+        if (response.data.status !== 'OK' && response.data.status !== 'ZERO_RESULTS') {
+            console.error('❌ Google Places API error:', response.data.status);
+            return [];
+        }
+
+        if (!response.data.results || response.data.results.length === 0) {
+            console.log('⚠️ No police stations found nearby');
+            return [];
+        }
+
+        const policeStations = response.data.results.slice(0, 5).map(place => ({
+            name: place.name,
+            address: place.vicinity,
+            latitude: place.geometry.location.lat,
+            longitude: place.geometry.location.lng,
+            placeId: place.place_id,
+            rating: place.rating || null,
+            isOpen: place.opening_hours?.open_now ?? null,
+            distance: calculateDistance(
+                latitude,
+                longitude,
+                place.geometry.location.lat,
+                place.geometry.location.lng
+            )
+        }));
+
+        policeStations.sort((a, b) => a.distance - b.distance);
+
+        console.log(`✅ Formatted ${policeStations.length} police stations`);
+        return policeStations;
+
+    } catch (error) {
+        console.error('🔥 Error finding nearby police:', error.message);
+        return [];
+    }
+}
+
+function calculateDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distance = R * c;
+
+    return parseFloat(distance.toFixed(2));
+}
+
+function toRad(degrees) {
+    return degrees * (Math.PI / 180);
+}
+
+
+
+// ========== GET ACTIVE STOLEN ALERT ==========
 exports.getActiveStolenAlert = async (req, res) => {
     try {
         const { vehicleId } = req.params;
 
-        const stolenAlert = await Alert.findOne({
+        const alert = await Alert.findOne({
             where: {
                 voiture_id: vehicleId,
                 alert_type: 'stolen',
@@ -509,43 +280,34 @@ exports.getActiveStolenAlert = async (req, res) => {
             order: [['alerted_at', 'DESC']]
         });
 
-        if (!stolenAlert) {
-            return res.status(404).json({
-                success: false,
-                message: "No active stolen alert for this vehicle"
+        if (!alert) {
+            return res.json({
+                success: true,
+                hasActiveAlert: false,
+                alert: null
             });
         }
 
-        return res.status(200).json({
+        res.json({
             success: true,
-            alert: stolenAlert
+            hasActiveAlert: true,
+            alert
         });
 
     } catch (error) {
-        console.error("🔥 Error fetching stolen alert:", error);
-        return res.status(500).json({
+        console.error("Error fetching stolen alert:", error);
+        res.status(500).json({
             success: false,
-            message: "Server error while fetching stolen alert",
+            message: "Error fetching stolen alert",
             error: error.message
         });
     }
 };
 
-/**
- * Resolve stolen alert
- * PATCH /api/alerts/stolen/:id/resolve
- */
+// ========== RESOLVE STOLEN ALERT ==========
 exports.resolveStolenAlert = async (req, res) => {
     try {
         const { id } = req.params;
-        const { status } = req.body;
-
-        if (!['RESOLVED', 'FALSE_ALARM'].includes(status)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid status. Must be 'RESOLVED' or 'FALSE_ALARM'"
-            });
-        }
 
         const alert = await Alert.findByPk(id);
 
@@ -563,26 +325,23 @@ exports.resolveStolenAlert = async (req, res) => {
             });
         }
 
-        alert.alert_status = status;
+        alert.alert_status = 'RESOLVED';
         alert.read = true;
         await alert.save();
 
-        console.log(`✅ Stolen alert ${id} marked as ${status}`);
-
-        return res.status(200).json({
+        res.json({
             success: true,
-            message: `Alert marked as ${status}`,
-            alert: alert
+            message: "Stolen alert resolved",
+            alert
         });
 
     } catch (error) {
-        console.error("🔥 Error resolving stolen alert:", error);
-        return res.status(500).json({
+        console.error("Error resolving stolen alert:", error);
+        res.status(500).json({
             success: false,
-            message: "Server error while resolving alert",
+            message: "Error resolving stolen alert",
             error: error.message
         });
     }
 };
 
-module.exports = exports;
