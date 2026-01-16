@@ -10,28 +10,64 @@ const otpStore = new Map();
 // OTP expiration time (5 minutes)
 const OTP_EXPIRY_TIME = 5 * 60 * 1000;
 
+// ═══════════════════════════════════════════════════════════════════════
+// PHONE NUMBER UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Normalize phone for database (always with + prefix)
+ * Database stores: +237673927172
+ */
+function normalizePhoneForDB(phone) {
+    if (!phone) return null;
+    const cleaned = phone.trim();
+    return cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
+}
+
+/**
+ * Normalize phone for SMS API (always without + prefix)
+ * SMS API requires: 237673927172
+ */
+function normalizePhoneForSMS(phone) {
+    if (!phone) return null;
+    return phone.trim().replace(/^\+/, '');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// OTP GENERATION
+// ═══════════════════════════════════════════════════════════════════════
+
 /**
  * Generate a 6-digit OTP
  */
 function generateOTP() {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    const first = Math.floor(100 + Math.random() * 900);
+    const second = Math.floor(100 + Math.random() * 900);
+    return `${first}-${second}`;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// SMS SENDING
+// ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Send OTP via Techsoft SMS API
  * API Documentation: https://app.techsoftsms.com/api/http/sms/send
+ *
+ * @param {string} phoneWithoutPlus - Phone number WITHOUT + prefix (e.g., 237673927172)
+ * @param {string} otp - The OTP code to send
  */
-async function sendOTPViaSMS(phone, otp) {
-
+async function sendOTPViaSMS(phoneWithoutPlus, otp) {
     const apiUrl = "https://app.techsoft-sms.com/api/http/sms/send/";
     const payload = {
         api_token: "1453|kZyPuqcJthu1g01kNhhJ1SdI5O1iYoS9S9ZcwCxL379271c5",
-        recipient: phone,
-        sender_id: "PROXYM-GROUP",
+        recipient: phoneWithoutPlus, // ✅ No + prefix for SMS API
+        sender_id: "PROXYM",
         type: "plain",
         message: `Your PROXYM TRACKING password reset OTP is: ${otp}. Valid for 5 minutes.`
     };
 
+    console.log("📤 Sending SMS to:", phoneWithoutPlus, "(verified no + prefix)");
 
     try {
         console.log("⏱️  Request started at:", new Date().toISOString());
@@ -54,14 +90,16 @@ async function sendOTPViaSMS(phone, otp) {
         );
 
         const duration = Date.now() - startTime;
-
-
+        console.log("⏱️  Request completed in:", duration, "ms");
 
         if (response.status >= 200 && response.status < 300) {
             console.log("✅ SMS API CALL SUCCESSFUL!");
+            console.log("📊 Response:", response.data);
             return { success: true, data: response.data };
         } else {
             console.error("❌ SMS API RETURNED ERROR STATUS!");
+            console.error("Status:", response.status);
+            console.error("Data:", response.data);
             return {
                 success: false,
                 error: {
@@ -73,7 +111,8 @@ async function sendOTPViaSMS(phone, otp) {
         }
 
     } catch (error) {
-
+        console.error("┌─────────────────────────────────────────");
+        console.error("│ ❌ SMS API ERROR");
 
         if (error.code) {
             console.error("│ ERROR CODE:", error.code);
@@ -116,6 +155,14 @@ async function sendOTPViaSMS(phone, otp) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// STEP 1: REQUEST OTP
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Step 1: Request OTP for password reset
+ * POST /api/auth/forgot-password/request-otp
+ */
 exports.requestOTP = async (req, res) => {
     try {
         console.log("\n📥 [FORGOT-PASSWORD] Request OTP received");
@@ -134,15 +181,20 @@ exports.requestOTP = async (req, res) => {
             });
         }
 
+        // ✅ FIX: Add + prefix for database lookup
+        const phoneWithPlus = normalizePhoneForDB(phone);
+        console.log("📱 Original phone:", phone);
+        console.log("📱 Phone for DB (with +):", phoneWithPlus);
+
         // =============================
         // 2️⃣ CHECK IF USER EXISTS
         // =============================
-        console.log(`🔎 Checking if user exists with phone: ${phone}`);
+        console.log(`🔎 Checking if user exists with phone: ${phoneWithPlus}`);
 
-        const user = await User.findOne({ where: { phone } });
+        const user = await User.findOne({ where: { phone: phoneWithPlus } });
 
         if (!user) {
-            console.error(`❌ No user found with phone: ${phone}`);
+            console.error(`❌ No user found with phone: ${phoneWithPlus}`);
             return res.status(404).json({
                 success: false,
                 message: "No account found with this phone number"
@@ -160,8 +212,8 @@ exports.requestOTP = async (req, res) => {
         console.log(`🔢 Generated OTP: ${otp}`);
         console.log(`⏰ OTP expires at: ${new Date(expiryTime).toLocaleTimeString()}`);
 
-        // Store OTP with expiry time
-        otpStore.set(phone, {
+        // Store OTP with phone (with + prefix)
+        otpStore.set(phoneWithPlus, {
             otp,
             expiryTime,
             userId: user.id,
@@ -171,17 +223,22 @@ exports.requestOTP = async (req, res) => {
         // =============================
         // 4️⃣ SEND OTP VIA SMS
         // =============================
-        const smsResult = await sendOTPViaSMS(phone, otp);
+        // ✅ FIX: Remove + prefix for SMS API
+        const phoneWithoutPlus = normalizePhoneForSMS(phoneWithPlus);
+        console.log("📱 Phone for SMS (without +):", phoneWithoutPlus);
+
+        const smsResult = await sendOTPViaSMS(phoneWithoutPlus, otp);
 
         if (!smsResult.success) {
             console.error("❌ Failed to send SMS");
+            console.error("Error details:", smsResult.error);
             return res.status(500).json({
                 success: false,
                 message: "Failed to send OTP. Please try again."
             });
         }
 
-        console.log("✅ OTP sent successfully");
+        console.log("✅ OTP sent successfully via SMS");
 
         // =============================
         // 5️⃣ SUCCESS RESPONSE
@@ -189,6 +246,7 @@ exports.requestOTP = async (req, res) => {
         return res.json({
             success: true,
             message: "OTP sent successfully to your phone",
+            phone: phoneWithPlus, // Return with + for consistency
             expiresIn: 300 // 5 minutes in seconds
         });
 
@@ -201,6 +259,10 @@ exports.requestOTP = async (req, res) => {
         });
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// STEP 2: VERIFY OTP
+// ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Step 2: Verify OTP
@@ -224,13 +286,19 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
+        // ✅ FIX: Add + prefix to match stored OTP key
+        const phoneWithPlus = normalizePhoneForDB(phone);
+        console.log("📱 Original phone:", phone);
+        console.log("📱 Phone for lookup (with +):", phoneWithPlus);
+
         // =============================
         // 2️⃣ CHECK IF OTP EXISTS
         // =============================
-        const storedOTPData = otpStore.get(phone);
+        const storedOTPData = otpStore.get(phoneWithPlus);
 
         if (!storedOTPData) {
             console.error("❌ No OTP found for this phone");
+            console.log("Available OTP keys:", Array.from(otpStore.keys()));
             return res.status(404).json({
                 success: false,
                 message: "No OTP request found. Please request a new OTP."
@@ -242,7 +310,7 @@ exports.verifyOTP = async (req, res) => {
         // =============================
         if (Date.now() > storedOTPData.expiryTime) {
             console.error("❌ OTP has expired");
-            otpStore.delete(phone);
+            otpStore.delete(phoneWithPlus);
             return res.status(400).json({
                 success: false,
                 message: "OTP has expired. Please request a new one."
@@ -254,7 +322,7 @@ exports.verifyOTP = async (req, res) => {
         // =============================
         if (storedOTPData.attempts >= 3) {
             console.error("❌ Too many failed attempts");
-            otpStore.delete(phone);
+            otpStore.delete(phoneWithPlus);
             return res.status(400).json({
                 success: false,
                 message: "Too many failed attempts. Please request a new OTP."
@@ -267,7 +335,7 @@ exports.verifyOTP = async (req, res) => {
         if (storedOTPData.otp !== otp) {
             console.error("❌ Invalid OTP");
             storedOTPData.attempts += 1;
-            otpStore.set(phone, storedOTPData);
+            otpStore.set(phoneWithPlus, storedOTPData);
 
             return res.status(400).json({
                 success: false,
@@ -286,15 +354,15 @@ exports.verifyOTP = async (req, res) => {
 
         const resetTokenExpiry = Date.now() + (10 * 60 * 1000); // 10 minutes
 
-        // Store reset token
-        otpStore.set(`reset_${phone}`, {
+        // Store reset token with phone (with + prefix)
+        otpStore.set(`reset_${phoneWithPlus}`, {
             token: resetToken,
             expiryTime: resetTokenExpiry,
             userId: storedOTPData.userId
         });
 
         // Delete OTP after successful verification
-        otpStore.delete(phone);
+        otpStore.delete(phoneWithPlus);
 
         console.log("🔑 Reset token generated");
 
@@ -305,6 +373,7 @@ exports.verifyOTP = async (req, res) => {
             success: true,
             message: "OTP verified successfully",
             resetToken, // Send this token to client
+            phone: phoneWithPlus, // Return with + for consistency
             userId: storedOTPData.userId
         });
 
@@ -317,6 +386,10 @@ exports.verifyOTP = async (req, res) => {
         });
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// STEP 3: RESET PASSWORD
+// ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Step 3: Reset password with verified token
@@ -348,13 +421,19 @@ exports.resetPassword = async (req, res) => {
             });
         }
 
+        // ✅ FIX: Add + prefix to match stored reset token key
+        const phoneWithPlus = normalizePhoneForDB(phone);
+        console.log("📱 Original phone:", phone);
+        console.log("📱 Phone for lookup (with +):", phoneWithPlus);
+
         // =============================
         // 2️⃣ VERIFY RESET TOKEN
         // =============================
-        const resetData = otpStore.get(`reset_${phone}`);
+        const resetData = otpStore.get(`reset_${phoneWithPlus}`);
 
         if (!resetData) {
             console.error("❌ No reset token found");
+            console.log("Available reset keys:", Array.from(otpStore.keys()).filter(k => k.startsWith('reset_')));
             return res.status(404).json({
                 success: false,
                 message: "Invalid or expired reset session. Please start over."
@@ -371,7 +450,7 @@ exports.resetPassword = async (req, res) => {
 
         if (Date.now() > resetData.expiryTime) {
             console.error("❌ Reset token expired");
-            otpStore.delete(`reset_${phone}`);
+            otpStore.delete(`reset_${phoneWithPlus}`);
             return res.status(400).json({
                 success: false,
                 message: "Reset session expired. Please start over."
@@ -410,14 +489,15 @@ exports.resetPassword = async (req, res) => {
         console.log("✅ Password updated successfully");
 
         // Delete reset token
-        otpStore.delete(`reset_${phone}`);
+        otpStore.delete(`reset_${phoneWithPlus}`);
 
         // =============================
         // 6️⃣ SUCCESS RESPONSE
         // =============================
         return res.json({
             success: true,
-            message: "Password reset successfully. You can now login with your new password."
+            message: "Password reset successfully. You can now login with your new password.",
+            phone: phoneWithPlus
         });
 
     } catch (error) {
@@ -429,6 +509,10 @@ exports.resetPassword = async (req, res) => {
         });
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// OPTIONAL: RESEND OTP
+// ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Optional: Resend OTP
@@ -446,15 +530,23 @@ exports.resendOTP = async (req, res) => {
             });
         }
 
+        // ✅ FIX: Add + prefix for database lookup
+        const phoneWithPlus = normalizePhoneForDB(phone);
+        console.log("📱 Original phone:", phone);
+        console.log("📱 Phone for DB (with +):", phoneWithPlus);
+
         // Check if user exists
-        const user = await User.findOne({ where: { phone } });
+        const user = await User.findOne({ where: { phone: phoneWithPlus } });
 
         if (!user) {
+            console.error(`❌ No user found with phone: ${phoneWithPlus}`);
             return res.status(404).json({
                 success: false,
                 message: "No account found with this phone number"
             });
         }
+
+        console.log(`✅ User found: ${user.nom} ${user.prenom}`);
 
         // Generate new OTP
         const otp = generateOTP();
@@ -462,18 +554,23 @@ exports.resendOTP = async (req, res) => {
 
         console.log(`🔢 New OTP: ${otp}`);
 
-        // Store OTP
-        otpStore.set(phone, {
+        // Store OTP with phone (with + prefix)
+        otpStore.set(phoneWithPlus, {
             otp,
             expiryTime,
             userId: user.id,
             attempts: 0
         });
 
+        // ✅ FIX: Remove + prefix for SMS API
+        const phoneWithoutPlus = normalizePhoneForSMS(phoneWithPlus);
+        console.log("📱 Phone for SMS (without +):", phoneWithoutPlus);
+
         // Send SMS
-        const smsResult = await sendOTPViaSMS(phone, otp);
+        const smsResult = await sendOTPViaSMS(phoneWithoutPlus, otp);
 
         if (!smsResult.success) {
+            console.error("❌ Failed to send SMS");
             return res.status(500).json({
                 success: false,
                 message: "Failed to send OTP. Please try again."
@@ -485,6 +582,7 @@ exports.resendOTP = async (req, res) => {
         return res.json({
             success: true,
             message: "New OTP sent successfully",
+            phone: phoneWithPlus, // Return with + for consistency
             expiresIn: 300
         });
 
@@ -497,3 +595,9 @@ exports.resendOTP = async (req, res) => {
         });
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// EXPORTS
+// ═══════════════════════════════════════════════════════════════════════
+
+module.exports = exports;

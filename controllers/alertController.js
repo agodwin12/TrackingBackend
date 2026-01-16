@@ -2,23 +2,51 @@
 const { Alert, Voiture, User } = require("../models");
 const axios = require('axios');
 
-// ========== GET ALERTS BY VEHICLE ==========
+// ========== GET ALERTS BY VEHICLE WITH PAGINATION ==========
 exports.getAlertsByVehicle = async (req, res) => {
     try {
         const { vehicleId } = req.params;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const offset = (page - 1) * limit;
 
+        console.log(`📥 Fetching alerts for vehicle ${vehicleId} - Page: ${page}, Limit: ${limit}`);
+
+        // Get total count
+        const totalAlerts = await Alert.count({
+            where: { voiture_id: vehicleId }
+        });
+
+        // Get paginated alerts
         const alerts = await Alert.findAll({
             where: { voiture_id: vehicleId },
             order: [["alerted_at", "DESC"]],
+            limit: limit,
+            offset: offset,
         });
+
+        const totalPages = Math.ceil(totalAlerts / limit);
+        const hasNextPage = page < totalPages;
+        const hasPrevPage = page > 1;
+
+        console.log(`✅ Found ${alerts.length} alerts out of ${totalAlerts} total`);
 
         res.json({
             success: true,
-            count: alerts.length,
-            alerts,
+            data: {
+                alerts: alerts,
+                pagination: {
+                    currentPage: page,
+                    totalPages: totalPages,
+                    totalAlerts: totalAlerts,
+                    limit: limit,
+                    hasNextPage: hasNextPage,
+                    hasPrevPage: hasPrevPage,
+                }
+            }
         });
     } catch (error) {
-        console.error("Error fetching alerts:", error);
+        console.error("🔥 Error fetching alerts:", error);
         res.status(500).json({
             success: false,
             message: "Error fetching alerts",
@@ -84,8 +112,7 @@ exports.markAllAsRead = async (req, res) => {
 };
 
 
-// controllers/alertController.js
-
+// ========== REPORT STOLEN VEHICLE ==========
 exports.reportStolenVehicle = async (req, res) => {
     try {
         console.log("🚨 [REPORT STOLEN] Request received");
@@ -121,21 +148,19 @@ exports.reportStolenVehicle = async (req, res) => {
             }
         });
 
-        // ✅ NEW: If alert exists, return it with fresh police data
+        // If alert exists, return it with fresh police data
         if (existingAlert) {
             console.log("⚠️ Active stolen alert already exists - returning with fresh police data");
 
-            // Use current location or existing alert location
             const alertLat = parseFloat(latitude);
             const alertLng = parseFloat(longitude);
 
-            // Find nearby police with current location
             const nearbyPolice = await findNearbyPolice(alertLat, alertLng);
 
             console.log(`🚔 Found ${nearbyPolice.length} nearby police stations`);
 
-            return res.status(200).json({ // ✅ Changed from 400 to 200
-                success: true, // ✅ Changed from false to true
+            return res.status(200).json({
+                success: true,
                 message: "Active stolen alert already exists",
                 alert: existingAlert,
                 nearbyPolice: nearbyPolice,
@@ -143,7 +168,7 @@ exports.reportStolenVehicle = async (req, res) => {
                     latitude: alertLat,
                     longitude: alertLng
                 },
-                alreadyReported: true // ✅ Flag to show it was already reported
+                alreadyReported: true
             });
         }
 
@@ -188,7 +213,7 @@ exports.reportStolenVehicle = async (req, res) => {
     }
 };
 
-// Keep the helper functions the same...
+// Helper function to find nearby police
 async function findNearbyPolice(latitude, longitude, radiusMeters = 5000) {
     try {
         const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
@@ -263,8 +288,6 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 function toRad(degrees) {
     return degrees * (Math.PI / 180);
 }
-
-
 
 // ========== GET ACTIVE STOLEN ALERT ==========
 exports.getActiveStolenAlert = async (req, res) => {
@@ -344,4 +367,3 @@ exports.resolveStolenAlert = async (req, res) => {
         });
     }
 };
-

@@ -1,18 +1,19 @@
 // controllers/gpsController.js
-const { getVehicleStatus } = require("../services/OptimizedGpsStatusService");
-const { loginGps, sendGpsCommand, resetGpsToken } = require("../services/GpsService"); // ✅ Add resetGpsToken
+const { sendGpsCommandWithFallback, getRealtimeStatusByMacWithFallback } = require("../services/GpsService");
 const Voiture = require("../models/voiture");
+const SimGps = require("../models/sim_gps");
+const Command = require("../models/Command"); // ✅ ADD THIS
 
 exports.issueCommandToVehicle = async (req, res) => {
     console.log("📥 Received request to issue GPS command:", req.body);
 
     try {
-        let { vehicleId, command, params = "", password = "", sendTime = "" } = req.body;
+        let { vehicleId, command, params = "", sendTime = "" } = req.body;
 
-        // Validation
         if (!vehicleId) {
             return res.status(400).json({ success: false, message: "vehicleId is required" });
         }
+
         command = String(command || "").trim().toUpperCase();
         const ALLOWED = new Set(["OPENRELAY", "CLOSERELAY"]);
         if (!ALLOWED.has(command)) {
@@ -22,81 +23,96 @@ exports.issueCommandToVehicle = async (req, res) => {
             });
         }
 
-        // Get vehicle MAC from database
+        // ✅ Map command to type_commande
+        const typeCommande = command === "OPENRELAY" ? "ALLUMAGE" : "COUPURE";
+
+        // 1) Get vehicle MAC
         const vehicle = await Voiture.findOne({
             where: { id: vehicleId },
-            attributes: ["mac_id_gps"],
+            attributes: ["mac_id_gps", "model"],
         });
+
         if (!vehicle || !vehicle.mac_id_gps) {
             return res.status(404).json({ success: false, message: "Vehicle or MAC not found" });
         }
-        const macIdGps = vehicle.mac_id_gps;
 
-        // ✅ LOGIN WITH RETRY LOGIC
-        console.log("🔑 Logging into GPS provider…");
-        let token = await loginGps();
+        const macIdGps = String(vehicle.mac_id_gps).trim();
 
-        if (!token) {
-            console.error("❌ GPS Login failed.");
-            return res.status(401).json({ success: false, message: "Login failed" });
-        }
+        // 2) Find account name from sim_gps
+        const simGpsRecord = await SimGps.findOne({
+            where: { mac_id: macIdGps },
+            attributes: ["account_name"],
+            order: [["updated_at", "DESC"]],
+        });
 
-        // ✅ SEND COMMAND WITH TOKEN REFRESH ON 403
-        console.log(`📡 Sending ${command} → MAC ${macIdGps}`);
-        let providerResp = await sendGpsCommand(macIdGps, command, params, password, sendTime, token);
-
-        // ✅ If we get 403, token might be expired - refresh and retry ONCE
-        if (providerResp && (providerResp.errorCode === '403' || providerResp.errorCode === 403)) {
-            console.warn("⚠️ Got 403 error - Token might be expired. Refreshing token and retrying...");
-
-            // Clear the old token
-            resetGpsToken();
-
-            // Get a fresh token
-            token = await loginGps();
-            if (!token) {
-                console.error("❌ Token refresh failed");
-                return res.status(401).json({
-                    success: false,
-                    message: "Token refresh failed"
-                });
-            }
-
-            console.log("🔄 Retrying command with fresh token...");
-            providerResp = await sendGpsCommand(macIdGps, command, params, password, sendTime, token);
-        }
-
-        // Check if command succeeded
-        const ok =
-            providerResp &&
-            (providerResp.success === true ||
-                providerResp.success === "true" ||
-                providerResp.errorCode === "200");
-
-        // Get return message from provider
-        const first = Array.isArray(providerResp?.data) && providerResp.data.length
-            ? providerResp.data[0]
-            : {};
-        const returnMsg = first?.ReturnMsg || providerResp?.errorDescribe || null;
-
-        if (!ok) {
-            console.error("❌ Command failed:", returnMsg || providerResp);
-            return res.status(502).json({
+        if (!simGpsRecord?.account_name) {
+            return res.status(404).json({
                 success: false,
-                message: returnMsg || "Command failed",
-                vehicleId,
-                macIdGps,
-                response: providerResp,
+                message: `No account found in sim_gps for MAC ${macIdGps}`,
             });
         }
 
-        // Return success response
+        const accountName = String(simGpsRecord.account_name).trim().toLowerCase();
+        console.log(`📡 Device ${macIdGps} belongs to account: ${accountName}`);
+
+        // ✅ Get user_id from request (assuming auth middleware sets req.user)
+        const userId = req.user?.id || null;
+
+        // ✅ Generate unique command number
+        const cmdNo = `CMD-${Date.now()}-${vehicleId}`;
+
+        // 3) Send command with fallback (password is now automatic based on account)
+        const result = await sendGpsCommandWithFallback({
+            accountName,
+            macId: macIdGps,
+            command,
+            params,
+            sendTime,
+        });
+
+        // ✅ Determine status based on result
+        const commandStatus = result.ok ? 'success' : 'failed';
+
+        // ✅ Save command to database
+        try {
+            await Command.create({
+                user_id: userId,
+                employe_id: null,
+                vehicule_id: vehicleId,
+                CmdNo: cmdNo,
+                status: commandStatus,
+                type_commande: typeCommande,
+            });
+
+            console.log(`✅ Command saved to database: ${cmdNo} (${typeCommande})`);
+        } catch (dbError) {
+            console.error(`⚠️ Failed to save command to database:`, dbError);
+            // Don't fail the request if DB save fails
+        }
+
+        if (!result.ok) {
+            return res.status(502).json({
+                success: false,
+                message: result.message || "Command failed",
+                vehicleId,
+                macIdGps,
+                accountName,
+                commandNumber: cmdNo,
+                retried: result.retried,
+                response: result.providerResp,
+            });
+        }
+
         return res.json({
             success: true,
-            message: `${command} sent`,
+            message: `${command} sent successfully`,
             vehicleId,
             macIdGps,
-            response: providerResp,
+            accountName,
+            commandNumber: cmdNo,
+            typeCommande: typeCommande,
+            retried: result.retried,
+            response: result.providerResp,
         });
     } catch (error) {
         console.error("🔥 Command error:", error);
@@ -107,8 +123,6 @@ exports.issueCommandToVehicle = async (req, res) => {
         });
     }
 };
-
-
 
 exports.getRealtimeVehicleStatus = async (req, res) => {
     console.log("\n📥 ========== GET REALTIME STATUS ==========");
@@ -140,52 +154,67 @@ exports.getRealtimeVehicleStatus = async (req, res) => {
             });
         }
 
-        const macIdGps = vehicle.mac_id_gps;
+        const macIdGps = String(vehicle.mac_id_gps).trim();
         const carModel = vehicle.model;
         console.log(`✅ Found vehicle: ${carModel} (MAC: ${macIdGps})`);
 
-        // Get status using 3-tier optimization
-        console.log(`🔍 Fetching vehicle status...`);
-        const status = await getVehicleStatus(parseInt(vehicleId), macIdGps);
+        // Get account name from sim_gps
+        const simGpsRecord = await SimGps.findOne({
+            where: { mac_id: macIdGps },
+            attributes: ["account_name"],
+            order: [["updated_at", "DESC"]],
+        });
 
-        if (!status.success) {
-            console.error(`❌ Failed to get status: ${status.error}`);
-            return res.status(502).json({
+        if (!simGpsRecord?.account_name) {
+            console.error("❌ No account found in sim_gps");
+            return res.status(404).json({
                 success: false,
-                message: "Failed to retrieve vehicle status",
-                error: status.error
+                message: `No account found in sim_gps for MAC ${macIdGps}`,
             });
         }
 
-        console.log(`✅ Status retrieved successfully!`);
-        console.log(`   📊 Source: ${status.source}`);
-        console.log(`   🔧 Engine: ${status.engineOn ? 'ON' : 'OFF'}`);
-        console.log(`   🔌 ACC: ${status.accOn ? 'ON' : 'OFF'}`);
-        console.log(`   📡 GPS Signal: ${status.gpsSignal}`);
-        console.log(`   🏎️ Speed: ${status.speed} km/h`);
+        const accountName = String(simGpsRecord.account_name).trim().toLowerCase();
+        console.log(`📡 Device ${macIdGps} belongs to account: ${accountName}`);
 
-        if (status.dataAgeSeconds !== undefined) {
-            console.log(`   ⏰ Data Age: ${status.dataAgeSeconds}s`);
+        // Get status using GPS service with fallback
+        console.log(`🔍 Fetching vehicle status...`);
+        const result = await getRealtimeStatusByMacWithFallback({
+            accountName,
+            macId: macIdGps
+        });
+
+        if (!result.success) {
+            console.error(`❌ Failed to get status: ${result.message}`);
+            return res.status(502).json({
+                success: false,
+                message: "Failed to retrieve vehicle status",
+                error: result.message
+            });
         }
+
+        const statusData = result.status;
+
+        console.log(`✅ Status retrieved successfully!`);
+        console.log(`   🔧 Engine: ${statusData.oilState ? 'ON' : 'OFF'}`);
+        console.log(`   🔌 ACC: ${statusData.accState ? 'ON' : 'OFF'}`);
+        console.log(`   📡 GPS Signal: ${statusData.gps_status}`);
+        console.log(`   🏎️ Speed: ${statusData.speed} km/h`);
 
         console.log("========== REQUEST COMPLETED ==========\n");
 
         // Return standardized response
         return res.json({
             success: true,
-            source: status.source,
             vehicleId: parseInt(vehicleId),
             macIdGps: macIdGps,
             carModel: carModel,
-            engineOn: status.engineOn,
-            accOn: status.accOn,
-            gpsStatus: status.gpsSignal,
-            speed: status.speed,
-            latitude: status.latitude,
-            longitude: status.longitude,
-            lastUpdate: status.lastUpdate || status.deviceTime,
-            rawStatus: status.rawStatus,
-            dataAgeSeconds: status.dataAgeSeconds,
+            accountName: accountName,
+            engineOn: statusData.oilState || false,
+            accOn: statusData.accState || false,
+            gpsStatus: statusData.gps_status,
+            speed: statusData.speed || 0,
+            rawStatus: statusData.status,
+            retried: result.retried,
         });
 
     } catch (error) {

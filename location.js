@@ -14,12 +14,12 @@ require('dotenv').config();
 // ========== MULTI-ACCOUNT GPS CONFIGURATION ==========
 const GPS_ACCOUNTS = [
     {
-        name: 'Account 1 (Proxym_tracking)',
+        name: 'tracking',
         loginName: process.env.GPS_LOGIN_NAME_1 || 'Proxym_tracking',
         loginPassword: process.env.GPS_LOGIN_PASSWORD_1 || 'proxym123',
     },
     {
-        name: 'Account 2',
+        name: 'mobility',
         loginName: process.env.GPS_LOGIN_NAME_2 || 'SecondAccount',
         loginPassword: process.env.GPS_LOGIN_PASSWORD_2 || 'password123',
     }
