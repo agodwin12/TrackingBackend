@@ -13,6 +13,7 @@ const normalizePhone = (phone) => {
     return cleaned;
 };
 
+
 exports.login = async (req, res) => {
     try {
         // ✅ STEP 1: Validate Input
@@ -86,7 +87,7 @@ exports.login = async (req, res) => {
 
         console.log(`✅ Refresh token stored for user ${user.id}, expires at ${refreshTokenExpiresAt}`);
 
-        // ✅ STEP 9: Set refresh token in httpOnly cookie (secure, can't be accessed by JS)
+        // ✅ STEP 9: Set refresh token in httpOnly cookie (for web browsers)
         res.cookie('refreshToken', refreshToken, {
             httpOnly: true,      // Cannot be accessed by JavaScript
             secure: process.env.NODE_ENV === 'production', // HTTPS only in production
@@ -96,7 +97,7 @@ exports.login = async (req, res) => {
 
         console.log(`✅ Refresh token set in httpOnly cookie`);
 
-        // 🚀 STEP 10: Send Response (Frontend only sees access token)
+        // 🚀 STEP 10: Send Response (with both access token and refresh token)
         res.json({
             message: "Login successful",
             isFirstLogin: user.is_first_login,
@@ -112,7 +113,7 @@ exports.login = async (req, res) => {
                 photo: user.photo,
             },
             accessToken,
-            // ✅ No need to send refreshToken to frontend - it's in cookie!
+            refreshToken,  // ✅ ADDED: Send refresh token in body for mobile apps
         });
 
         if (process.env.NODE_ENV !== "production") {
@@ -155,5 +156,79 @@ exports.logout = async (req, res) => {
     } catch (error) {
         console.error("🔥 Logout error:", error);
         res.status(500).json({ message: "Error logging out" });
+    }
+};
+
+
+// ✅ NEW: Refresh Token Endpoint
+// controllers/authController.js - UPDATE the refreshToken function
+
+// ✅ UPDATED: Refresh Token Endpoint (accepts token from cookie OR body)
+exports.refreshToken = async (req, res) => {
+    try {
+        // ✅ Try to get refresh token from cookie first, then from body
+        let refreshToken = req.cookies.refreshToken;
+
+        if (!refreshToken && req.body.refreshToken) {
+            refreshToken = req.body.refreshToken;
+            console.log("🔄 Using refresh token from request body");
+        } else if (refreshToken) {
+            console.log("🔄 Using refresh token from cookie");
+        }
+
+        if (!refreshToken) {
+            console.log("❌ No refresh token in cookie or body");
+            return res.status(401).json({ message: "No refresh token provided" });
+        }
+
+        console.log("🔄 Attempting to refresh token...");
+
+        // Verify refresh token
+        let decoded;
+        try {
+            decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
+        } catch (error) {
+            console.log("❌ Invalid refresh token:", error.message);
+            return res.status(401).json({ message: "Invalid refresh token" });
+        }
+
+        // Find user and verify refresh token matches
+        const user = await User.findByPk(decoded.id);
+
+        if (!user || user.refresh_token !== refreshToken) {
+            console.log("❌ Refresh token not found in database");
+            return res.status(401).json({ message: "Invalid refresh token" });
+        }
+
+        // Check if refresh token has expired
+        if (user.refresh_token_expires_at && new Date() > new Date(user.refresh_token_expires_at)) {
+            console.log("❌ Refresh token has expired");
+            return res.status(401).json({ message: "Refresh token expired" });
+        }
+
+        console.log(`✅ Refresh token valid for user ${user.id}`);
+
+        // Generate new access token (1 hour)
+        const newAccessToken = jwt.sign(
+            {
+                id: user.id,
+                phone: user.phone,
+                user_unique_id: user.user_unique_id
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: "1h" }
+        );
+
+        console.log(`✅ New access token generated for user ${user.id}`);
+
+        // Send new access token
+        res.json({
+            message: "Token refreshed successfully",
+            accessToken: newAccessToken
+        });
+
+    } catch (error) {
+        console.error("🔥 Refresh token error:", error);
+        res.status(500).json({ message: "Error refreshing token" });
     }
 };

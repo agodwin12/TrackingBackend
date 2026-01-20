@@ -2,6 +2,7 @@
 const { Alert, Voiture, User } = require("../models");
 const axios = require('axios');
 
+
 // ========== GET ALERTS BY VEHICLE WITH PAGINATION ==========
 exports.getAlertsByVehicle = async (req, res) => {
     try {
@@ -12,14 +13,20 @@ exports.getAlertsByVehicle = async (req, res) => {
 
         console.log(`📥 Fetching alerts for vehicle ${vehicleId} - Page: ${page}, Limit: ${limit}`);
 
-        // Get total count
+        // ✅ UPDATED: Only fetch safe zone and geofence alerts
+        const whereClause = {
+            voiture_id: vehicleId,
+            alert_type: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+        };
+
+        // Get total count (only safe zone and geofence)
         const totalAlerts = await Alert.count({
-            where: { voiture_id: vehicleId }
+            where: whereClause
         });
 
-        // Get paginated alerts
+        // Get paginated alerts (only safe zone and geofence)
         const alerts = await Alert.findAll({
-            where: { voiture_id: vehicleId },
+            where: whereClause,
             order: [["alerted_at", "DESC"]],
             limit: limit,
             offset: offset,
@@ -29,7 +36,7 @@ exports.getAlertsByVehicle = async (req, res) => {
         const hasNextPage = page < totalPages;
         const hasPrevPage = page > 1;
 
-        console.log(`✅ Found ${alerts.length} alerts out of ${totalAlerts} total`);
+        console.log(`✅ Found ${alerts.length} safe zone/geofence alerts out of ${totalAlerts} total`);
 
         res.json({
             success: true,

@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: proxym_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: your_root_password
+      MYSQL_DATABASE: proxym_tracking
+      MYSQL_USER: proxym_user
+      MYSQL_PASSWORD: your_mysql_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - proxym_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: proxym_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - proxym_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Node.js Backend
+  backend:
+    build: .
+    container_name: proxym_backend
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: proxym_tracking
+      DB_USER: proxym_user
+      DB_PASSWORD: your_mysql_password
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - proxym_network
+    volumes:
+      - ./logs:/app/logs
+
+networks:
+  proxym_network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:

@@ -1,0 +1,41 @@
+# Node modules
+node_modules
+npm-debug.log
+
+# Environment files
+.env
+.env.*
+
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Tests
+test
+tests
+__tests__
+*.test.js
+*.spec.js
+
+# Development files
+.vscode
+.idea
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist
+build
+coverage
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
