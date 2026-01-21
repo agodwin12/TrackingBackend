@@ -1,5 +1,6 @@
 // controllers/alertController.js
 const { Alert, Voiture, User } = require("../models");
+const { Op } = require('sequelize'); // ✅ ADDED: Need this for filtering
 const axios = require('axios');
 
 
@@ -13,10 +14,12 @@ exports.getAlertsByVehicle = async (req, res) => {
 
         console.log(`📥 Fetching alerts for vehicle ${vehicleId} - Page: ${page}, Limit: ${limit}`);
 
-        // ✅ UPDATED: Only fetch safe zone and geofence alerts
+        // ✅ FIXED: Proper Sequelize syntax for filtering alert types
         const whereClause = {
             voiture_id: vehicleId,
-            alert_type: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+            alert_type: {
+                [Op.in]: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+            }
         };
 
         // Get total count (only safe zone and geofence)
@@ -79,13 +82,15 @@ exports.markAlertAsRead = async (req, res) => {
         alert.read = true;
         await alert.save();
 
+        console.log(`✅ Alert ${id} marked as read`);
+
         res.json({
             success: true,
             message: "Alert marked as read",
             alert,
         });
     } catch (error) {
-        console.error("Error marking alert as read:", error);
+        console.error("🔥 Error marking alert as read:", error);
         res.status(500).json({
             success: false,
             message: "Error marking alert as read",
@@ -99,17 +104,28 @@ exports.markAllAsRead = async (req, res) => {
     try {
         const { vehicleId } = req.params;
 
-        await Alert.update(
+        // ✅ FIXED: Only mark safe_zone and geofence alerts as read
+        const [updatedCount] = await Alert.update(
             { read: true },
-            { where: { voiture_id: vehicleId, read: false } }
+            {
+                where: {
+                    voiture_id: vehicleId,
+                    read: false,
+                    alert_type: {
+                        [Op.in]: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+                    }
+                }
+            }
         );
+
+        console.log(`✅ Marked ${updatedCount} alerts as read for vehicle ${vehicleId}`);
 
         res.json({
             success: true,
-            message: "All alerts marked as read",
+            message: `${updatedCount} alerts marked as read`,
         });
     } catch (error) {
-        console.error("Error marking all alerts as read:", error);
+        console.error("🔥 Error marking all alerts as read:", error);
         res.status(500).json({
             success: false,
             message: "Error marking all alerts as read",
@@ -325,7 +341,7 @@ exports.getActiveStolenAlert = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Error fetching stolen alert:", error);
+        console.error("🔥 Error fetching stolen alert:", error);
         res.status(500).json({
             success: false,
             message: "Error fetching stolen alert",
@@ -359,6 +375,8 @@ exports.resolveStolenAlert = async (req, res) => {
         alert.read = true;
         await alert.save();
 
+        console.log(`✅ Stolen alert ${id} resolved`);
+
         res.json({
             success: true,
             message: "Stolen alert resolved",
@@ -366,7 +384,7 @@ exports.resolveStolenAlert = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Error resolving stolen alert:", error);
+        console.error("🔥 Error resolving stolen alert:", error);
         res.status(500).json({
             success: false,
             message: "Error resolving stolen alert",

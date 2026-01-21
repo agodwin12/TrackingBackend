@@ -57,7 +57,7 @@ exports.login = async (req, res) => {
             });
         }
 
-        // 🔑 STEP 5: Generate Access Token (1 hour)
+        // 🔑 STEP 5: Generate Access Token (90 days)
         const accessToken = jwt.sign(
             {
                 id: user.id,
@@ -65,19 +65,19 @@ exports.login = async (req, res) => {
                 user_unique_id: user.user_unique_id
             },
             process.env.JWT_SECRET,
-            { expiresIn: "1h" }
+            { expiresIn: "90d" }
         );
 
-        // 🔄 STEP 6: ALWAYS Generate Refresh Token (30 days)
+        // 🔄 STEP 6: Generate Refresh Token (180 days)
         const refreshToken = jwt.sign(
             { id: user.id },
             process.env.JWT_SECRET,
-            { expiresIn: "30d" }
+            { expiresIn: "180d" }
         );
 
-        // ✅ STEP 7: Calculate expiration date
+        // ✅ STEP 7: Calculate expiration date (180 days)
         const refreshTokenExpiresAt = new Date();
-        refreshTokenExpiresAt.setDate(refreshTokenExpiresAt.getDate() + 30); // 30 days from now
+        refreshTokenExpiresAt.setDate(refreshTokenExpiresAt.getDate() + 180);
 
         // ✅ STEP 8: Store refresh token in database
         await user.update({
@@ -87,17 +87,17 @@ exports.login = async (req, res) => {
 
         console.log(`✅ Refresh token stored for user ${user.id}, expires at ${refreshTokenExpiresAt}`);
 
-        // ✅ STEP 9: Set refresh token in httpOnly cookie (for web browsers)
+        // ✅ STEP 9: Set refresh token in httpOnly cookie (180 days)
         res.cookie('refreshToken', refreshToken, {
-            httpOnly: true,      // Cannot be accessed by JavaScript
-            secure: process.env.NODE_ENV === 'production', // HTTPS only in production
-            sameSite: 'strict',  // CSRF protection
-            maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days in milliseconds
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'strict',
+            maxAge: 180 * 24 * 60 * 60 * 1000 // 180 days in milliseconds
         });
 
         console.log(`✅ Refresh token set in httpOnly cookie`);
 
-        // 🚀 STEP 10: Send Response (with both access token and refresh token)
+        // 🚀 STEP 10: Send Response
         res.json({
             message: "Login successful",
             isFirstLogin: user.is_first_login,
@@ -113,7 +113,7 @@ exports.login = async (req, res) => {
                 photo: user.photo,
             },
             accessToken,
-            refreshToken,  // ✅ ADDED: Send refresh token in body for mobile apps
+            refreshToken,
         });
 
         if (process.env.NODE_ENV !== "production") {
@@ -128,12 +128,11 @@ exports.login = async (req, res) => {
     }
 };
 
-// ✅ NEW: Logout endpoint to clear refresh token
+// ✅ Logout endpoint
 exports.logout = async (req, res) => {
     try {
         const userId = req.user.id;
 
-        // Clear refresh token from database
         await User.update(
             {
                 refresh_token: null,
@@ -142,7 +141,6 @@ exports.logout = async (req, res) => {
             { where: { id: userId } }
         );
 
-        // Clear refresh token cookie
         res.clearCookie('refreshToken', {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
@@ -159,14 +157,9 @@ exports.logout = async (req, res) => {
     }
 };
 
-
-// ✅ NEW: Refresh Token Endpoint
-// controllers/authController.js - UPDATE the refreshToken function
-
-// ✅ UPDATED: Refresh Token Endpoint (accepts token from cookie OR body)
+// ✅ Refresh Token Endpoint
 exports.refreshToken = async (req, res) => {
     try {
-        // ✅ Try to get refresh token from cookie first, then from body
         let refreshToken = req.cookies.refreshToken;
 
         if (!refreshToken && req.body.refreshToken) {
@@ -183,7 +176,6 @@ exports.refreshToken = async (req, res) => {
 
         console.log("🔄 Attempting to refresh token...");
 
-        // Verify refresh token
         let decoded;
         try {
             decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
@@ -192,7 +184,6 @@ exports.refreshToken = async (req, res) => {
             return res.status(401).json({ message: "Invalid refresh token" });
         }
 
-        // Find user and verify refresh token matches
         const user = await User.findByPk(decoded.id);
 
         if (!user || user.refresh_token !== refreshToken) {
@@ -200,7 +191,6 @@ exports.refreshToken = async (req, res) => {
             return res.status(401).json({ message: "Invalid refresh token" });
         }
 
-        // Check if refresh token has expired
         if (user.refresh_token_expires_at && new Date() > new Date(user.refresh_token_expires_at)) {
             console.log("❌ Refresh token has expired");
             return res.status(401).json({ message: "Refresh token expired" });
@@ -208,7 +198,7 @@ exports.refreshToken = async (req, res) => {
 
         console.log(`✅ Refresh token valid for user ${user.id}`);
 
-        // Generate new access token (1 hour)
+        // Generate new access token (90 days)
         const newAccessToken = jwt.sign(
             {
                 id: user.id,
@@ -216,12 +206,11 @@ exports.refreshToken = async (req, res) => {
                 user_unique_id: user.user_unique_id
             },
             process.env.JWT_SECRET,
-            { expiresIn: "1h" }
+            { expiresIn: "90d" }
         );
 
         console.log(`✅ New access token generated for user ${user.id}`);
 
-        // Send new access token
         res.json({
             message: "Token refreshed successfully",
             accessToken: newAccessToken

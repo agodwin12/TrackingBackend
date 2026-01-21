@@ -7,12 +7,20 @@ const sequelize = require('../config/database');
 const { isInsideGeofence } = require('../services/geofenceService');
 const socketService = require('../services/socketService');
 const axios = require('axios');
+const moment = require('moment');
 
 // Google Maps API key for geocoding
 const GOOGLE_MAPS_API_KEY = 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
 
 // ✅ Cooldown period for geofence alerts (in minutes)
 const GEOFENCE_ALERT_COOLDOWN_MINUTES = 30;
+
+/**
+ * ✅ Format time ago string
+ */
+const getTimeAgo = (date) => {
+    return moment(date).fromNow();
+};
 
 /**
  * ✅ Get user alert settings from users table
@@ -77,11 +85,14 @@ const reverseGeocode = async (latitude, longitude) => {
             let neighborhood = null;  // Quartier
             let locality = null;       // City
             let sublocality = null;    // Sub-city area
+            let route = null;          // Street/Road name
             let administrativeArea = null;
 
             for (const component of result.address_components) {
                 if (component.types.includes('neighborhood')) {
                     neighborhood = component.long_name;
+                } else if (component.types.includes('route')) {
+                    route = component.long_name;
                 } else if (component.types.includes('sublocality') || component.types.includes('sublocality_level_1')) {
                     sublocality = component.long_name;
                 } else if (component.types.includes('locality')) {
@@ -93,11 +104,12 @@ const reverseGeocode = async (latitude, longitude) => {
                 }
             }
 
-            // Prioritize: neighborhood > sublocality > locality > administrative area
-            const areaName = neighborhood || sublocality || locality || administrativeArea || formattedAddress.split(',')[0];
+            // Prioritize: neighborhood > route > sublocality > locality > administrative area
+            const areaName = neighborhood || route || sublocality || locality || administrativeArea || formattedAddress.split(',')[0];
 
             console.log(`✅ Geocoded successfully!`);
             console.log(`   Neighborhood: ${neighborhood || 'N/A'}`);
+            console.log(`   Route/Road: ${route || 'N/A'}`);
             console.log(`   Sublocality: ${sublocality || 'N/A'}`);
             console.log(`   Locality: ${locality || 'N/A'}`);
             console.log(`   Selected Area: ${areaName}`);
@@ -105,9 +117,10 @@ const reverseGeocode = async (latitude, longitude) => {
 
             return {
                 formattedAddress: formattedAddress,
-                areaName: areaName,  // This is the "quartier" or neighborhood
+                areaName: areaName,  // This is the "quartier" or neighborhood or road
                 locality: locality || areaName,
                 neighborhood: neighborhood,
+                route: route,
                 sublocality: sublocality,
                 success: true
             };
@@ -308,9 +321,12 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
 
         const vehicleName = voiture.nickname || `${voiture.marque} ${voiture.model}`;
 
-        // ✅ Create alert message in English format
-        // "Your vehicle TINBOT left the defined zone near Yaounde"
-        const alertMessage = `Your vehicle ${vehicleName} left the defined zone near ${locationInfo.areaName}`;
+        // ✅ Get time ago
+        const timeAgo = getTimeAgo(new Date());
+
+        // ✅ Create alert message in the new format
+        // "Your vehicle TINBOT left the geofence just now from Bastos"
+        const alertMessage = `Your vehicle ${vehicleName} left the geofence ${timeAgo} from ${locationInfo.areaName}`;
 
         console.log(`\n📝 Alert Message: "${alertMessage}"`);
 
@@ -468,7 +484,7 @@ const getGeofenceStatus = async (req, res) => {
         const [latestLocation] = await sequelize.query(
             'SELECT latitude, longitude FROM locations WHERE mac_id_gps = ? ORDER BY datetime DESC LIMIT 1',
             {
-                replacements: [voiture.mac_id_gps],
+                replacements: [vehicleId],
                 type: sequelize.QueryTypes.SELECT
             }
         );

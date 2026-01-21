@@ -73,7 +73,7 @@ const authMiddleware = async (req, res, next) => {
                         });
                     }
 
-                    // ✅ STEP 8: Generate new access token
+                    // ✅ STEP 8: Generate new access token (90 days)
                     const newAccessToken = jwt.sign(
                         {
                             id: user.id,
@@ -81,7 +81,7 @@ const authMiddleware = async (req, res, next) => {
                             user_unique_id: user.user_unique_id
                         },
                         process.env.JWT_SECRET,
-                        { expiresIn: "1h" }
+                        { expiresIn: "90d" }  // ✅ Changed from 1h to 90d
                     );
 
                     console.log(`✅ Generated new access token for user ${user.id}`);
