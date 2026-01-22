@@ -36,10 +36,7 @@ async function getLocationName(latitude, longitude) {
         });
 
         if (response.data.status === 'OK' && response.data.results.length > 0) {
-            // Try to get a readable location from the results
             const result = response.data.results[0];
-
-            // Look for specific components
             const addressComponents = result.address_components;
             let locality = '';
             let route = '';
@@ -57,7 +54,6 @@ async function getLocationName(latitude, longitude) {
                 }
             }
 
-            // Build location string
             if (route && locality) {
                 return `${route}, ${locality}`;
             } else if (neighborhood && locality) {
@@ -65,7 +61,6 @@ async function getLocationName(latitude, longitude) {
             } else if (locality) {
                 return locality;
             } else {
-                // Fall back to formatted address
                 return result.formatted_address;
             }
         }
@@ -268,7 +263,7 @@ exports.deleteSafeZone = async (req, res) => {
     }
 };
 
-// ✅ Safe Zone Violation Check with ENHANCED LOGGING + 50M RETURN BUFFER + BETTER MESSAGES
+// ✅ FIXED: Safe Zone Check - ONLY Alert on State Change
 exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
     console.log(`\n========================================`);
     console.log(`🚨 SAFE ZONE CHECK STARTED`);
@@ -292,7 +287,7 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
         });
 
         if (!safeZone) {
-            console.log("ℹ️ No active safe zone configured for this vehicle");
+            console.log("ℹ️  No active safe zone configured for this vehicle");
             console.log(`========================================\n`);
             return { violation: false, safeZone: null };
         }
@@ -302,7 +297,7 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
         console.log(`   Name: ${safeZone.name}`);
         console.log(`   Center: [${safeZone.center_latitude}, ${safeZone.center_longitude}]`);
         console.log(`   Radius: ${safeZone.radius_meters}m`);
-        console.log(`   Alert Triggered: ${safeZone.alert_triggered ? 'TRUE' : 'FALSE'}`);
+        console.log(`   Previous State: ${safeZone.alert_triggered ? '🔴 WAS OUTSIDE' : '🟢 WAS INSIDE'}`);
         console.log(`   User ID: ${safeZone.user_id}`);
 
         // ✅ STEP 2: Calculate distance
@@ -315,164 +310,123 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
         );
 
         console.log(`📏 Distance from center: ${distance.toFixed(2)}m`);
-        console.log(`📏 Allowed radius: ${safeZone.radius_meters}m`);
+        console.log(`📏 Safe zone radius: ${safeZone.radius_meters}m`);
 
-        // ✅ HYSTERESIS: Use different thresholds for leaving vs returning
-        const RETURN_BUFFER = 50; // 50m buffer for return
+        // ✅ Determine current state
         const isOutside = distance > safeZone.radius_meters;
-        const isInside = distance < (safeZone.radius_meters - RETURN_BUFFER);
+        const wasOutside = safeZone.alert_triggered;
 
-        console.log(`🎯 Vehicle is: ${isOutside ? '🔴 OUTSIDE' : (isInside ? '🟢 INSIDE' : '⚪ IN BUFFER ZONE')} safe zone`);
-        console.log(`   Return threshold: ${safeZone.radius_meters - RETURN_BUFFER}m`);
+        console.log(`🎯 Current Status: Vehicle is ${isOutside ? '🔴 OUTSIDE' : '🟢 INSIDE'} safe zone`);
 
-        // ✅ STEP 3: Check if alert should be triggered
-        console.log(`\n🔍 STEP 3: Checking alert conditions...`);
-        console.log(`   Is Outside: ${isOutside}`);
-        console.log(`   Is Inside (with buffer): ${isInside}`);
-        console.log(`   Alert Already Triggered: ${safeZone.alert_triggered}`);
-        console.log(`   Should Create Leave Alert: ${isOutside && !safeZone.alert_triggered}`);
-        console.log(`   Should Create Return Alert: ${isInside && safeZone.alert_triggered}`);
+        // ✅ STEP 3: STATE CHANGE DETECTION (CRITICAL!)
+        console.log(`\n🔍 STEP 3: Checking for state changes...`);
+        console.log(`   Was outside before: ${wasOutside ? '✅ YES' : '❌ NO'}`);
+        console.log(`   Is outside now: ${isOutside ? '✅ YES' : '❌ NO'}`);
 
-        // ✅ Vehicle LEFT safe zone - send alert
-        if (isOutside && !safeZone.alert_triggered) {
+        // ========================================
+        // 🚨 SCENARIO 1: Vehicle JUST LEFT safe zone
+        // ========================================
+        if (isOutside && !wasOutside) {
             console.log(`\n========================================`);
-            console.log(`🚨 SAFE ZONE VIOLATION DETECTED!`);
+            console.log(`🚨 STATE CHANGE DETECTED: LEFT SAFE ZONE!`);
             console.log(`========================================`);
-            console.log(`Vehicle ${vehicleId} has LEFT the safe zone!`);
-            console.log(`Distance: ${Math.round(distance)}m (limit: ${safeZone.radius_meters}m)`);
+            console.log(`🔄 Transition: INSIDE → OUTSIDE`);
+            console.log(`📏 Distance: ${Math.round(distance)}m (limit: ${safeZone.radius_meters}m)`);
 
-            // ✅ STEP 4: Update safe zone flag
-            console.log(`\n🔍 STEP 4: Updating safe zone flag...`);
+            const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || 'Your vehicle';
+            const locationName = await getLocationName(currentLat, currentLon);
+
+            // Create message: "VEHICLE NICKNAME just left the safezone from LOCALITY"
+            const alertMessage = `🚨 ${vehicleNickname} just left the safe zone from ${locationName}`;
+
+            console.log(`📝 Alert message: "${alertMessage}"`);
+
+            // Create alert in database
+            const newAlert = await Alert.create({
+                voiture_id: vehicleId,
+                alert_type: 'safe_zone',
+                message: alertMessage,
+                latitude: currentLat,
+                longitude: currentLon,
+                alerted_at: new Date(),
+                sent: true,
+                read: false
+            });
+            console.log(`✅ Alert created in database: ID=${newAlert.id}`);
+
+            // Update safe zone state to "outside"
             safeZone.alert_triggered = true;
             safeZone.last_alert_at = new Date();
             await safeZone.save();
-            console.log(`✅ Safe zone alert_triggered set to TRUE`);
-            console.log(`✅ last_alert_at set to: ${safeZone.last_alert_at}`);
+            console.log(`✅ Safe zone state updated: alert_triggered = TRUE (outside)`);
 
-            // ✅ Get location name
-            console.log(`\n🔍 STEP 4.5: Getting location name...`);
-            const locationName = await getLocationName(currentLat, currentLon);
-            console.log(`📍 Location: ${locationName}`);
-
-            const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || 'Your vehicle';
-
-            // ✅ NEW MESSAGE FORMAT: "Your vehicle NICKNAME left the safe zone just now from LOCATION"
-            const alertMessage = `⚠️ ${vehicleNickname} left the safe zone just now from ${locationName}`;
-
-            // ✅ STEP 5: Create alert in database
-            console.log(`\n🔍 STEP 5: Creating alert in database...`);
-            console.log(`   Message: ${alertMessage}`);
-
+            // Send push notification
             try {
-                const newAlert = await Alert.create({
-                    voiture_id: vehicleId,
-                    alert_type: 'safe_zone',
-                    message: alertMessage,
-                    latitude: currentLat,
-                    longitude: currentLon,
-                    alerted_at: new Date(),
-                    sent: true,
-                    read: false
-                });
-                console.log(`✅ ALERT CREATED IN DATABASE!`);
-                console.log(`   Alert ID: ${newAlert.id}`);
-                console.log(`   Vehicle ID: ${newAlert.voiture_id}`);
-                console.log(`   Type: ${newAlert.alert_type}`);
-                console.log(`   Message: ${newAlert.message}`);
-                console.log(`   Location: [${newAlert.latitude}, ${newAlert.longitude}]`);
-                console.log(`   Created At: ${newAlert.alerted_at}`);
-
-                // ✅ STEP 6: Send push notification
-                console.log(`\n🔍 STEP 6: Sending push notification...`);
-                console.log(`   User ID: ${safeZone.user_id}`);
-                console.log(`   Vehicle Nickname: ${vehicleNickname}`);
-                console.log(`   Zone Name: ${safeZone.name}`);
-
-                try {
-                    const notificationResult = await NotificationService.sendSafeZoneAlert(
-                        safeZone.user_id,
-                        vehicleNickname,
-                        safeZone.name,
-                        'left'
-                    );
-
-                    if (notificationResult.success) {
-                        console.log(`✅ PUSH NOTIFICATION SENT SUCCESSFULLY!`);
-                        console.log(`   Success Count: ${notificationResult.successCount}`);
-                        console.log(`   Failure Count: ${notificationResult.failureCount}`);
-                    } else {
-                        console.log(`⚠️ Push notification failed: ${notificationResult.message}`);
-                    }
-                } catch (notifError) {
-                    console.error(`❌ PUSH NOTIFICATION ERROR:`, notifError.message);
-                    console.error(`Stack trace:`, notifError.stack);
+                console.log(`📤 Sending push notification...`);
+                const notificationResult = await NotificationService.sendSafeZoneAlert(
+                    safeZone.user_id,
+                    vehicleNickname,
+                    safeZone.name,
+                    'left'
+                );
+                if (notificationResult.success) {
+                    console.log(`✅ Push notification sent successfully (${notificationResult.successCount} devices)`);
+                } else {
+                    console.log(`⚠️  Push notification failed`);
                 }
-
-                // ✅ STEP 7: Emit Socket.IO notification
-                console.log(`\n🔍 STEP 7: Emitting Socket.IO notification...`);
-                try {
-                    socketService.emitToVehicle(vehicleId, 'safe_zone_alert', {
-                        alertId: newAlert.id,
-                        type: 'safe_zone_violation',
-                        severity: 'warning',
-                        title: 'Safe Zone Alert',
-                        message: alertMessage,
-                        vehicleId: vehicleId,
-                        vehicleName: vehicleNickname,
-                        safeZoneName: safeZone.name,
-                        distance: Math.round(distance),
-                        location: locationName,
-                        timestamp: new Date().toISOString()
-                    });
-                    console.log(`✅ Socket.IO notification emitted`);
-                } catch (socketError) {
-                    console.error(`❌ Socket.IO error:`, socketError.message);
-                }
-
-                console.log(`\n========================================`);
-                console.log(`✅ SAFE ZONE VIOLATION ALERT COMPLETE`);
-                console.log(`========================================\n`);
-
-                return {
-                    violation: true,
-                    safeZone,
-                    distance: Math.round(distance),
-                    isFirstAlert: true,
-                    alertId: newAlert.id
-                };
-
-            } catch (alertError) {
-                console.error(`\n========================================`);
-                console.error(`❌ ERROR CREATING ALERT IN DATABASE`);
-                console.error(`========================================`);
-                console.error(`Error message:`, alertError.message);
-                console.error(`Stack trace:`, alertError.stack);
-                console.error(`========================================\n`);
-                throw alertError;
+            } catch (notifError) {
+                console.error(`❌ Push notification error:`, notifError.message);
             }
+
+            // Emit Socket.IO event
+            try {
+                socketService.emitToVehicle(vehicleId, 'safe_zone_alert', {
+                    alertId: newAlert.id,
+                    type: 'safe_zone_violation',
+                    severity: 'warning',
+                    title: 'Safe Zone Alert',
+                    message: alertMessage,
+                    vehicleId: vehicleId,
+                    vehicleName: vehicleNickname,
+                    safeZoneName: safeZone.name,
+                    distance: Math.round(distance),
+                    location: locationName,
+                    timestamp: new Date().toISOString()
+                });
+                console.log(`✅ Socket.IO event emitted`);
+            } catch (socketError) {
+                console.error(`❌ Socket.IO error:`, socketError.message);
+            }
+
+            console.log(`========================================\n`);
+            return {
+                violation: true,
+                safeZone,
+                distance: Math.round(distance),
+                isFirstAlert: true,
+                alertId: newAlert.id
+            };
         }
 
-        // ✅ Vehicle RETURNED to safe zone (with 50m buffer)
-        if (isInside && safeZone.alert_triggered) {
+            // ========================================
+            // ✅ SCENARIO 2: Vehicle JUST RETURNED to safe zone
+        // ========================================
+        else if (!isOutside && wasOutside) {
             console.log(`\n========================================`);
-            console.log(`✅ VEHICLE RETURNED TO SAFE ZONE`);
+            console.log(`✅ STATE CHANGE DETECTED: RETURNED TO SAFE ZONE!`);
             console.log(`========================================`);
-            console.log(`Distance: ${Math.round(distance)}m (return threshold: ${safeZone.radius_meters - RETURN_BUFFER}m)`);
-
-            safeZone.alert_triggered = false;
-            await safeZone.save();
-            console.log(`✅ Safe zone alert_triggered reset to FALSE`);
-
-            // ✅ Get location name
-            console.log(`\n🔍 Getting return location name...`);
-            const locationName = await getLocationName(currentLat, currentLon);
-            console.log(`📍 Location: ${locationName}`);
+            console.log(`🔄 Transition: OUTSIDE → INSIDE`);
+            console.log(`📏 Distance: ${Math.round(distance)}m (threshold: ${safeZone.radius_meters}m)`);
 
             const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || 'Your vehicle';
+            const locationName = await getLocationName(currentLat, currentLon);
 
-            // ✅ NEW MESSAGE FORMAT: "Your vehicle NICKNAME returned to safe zone just now at LOCATION"
-            const returnMessage = `✅ ${vehicleNickname} returned to safe zone just now at ${locationName}`;
+            // Create message: "VEHICLE NICKNAME returned to the safezone at LOCALITY"
+            const returnMessage = `✅ ${vehicleNickname} returned to the safe zone at ${locationName}`;
 
+            console.log(`📝 Alert message: "${returnMessage}"`);
+
+            // Create alert in database
             const returnAlert = await Alert.create({
                 voiture_id: vehicleId,
                 alert_type: 'safe_zone',
@@ -483,35 +437,39 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
                 sent: true,
                 read: false
             });
-            console.log(`✅ Return alert created: ID=${returnAlert.id}`);
+            console.log(`✅ Alert created in database: ID=${returnAlert.id}`);
 
-            // ✅ Use the same notification method
+            // Update safe zone state to "inside"
+            safeZone.alert_triggered = false;
+            safeZone.last_alert_at = new Date();
+            await safeZone.save();
+            console.log(`✅ Safe zone state updated: alert_triggered = FALSE (inside)`);
+
+            // Send push notification
             try {
+                console.log(`📤 Sending push notification...`);
                 const notificationResult = await NotificationService.sendSafeZoneAlert(
                     safeZone.user_id,
                     vehicleNickname,
                     safeZone.name,
                     'returned'
                 );
-
                 if (notificationResult.success) {
-                    console.log(`✅ RETURN PUSH NOTIFICATION SENT SUCCESSFULLY!`);
-                    console.log(`   Success Count: ${notificationResult.successCount}`);
-                    console.log(`   Failure Count: ${notificationResult.failureCount}`);
+                    console.log(`✅ Push notification sent successfully (${notificationResult.successCount} devices)`);
                 } else {
-                    console.log(`⚠️ Return push notification failed: ${notificationResult.message}`);
+                    console.log(`⚠️  Push notification failed`);
                 }
             } catch (notifError) {
-                console.error(`❌ RETURN PUSH NOTIFICATION ERROR:`, notifError.message);
-                console.error(`Stack trace:`, notifError.stack);
+                console.error(`❌ Push notification error:`, notifError.message);
             }
 
+            // Emit Socket.IO event
             try {
                 socketService.emitToVehicle(vehicleId, 'safe_zone_alert', {
                     alertId: returnAlert.id,
                     type: 'safe_zone_return',
                     severity: 'info',
-                    title: 'Safe Zone Return',
+                    title: 'Safe Zone Safe',
                     message: returnMessage,
                     vehicleId: vehicleId,
                     vehicleName: vehicleNickname,
@@ -519,40 +477,42 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
                     location: locationName,
                     timestamp: new Date().toISOString()
                 });
-                console.log(`✅ Return Socket.IO notification emitted`);
+                console.log(`✅ Socket.IO event emitted`);
             } catch (socketError) {
-                console.error(`⚠️ Socket.IO emit failed:`, socketError.message);
+                console.error(`❌ Socket.IO error:`, socketError.message);
             }
 
             console.log(`========================================\n`);
-
             return {
                 violation: false,
+                returned: true,
                 safeZone,
                 distance: Math.round(distance),
                 isFirstAlert: true,
-                alertId: returnAlert.id,
-                returned: true
+                alertId: returnAlert.id
             };
         }
 
-        // ✅ No status change
-        if (isOutside && safeZone.alert_triggered) {
-            console.log(`ℹ️ Vehicle still outside safe zone (alert already sent)`);
-        } else if (!isOutside && !isInside && safeZone.alert_triggered) {
-            console.log(`ℹ️ Vehicle in buffer zone (${RETURN_BUFFER}m) - waiting for clear return`);
-        } else if (isInside && !safeZone.alert_triggered) {
-            console.log(`ℹ️ Vehicle inside safe zone (no alert needed)`);
+            // ========================================
+            // ℹ️  SCENARIO 3: NO STATE CHANGE (Do Nothing!)
+        // ========================================
+        else {
+            console.log(`\n========================================`);
+            console.log(`ℹ️  NO STATE CHANGE - NO ACTION NEEDED`);
+            console.log(`========================================`);
+            console.log(`📊 Status: Vehicle remains ${isOutside ? '🔴 OUTSIDE' : '🟢 INSIDE'} safe zone`);
+            console.log(`📏 Distance: ${Math.round(distance)}m`);
+            console.log(`⏭️  Skipping alert (already notified)`);
+            console.log(`========================================\n`);
+
+            return {
+                violation: isOutside,
+                safeZone,
+                distance: Math.round(distance),
+                isFirstAlert: false,
+                noStateChange: true
+            };
         }
-
-        console.log(`========================================\n`);
-
-        return {
-            violation: isOutside,
-            safeZone,
-            distance: Math.round(distance),
-            isFirstAlert: false
-        };
 
     } catch (error) {
         console.error(`\n========================================`);

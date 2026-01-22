@@ -345,14 +345,22 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                         // ========== ALERT CHECKS ==========
                         logger.debug(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
 
-                        // ✅ 1. Safe zone violation check
+                        // ✅ 1. Safe zone violation check (FIXED - handles both leave AND return)
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-                            if (safeZoneResult.violation) {
-                                logger.info(`⚠️ SAFE ZONE VIOLATION DETECTED!`);
-                                if (safeZoneResult.isFirstAlert) {
-                                    logger.info(`📧 Safe zone alert created and notification sent`);
-                                }
+
+                            // Handle vehicle LEAVING safe zone
+                            if (safeZoneResult.violation && safeZoneResult.isFirstAlert) {
+                                logger.info(`🚨 SAFE ZONE VIOLATION DETECTED!`);
+                                logger.info(`   Vehicle left the safe zone`);
+                                logger.info(`📧 Safe zone "left" alert created and notification sent`);
+                            }
+
+                            // ✅ FIXED: Handle vehicle RETURNING to safe zone
+                            if (safeZoneResult.returned && safeZoneResult.isFirstAlert) {
+                                logger.info(`✅ VEHICLE RETURNED TO SAFE ZONE!`);
+                                logger.info(`   Vehicle returned to safe zone`);
+                                logger.info(`📧 Safe zone "returned" alert created and notification sent`);
                             }
                         } catch (safeZoneError) {
                             logger.error(`❌ Safe zone check error:`, safeZoneError.message);
