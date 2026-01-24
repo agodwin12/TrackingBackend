@@ -1,10 +1,66 @@
 // controllers/alertController.js
 const { Alert, Voiture, User } = require("../models");
-const { Op } = require('sequelize'); // ✅ ADDED: Need this for filtering
+const { Op } = require('sequelize');
 const axios = require('axios');
 
+// ========== SMART STATE CHANGE DETECTION (UPDATED) ==========
+const filterStateChangeAlerts = (alerts) => {
+    if (alerts.length === 0) return [];
 
-// ========== GET ALERTS BY VEHICLE WITH PAGINATION ==========
+    console.log(`\n🧠 SMART STATE CHANGE FILTERING`);
+    console.log(`📊 Total alerts to process: ${alerts.length}`);
+    console.log(`========================================`);
+
+    const filteredAlerts = [];
+
+    for (let i = 0; i < alerts.length; i++) {
+        const alert = alerts[i];
+        const subtype = alert.alert_subtype;
+
+        // ✅ NEW: Filter out STILL_OUTSIDE alerts (internal logs only)
+        if (subtype === 'STILL_OUTSIDE') {
+            console.log(`⏭️  Alert ${alert.id}: STILL_OUTSIDE (internal log), skipping`);
+            continue;
+        }
+
+        // ✅ NEW: Only show LEFT_ZONE and RETURNED_ZONE
+        if (subtype === 'LEFT_ZONE' || subtype === 'RETURNED_ZONE') {
+            filteredAlerts.push(alert);
+            console.log(`✅ Alert ${alert.id}: ${subtype} - INCLUDED`);
+            console.log(`   Message: "${alert.message}"`);
+            console.log(`   Time: ${new Date(alert.alerted_at).toLocaleString()}`);
+        } else {
+            // ✅ LEGACY: Handle old alerts without subtype (parse message)
+            const message = alert.message.toLowerCase();
+            let currentState = null;
+
+            if (message.includes('left') && (message.includes('geofence') || message.includes('safe zone') || message.includes('defined zone'))) {
+                currentState = 'left';
+            } else if (message.includes('returned') && (message.includes('geofence') || message.includes('safe zone') || message.includes('defined zone'))) {
+                currentState = 'returned';
+            }
+
+            if (currentState) {
+                filteredAlerts.push(alert);
+                console.log(`✅ Alert ${alert.id}: LEGACY ${currentState} - INCLUDED`);
+                console.log(`   Message: "${alert.message}"`);
+            } else {
+                console.log(`⚠️  Alert ${alert.id}: Unknown type, skipping`);
+            }
+        }
+    }
+
+    console.log(`========================================`);
+    console.log(`🎯 FILTERING COMPLETE`);
+    console.log(`   Original alerts: ${alerts.length}`);
+    console.log(`   Filtered alerts: ${filteredAlerts.length}`);
+    console.log(`   Removed: ${alerts.length - filteredAlerts.length} internal/spam alerts`);
+    console.log(`========================================\n`);
+
+    return filteredAlerts;
+};
+
+// ========== GET ALERTS BY VEHICLE WITH SMART FILTERING ==========
 exports.getAlertsByVehicle = async (req, res) => {
     try {
         const { vehicleId } = req.params;
@@ -14,44 +70,49 @@ exports.getAlertsByVehicle = async (req, res) => {
 
         console.log(`📥 Fetching alerts for vehicle ${vehicleId} - Page: ${page}, Limit: ${limit}`);
 
-        // ✅ FIXED: Proper Sequelize syntax for filtering alert types
+        // ✅ Filter: Only safe_zone and geofence alerts
         const whereClause = {
             voiture_id: vehicleId,
             alert_type: {
-                [Op.in]: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+                [Op.in]: ['safe_zone', 'geofence']
             }
         };
 
-        // Get total count (only safe zone and geofence)
-        const totalAlerts = await Alert.count({
-            where: whereClause
-        });
-
-        // Get paginated alerts (only safe zone and geofence)
-        const alerts = await Alert.findAll({
+        // ✅ STEP 1: Get ALL alerts (ordered by time DESC - newest first)
+        console.log(`🔍 Fetching all alerts from database...`);
+        const allAlerts = await Alert.findAll({
             where: whereClause,
-            order: [["alerted_at", "DESC"]],
-            limit: limit,
-            offset: offset,
+            order: [["alerted_at", "DESC"]]
         });
 
-        const totalPages = Math.ceil(totalAlerts / limit);
+        console.log(`✅ Found ${allAlerts.length} total alerts in database`);
+
+        // ✅ STEP 2: Apply smart STATE CHANGE filtering
+        const stateChangeAlerts = filterStateChangeAlerts(allAlerts);
+
+        // ✅ STEP 3: Apply pagination to filtered results
+        const totalFilteredAlerts = stateChangeAlerts.length;
+        const paginatedAlerts = stateChangeAlerts.slice(offset, offset + limit);
+
+        const totalPages = Math.ceil(totalFilteredAlerts / limit);
         const hasNextPage = page < totalPages;
         const hasPrevPage = page > 1;
 
-        console.log(`✅ Found ${alerts.length} safe zone/geofence alerts out of ${totalAlerts} total`);
+        console.log(`✅ Returning ${paginatedAlerts.length} alerts (page ${page} of ${totalPages})`);
 
         res.json({
             success: true,
             data: {
-                alerts: alerts,
+                alerts: paginatedAlerts,
                 pagination: {
                     currentPage: page,
                     totalPages: totalPages,
-                    totalAlerts: totalAlerts,
+                    totalAlerts: totalFilteredAlerts,
+                    totalAlertsInDb: allAlerts.length,
                     limit: limit,
                     hasNextPage: hasNextPage,
                     hasPrevPage: hasPrevPage,
+                    spamAlertsFiltered: allAlerts.length - totalFilteredAlerts
                 }
             }
         });
@@ -104,7 +165,7 @@ exports.markAllAsRead = async (req, res) => {
     try {
         const { vehicleId } = req.params;
 
-        // ✅ FIXED: Only mark safe_zone and geofence alerts as read
+        // ✅ Only mark safe_zone and geofence alerts as read
         const [updatedCount] = await Alert.update(
             { read: true },
             {
@@ -112,7 +173,7 @@ exports.markAllAsRead = async (req, res) => {
                     voiture_id: vehicleId,
                     read: false,
                     alert_type: {
-                        [Op.in]: ['safe_zone', 'geofence']  // ✅ Only these 2 types
+                        [Op.in]: ['safe_zone', 'geofence']
                     }
                 }
             }
@@ -133,7 +194,6 @@ exports.markAllAsRead = async (req, res) => {
         });
     }
 };
-
 
 // ========== REPORT STOLEN VEHICLE ==========
 exports.reportStolenVehicle = async (req, res) => {

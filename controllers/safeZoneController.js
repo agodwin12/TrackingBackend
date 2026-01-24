@@ -100,7 +100,7 @@ exports.createSafeZone = async (req, res) => {
             name: name || 'Safe Zone',
             center_latitude,
             center_longitude,
-            radius_meters: radius_meters || 100,
+            radius_meters: radius_meters || 10,
             is_active: true,
             alert_triggered: false
         });
