@@ -1,18 +1,52 @@
+// controllers/tripController.js - COMPLETE WITH SMART ADDRESS HANDLING
 const { Op } = require("sequelize");
 const Trip = require("../models/trip");
 const TripWaypoint = require("../models/tripWaypoint");
 const Voiture = require("../models/voiture");
 const redisClient = require("../config/redis");
 const logger = require("../utils/logger");
+const RouteSnappingService = require('../services/routeSnappingService');
+
 
 // Cache TTL: 5 minutes - automatically expires and refreshes with fresh data
 const TRIP_CACHE_TTL = 300; // 5 minutes (300 seconds)
 const EMPTY_RESULT_TTL = 60; // 1 minute for empty results
 
-// 🆕 Waypoint limits for performance
+// Waypoint limits for performance
 const MAX_WAYPOINTS_FOR_MAP = 500; // Maximum waypoints to send to mobile app
 const STATS_TRIP_LIMIT = 1000; // Maximum trips to calculate stats from
 
+// ==================== SMART ADDRESS FORMATTER ====================
+/**
+ * 🆕 Returns proper address based on geocoding status
+ * This function ensures mobile app always gets useful address info:
+ * - Real address if geocoded successfully
+ * - "Geocoding..." if still processing
+ * - Formatted coordinates if geocoding failed
+ */
+function formatAddress(address, addressStatus, latitude, longitude) {
+    // If successfully geocoded, return the address
+    if (addressStatus === 'geocoded' && address &&
+        address !== 'Unknown location' &&
+        address !== 'Geocoding...' &&
+        !address.includes('°')) {
+        return address;
+    }
+
+    // If pending, return loading message
+    if (addressStatus === 'pending') {
+        return 'Geocoding...';
+    }
+
+    // If failed or no valid address, return formatted coordinates
+    if (latitude && longitude) {
+        return `${parseFloat(latitude).toFixed(6)}°, ${parseFloat(longitude).toFixed(6)}°`;
+    }
+
+    return 'Unknown location';
+}
+
+// ==================== CACHE FUNCTIONS ====================
 /**
  * Get cached data from Redis
  * ✅ Enhanced: Gracefully handles Redis being down
@@ -81,6 +115,7 @@ async function deleteCachedData(pattern) {
     }
 }
 
+// ==================== UTILITY FUNCTIONS ====================
 /**
  * Format duration minutes to readable string
  */
@@ -115,7 +150,7 @@ function toDegrees(radians) {
 }
 
 /**
- * 🆕 Calculate bearing between two points
+ * Calculate bearing between two points
  */
 function calculateBearing(lat1, lon1, lat2, lon2) {
     const dLon = toRadians(lon2 - lon1);
@@ -127,7 +162,7 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * 🆕 Detect if a waypoint represents a significant turn
+ * Detect if a waypoint represents a significant turn
  */
 function isSignificantTurn(prev, curr, next) {
     try {
@@ -157,7 +192,7 @@ function isSignificantTurn(prev, curr, next) {
 }
 
 /**
- * 🆕 SMART SAMPLING: Preserves important points (turns, speed changes)
+ * SMART SAMPLING: Preserves important points (turns, speed changes)
  */
 function smartSample(waypoints, maxPoints) {
     if (waypoints.length <= maxPoints) return waypoints;
@@ -194,7 +229,7 @@ function smartSample(waypoints, maxPoints) {
 }
 
 /**
- * 🆕 SMART WAYPOINT SAMPLING: Preserves route shape for all trip lengths
+ * SMART WAYPOINT SAMPLING: Preserves route shape for all trip lengths
  * - Short trips (< 1 km): Keep ALL waypoints
  * - Medium trips (1-5 km): Adaptive sampling based on distance
  * - Long trips (> 5 km): More aggressive sampling with turn preservation
@@ -225,6 +260,8 @@ function sampleWaypoints(waypoints, tripDistanceKm = 0, maxPoints = MAX_WAYPOINT
     logger.info(`📊 Sampled waypoints: ${waypoints.length} → ${sampled.length} (${tripDistanceKm.toFixed(2)} km trip)`);
     return sampled;
 }
+
+// ==================== API ENDPOINTS ====================
 
 /**
  * Get trips for a specific vehicle
@@ -302,6 +339,7 @@ exports.getVehicleTrips = async (req, res) => {
 
         logger.info(`✅ Fetched ${result.rows.length} trips out of ${result.count} total for vehicle ${vehicleId}`);
 
+        // 🆕 FORMAT ADDRESSES PROPERLY
         const trips = result.rows.map(t => ({
             id: t.id,
             vehicleId: t.vehicle_id,
@@ -318,12 +356,22 @@ exports.getVehicleTrips = async (req, res) => {
             startLocation: {
                 latitude: parseFloat(t.start_latitude),
                 longitude: parseFloat(t.start_longitude),
-                address: t.start_address
+                address: formatAddress(
+                    t.start_address,
+                    t.start_address_status,
+                    t.start_latitude,
+                    t.start_longitude
+                )
             },
             endLocation: {
                 latitude: parseFloat(t.end_latitude),
                 longitude: parseFloat(t.end_longitude),
-                address: t.end_address
+                address: formatAddress(
+                    t.end_address,
+                    t.end_address_status,
+                    t.end_latitude,
+                    t.end_longitude
+                )
             },
             totalDistanceKm: parseFloat(t.total_distance_km),
             avgSpeedKmh: parseFloat(t.avg_speed_kmh),
@@ -416,12 +464,22 @@ exports.getTripDetails = async (req, res) => {
                 startLocation: {
                     latitude: parseFloat(trip.start_latitude),
                     longitude: parseFloat(trip.start_longitude),
-                    address: trip.start_address
+                    address: formatAddress(
+                        trip.start_address,
+                        trip.start_address_status,
+                        trip.start_latitude,
+                        trip.start_longitude
+                    )
                 },
                 endLocation: {
                     latitude: parseFloat(trip.end_latitude),
                     longitude: parseFloat(trip.end_longitude),
-                    address: trip.end_address
+                    address: formatAddress(
+                        trip.end_address,
+                        trip.end_address_status,
+                        trip.end_latitude,
+                        trip.end_longitude
+                    )
                 },
                 totalDistanceKm: parseFloat(trip.total_distance_km),
                 avgSpeedKmh: parseFloat(trip.avg_speed_kmh),
@@ -544,9 +602,9 @@ exports.getTripRoute = async (req, res) => {
 exports.getTripDetailsWithRoute = async (req, res) => {
     try {
         const { tripId } = req.params;
-        const { maxPoints } = req.query;
+        const { maxPoints, snapToRoads } = req.query;
 
-        logger.info(`ℹ️ Fetching trip details with route: ${tripId}`);
+        logger.info(`ℹ️ Fetching trip details with route: ${tripId} (snap: ${snapToRoads})`);
 
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
@@ -556,7 +614,9 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         }
 
         const limit = maxPoints ? parseInt(maxPoints) : MAX_WAYPOINTS_FOR_MAP;
-        const cacheKey = `trip:details-route:${tripId}:limit:${limit}`;
+        const shouldSnapToRoads = snapToRoads === 'true' || snapToRoads === '1';
+
+        const cacheKey = `trip:details-route:${tripId}:limit:${limit}:snap:${shouldSnapToRoads}`;
 
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
@@ -588,11 +648,33 @@ exports.getTripDetailsWithRoute = async (req, res) => {
 
         logger.info(`📍 Fetched trip ${tripId} with ${waypoints.length} waypoints`);
 
-        // ✅ Pass trip distance to smart sampling
         const tripDistance = parseFloat(trip.total_distance_km || 0);
-        const sampledWaypoints = sampleWaypoints(waypoints, tripDistance, limit);
+        let sampledWaypoints = sampleWaypoints(waypoints, tripDistance, limit);
 
-        logger.info(`📊 Returning ${sampledWaypoints.length}/${waypoints.length} waypoints`);
+        // 🆕 SNAP TO ROADS if requested
+        let finalRoute = sampledWaypoints;
+        let snappingApplied = false;
+
+        if (shouldSnapToRoads && sampledWaypoints.length >= 2) {
+            logger.info(`🗺️ Snapping route to roads...`);
+
+            try {
+                const snappedRoute = await RouteSnappingService.matchToRoads(sampledWaypoints);
+
+                if (snappedRoute && snappedRoute.length > sampledWaypoints.length * 0.5) {
+                    finalRoute = snappedRoute;
+                    snappingApplied = true;
+                    logger.info(`✅ Route snapped: ${sampledWaypoints.length} → ${snappedRoute.length} road points`);
+                } else {
+                    logger.warn('⚠️ Road snapping returned insufficient points, using GPS waypoints');
+                }
+            } catch (error) {
+                logger.error('🔥 Road snapping failed:', error);
+                // Continue with GPS waypoints
+            }
+        }
+
+        logger.info(`📊 Returning ${finalRoute.length}/${waypoints.length} waypoints (snapped: ${snappingApplied})`);
 
         const responseData = {
             success: true,
@@ -608,12 +690,22 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     startLocation: {
                         latitude: parseFloat(trip.start_latitude),
                         longitude: parseFloat(trip.start_longitude),
-                        address: trip.start_address
+                        address: formatAddress(
+                            trip.start_address,
+                            trip.start_address_status,
+                            trip.start_latitude,
+                            trip.start_longitude
+                        )
                     },
                     endLocation: {
                         latitude: parseFloat(trip.end_latitude),
                         longitude: parseFloat(trip.end_longitude),
-                        address: trip.end_address
+                        address: formatAddress(
+                            trip.end_address,
+                            trip.end_address_status,
+                            trip.end_latitude,
+                            trip.end_longitude
+                        )
                     },
                     totalDistanceKm: parseFloat(trip.total_distance_km),
                     avgSpeedKmh: parseFloat(trip.avg_speed_kmh),
@@ -621,7 +713,7 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     waypointCount: trip.waypoint_count,
                     createdAt: trip.created_at
                 },
-                waypoints: sampledWaypoints.map(w => ({
+                waypoints: finalRoute.map(w => ({
                     latitude: parseFloat(w.latitude),
                     longitude: parseFloat(w.longitude),
                     speed: parseFloat(w.speed || 0),
@@ -630,8 +722,9 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                 })),
                 metadata: {
                     totalWaypoints: waypoints.length,
-                    returnedWaypoints: sampledWaypoints.length,
+                    returnedWaypoints: finalRoute.length,
                     isSampled: sampledWaypoints.length < waypoints.length,
+                    isSnappedToRoads: snappingApplied,
                     samplingRatio: waypoints.length > 0
                         ? (sampledWaypoints.length / waypoints.length).toFixed(2)
                         : 1,
@@ -960,12 +1053,22 @@ exports.getTripFull = async (req, res) => {
                     startLocation: {
                         latitude: parseFloat(trip.start_latitude),
                         longitude: parseFloat(trip.start_longitude),
-                        address: trip.start_address
+                        address: formatAddress(
+                            trip.start_address,
+                            trip.start_address_status,
+                            trip.start_latitude,
+                            trip.start_longitude
+                        )
                     },
                     endLocation: {
                         latitude: parseFloat(trip.end_latitude),
                         longitude: parseFloat(trip.end_longitude),
-                        address: trip.end_address
+                        address: formatAddress(
+                            trip.end_address,
+                            trip.end_address_status,
+                            trip.end_latitude,
+                            trip.end_longitude
+                        )
                     },
                     totalDistanceKm: parseFloat(trip.total_distance_km),
                     avgSpeedKmh: parseFloat(trip.avg_speed_kmh),

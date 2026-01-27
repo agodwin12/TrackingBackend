@@ -366,18 +366,30 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                             logger.error(`❌ Safe zone check error:`, safeZoneError.message);
                         }
 
-                        // ✅ 2. Geofence violation check
+                        // ✅ 2. Geofence violation check (UPDATED - no more cooldown logic)
                         try {
                             const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-                            if (geofenceResult.violation) {
-                                if (geofenceResult.isFirstAlert) {
+
+                            // Handle state changes (leaving or returning)
+                            if (geofenceResult.stateChanged) {
+                                if (geofenceResult.currentState === 'outside') {
+                                    // Vehicle LEFT the geofence
                                     logger.info(`🚨 GEOFENCE VIOLATION DETECTED!`);
-                                    logger.info(`   Vehicle: ${geofenceResult.vehicleName}`);
-                                    logger.info(`   Location: ${geofenceResult.locationName || `[${geofenceResult.latitude}, ${geofenceResult.longitude}]`}`);
+                                    logger.info(`   Vehicle left the defined zone`);
+                                    logger.info(`   Previous state: ${geofenceResult.previousState}`);
+                                    logger.info(`   Current state: ${geofenceResult.currentState}`);
                                     logger.info(`📧 Geofence alert created and notification sent`);
-                                } else if (geofenceResult.reason === 'Cooldown active') {
-                                    logger.debug(`⏳ Geofence violation ongoing (cooldown active)`);
+                                } else if (geofenceResult.currentState === 'inside') {
+                                    // Vehicle RETURNED to the geofence
+                                    logger.info(`✅ VEHICLE RETURNED TO GEOFENCE!`);
+                                    logger.info(`   Vehicle returned to the defined zone`);
+                                    logger.info(`   Previous state: ${geofenceResult.previousState}`);
+                                    logger.info(`   Current state: ${geofenceResult.currentState}`);
+                                    logger.info(`📧 Geofence return alert created and notification sent`);
                                 }
+                            } else {
+                                // No state change - vehicle still in same state
+                                logger.debug(`ℹ️ No geofence state change (vehicle still ${geofenceResult.currentState || 'in previous state'})`);
                             }
                         } catch (geofenceError) {
                             logger.error(`❌ Geofence check error:`, geofenceError.message);

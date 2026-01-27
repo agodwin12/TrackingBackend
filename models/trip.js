@@ -1,3 +1,4 @@
+// models/trip.js - CORRECTED WITHOUT updated_at
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
@@ -47,6 +48,17 @@ const Trip = sequelize.define("trips", {
         type: DataTypes.STRING(500),
         allowNull: true
     },
+    // 🆕 NEW: Start address status tracking
+    start_address_status: {
+        type: DataTypes.ENUM('pending', 'geocoded', 'failed'),
+        defaultValue: 'pending',
+        allowNull: false
+    },
+    start_address_retry_count: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0,
+        allowNull: false
+    },
 
     // End location
     end_latitude: {
@@ -60,6 +72,17 @@ const Trip = sequelize.define("trips", {
     end_address: {
         type: DataTypes.STRING(500),
         allowNull: true
+    },
+    // 🆕 NEW: End address status tracking
+    end_address_status: {
+        type: DataTypes.ENUM('pending', 'geocoded', 'failed'),
+        defaultValue: 'pending',
+        allowNull: false
+    },
+    end_address_retry_count: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0,
+        allowNull: false
     },
 
     // Trip metrics
@@ -91,7 +114,7 @@ const Trip = sequelize.define("trips", {
         defaultValue: DataTypes.NOW
     }
 }, {
-    timestamps: false,
+    timestamps: false, // ✅ No automatic timestamps
 
     // ✅ ALL PERFORMANCE INDEXES
     indexes: [
@@ -121,6 +144,20 @@ const Trip = sequelize.define("trips", {
         {
             name: 'idx_trips_vehicle_status_time',
             fields: ['vehicle_id', 'status', 'start_time']
+        },
+
+        // 🆕 NEW: Indexes for background geocoding service
+        {
+            name: 'idx_trips_start_address_status',
+            fields: ['start_address_status']
+        },
+        {
+            name: 'idx_trips_end_address_status',
+            fields: ['end_address_status']
+        },
+        {
+            name: 'idx_trips_address_pending',
+            fields: ['start_address_status', 'end_address_status', 'created_at']
         }
     ]
 });

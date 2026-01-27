@@ -1,7 +1,10 @@
 // server.js - SERVER LIFECYCLE MANAGEMENT (HTTP + Socket.IO + Services)
+
+// ✅ LOAD ENVIRONMENT VARIABLES FIRST (before any other imports)
+require('dotenv').config();
+
 const http = require('http');
 const { Server } = require('socket.io');
-const dotenv = require('dotenv');
 const app = require('./app');
 const sequelize = require('./config/database');
 const redisClient = require('./config/redis');
@@ -13,8 +16,6 @@ const GeocodingService = require('./services/geocodingService');
 
 // ✅ Security Check Job
 require('./jobs/checkSecurityMovement');
-
-dotenv.config();
 
 // ========== HTTP SERVER SETUP ==========
 const httpServer = http.createServer(app);
@@ -139,6 +140,7 @@ async function startServer() {
     } catch (error) {
         logger.error('❌ FATAL: Server failed to start');
         logger.error('🔥 Error:', error.message);
+        logger.error('🔥 Stack:', error.stack);
         process.exit(1);
     }
 }
@@ -151,9 +153,14 @@ async function gracefulShutdown(signal) {
 
     // 1. Stop GPS
     try {
-        stopGPSFetchCycle();
-        logger.info('✅ GPS service stopped');
+        if (isRunning()) {
+            stopGPSFetchCycle();
+            logger.info('✅ GPS service stopped');
+        } else {
+            logger.info('ℹ️  GPS service was not running');
+        }
     } catch (error) {
+        logger.error('❌ GPS shutdown failed:', error.message);
         errors.push('GPS');
     }
 
@@ -162,6 +169,7 @@ async function gracefulShutdown(signal) {
         await new Promise((resolve) => httpServer.close(resolve));
         logger.info('✅ HTTP server closed');
     } catch (error) {
+        logger.error('❌ HTTP server close failed:', error.message);
         errors.push('HTTP');
     }
 
@@ -170,14 +178,20 @@ async function gracefulShutdown(signal) {
         await new Promise((resolve) => io.close(resolve));
         logger.info('✅ Socket.IO closed');
     } catch (error) {
+        logger.error('❌ Socket.IO close failed:', error.message);
         errors.push('Socket.IO');
     }
 
     // 4. Disconnect Redis
     try {
-        await redisClient.disconnect();
-        logger.info('✅ Redis disconnected');
+        if (redisClient.isOpen) {
+            await redisClient.disconnect();
+            logger.info('✅ Redis disconnected');
+        } else {
+            logger.info('ℹ️  Redis was not connected');
+        }
     } catch (error) {
+        logger.error('❌ Redis disconnect failed:', error.message);
         errors.push('Redis');
     }
 
@@ -186,13 +200,27 @@ async function gracefulShutdown(signal) {
         await sequelize.close();
         logger.info('✅ Database closed');
     } catch (error) {
+        logger.error('❌ Database close failed:', error.message);
         errors.push('Database');
     }
 
-    logger.info(errors.length > 0
-        ? `⚠️  Shutdown complete (errors: ${errors.join(', ')})`
-        : '✅ Shutdown complete'
-    );
+    // 6. Stop Cron Jobs
+    try {
+        TripDetectionCron.stop();
+        logger.info('✅ Trip Detection Cron stopped');
+    } catch (error) {
+        logger.error('❌ Cron stop failed:', error.message);
+        errors.push('Cron');
+    }
+
+    logger.info('\n╔════════════════════════════════════════╗');
+    if (errors.length > 0) {
+        logger.warn(`║  ⚠️  SHUTDOWN COMPLETE (${errors.length} errors)      ║`);
+        logger.warn(`║     Failed: ${errors.join(', ').padEnd(25)}║`);
+    } else {
+        logger.info('║      ✅ SHUTDOWN COMPLETE             ║');
+    }
+    logger.info('╚════════════════════════════════════════╝\n');
 
     process.exit(errors.length > 0 ? 1 : 0);
 }
@@ -202,14 +230,73 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('uncaughtException', (error) => {
-    logger.error('🔥 UNCAUGHT EXCEPTION:', error);
+    logger.error('\n╔════════════════════════════════════════╗');
+    logger.error('║      🔥 UNCAUGHT EXCEPTION            ║');
+    logger.error('╚════════════════════════════════════════╝');
+    logger.error('Error:', error.message);
+    logger.error('Stack:', error.stack);
     gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
-process.on('unhandledRejection', (reason) => {
-    logger.error('🔥 UNHANDLED REJECTION:', reason);
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('\n╔════════════════════════════════════════╗');
+    logger.error('║     🔥 UNHANDLED REJECTION            ║');
+    logger.error('╚════════════════════════════════════════╝');
+    logger.error('Reason:', reason);
+    logger.error('Promise:', promise);
     gracefulShutdown('UNHANDLED_REJECTION');
 });
+
+// ========== VERIFY CRITICAL ENVIRONMENT VARIABLES ==========
+// ✅ Updated to allow empty passwords (common in local development)
+const requiredEnvVars = [
+    'DB_HOST',
+    'DB_USER',
+    'DB_NAME',
+    'GPS_LOGIN_NAME_1',
+    'GPS_LOGIN_PASSWORD_1'
+];
+
+// Variables that can be empty (like passwords)
+const optionalButDefinedVars = [
+    'DB_PASSWORD',
+    'REDIS_PASSWORD'
+];
+
+logger.info('\n🔍 Checking required environment variables...');
+
+// Check required variables (must exist and not be undefined)
+const missingVars = requiredEnvVars.filter(varName => process.env[varName] === undefined);
+
+// Check optional variables (must be defined, can be empty string)
+const undefinedOptionalVars = optionalButDefinedVars.filter(varName => process.env[varName] === undefined);
+
+if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
+    logger.error('❌ Missing required environment variables:');
+
+    if (missingVars.length > 0) {
+        logger.error('\n  Required (must have value):');
+        missingVars.forEach(varName => logger.error(`   - ${varName}`));
+    }
+
+    if (undefinedOptionalVars.length > 0) {
+        logger.error('\n  Required (can be empty, but must be defined):');
+        undefinedOptionalVars.forEach(varName => logger.error(`   - ${varName}`));
+    }
+
+    logger.error('\n⚠️  Please check your .env file');
+    process.exit(1);
+} else {
+    logger.info('✅ All required environment variables are set');
+
+    // Show which passwords are empty (informational)
+    const emptyPasswords = optionalButDefinedVars.filter(varName => process.env[varName] === '');
+    if (emptyPasswords.length > 0) {
+        logger.warn(`⚠️  Note: Empty passwords detected for: ${emptyPasswords.join(', ')}`);
+    }
+
+    logger.info('');
+}
 
 // ========== START THE SERVER ==========
 startServer();
