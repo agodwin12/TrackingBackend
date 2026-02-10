@@ -1,4 +1,4 @@
-// services/tripDetectionService.js - ENHANCED WITH IMMEDIATE GEOCODING
+// services/tripDetectionService.js - FIXED GPS THRESHOLDS FOR COMPLETE ROUTES
 const { Op } = require("sequelize");
 const Location = require("../models/location");
 const Trip = require("../models/trip");
@@ -8,39 +8,39 @@ const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
 const sequelize = require("../config/database");
 const logger = require("../utils/logger");
-const axios = require('axios'); // ✅ For geocoding
+const axios = require('axios');
 
 class TripDetectionService {
-    // ==================== ENHANCED CONFIGURATION ====================
+    // ==================== FIXED CONFIGURATION ====================
 
     // 🚗 TRIP DETECTION THRESHOLDS
     static IDLE_THRESHOLD_MINUTES = Number(process.env.TRIP_IDLE_MINUTES ?? 10);
     static MIN_SPEED_THRESHOLD = Number(process.env.TRIP_MIN_SPEED_KMH ?? 10);
     static TRIP_MERGE_THRESHOLD_MINUTES = Number(process.env.TRIP_MERGE_MINUTES ?? 3);
 
-    // 🎯 MINIMUM TRIP REQUIREMENTS
-    static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 5);
-    static MIN_TRIP_DISTANCE_KM = Number(process.env.TRIP_MIN_DISTANCE_KM ?? 1.5);
+    // 🎯 MINIMUM TRIP REQUIREMENTS - ✅ REDUCED
+    static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 2); // ✅ REDUCED from 5 to 2
+    static MIN_TRIP_DISTANCE_KM = Number(process.env.TRIP_MIN_DISTANCE_KM ?? 0.5); // ✅ REDUCED from 1.5 to 0.5
 
     // 📍 GPS DRIFT DETECTION
     static GPS_DRIFT_THRESHOLD_METERS = Number(process.env.GPS_DRIFT_METERS ?? 100);
     static MAX_PARKED_SPEED = 3;
 
-    // 🆕 TRIP START CONFIRMATION
-    static MIN_CONSECUTIVE_MOVING_POINTS = 5;
-    static MIN_DISTANCE_TO_START_TRIP_METERS = 200;
+    // 🆕 TRIP START CONFIRMATION - ✅ RELAXED
+    static MIN_CONSECUTIVE_MOVING_POINTS = 3; // ✅ REDUCED from 5 to 3
+    static MIN_DISTANCE_TO_START_TRIP_METERS = 100; // ✅ REDUCED from 200 to 100
     static PARKING_LOT_RADIUS_METERS = 100;
 
-    // 🆕 GPS POSITION CORRECTION THRESHOLDS
-    static MAX_SPEED_KMPH = 180;
-    static MAX_JUMP_DISTANCE_METERS = 500;
-    static MIN_JUMP_TIME_SECONDS = 3;
-    static DIRECTION_CHANGE_THRESHOLD = 135;
-    static DOUGLAS_PEUCKER_TOLERANCE = 0.00005;
+    // 🆕 GPS POSITION CORRECTION THRESHOLDS - ✅ RELAXED
+    static MAX_SPEED_KMPH = 200; // ✅ Increased from 180
+    static MAX_JUMP_DISTANCE_METERS = 1000; // ✅ DOUBLED from 500
+    static MIN_JUMP_TIME_SECONDS = 2; // ✅ REDUCED from 3
+    static DIRECTION_CHANGE_THRESHOLD = 170; // ✅ RELAXED from 135 to 170 (allows sharper turns)
+    static DOUGLAS_PEUCKER_TOLERANCE = 0.0001; // ✅ REDUCED from 0.00005 (less aggressive simplification)
 
     // ⚡ PERFORMANCE SETTINGS
-    static MAX_LOCATIONS_PER_BATCH = 5000;
-    static WAYPOINT_BATCH_SIZE = 500;
+    static MAX_LOCATIONS_PER_BATCH = 10000;
+    static WAYPOINT_BATCH_SIZE = 50000;
 
     // 🗺️ GEOCODING
     static GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
@@ -66,13 +66,12 @@ class TripDetectionService {
 
             const response = await axios.get(url, {
                 params: params,
-                timeout: 10000 // ✅ Increased timeout to 10 seconds
+                timeout: 10000
             });
 
             logger.debug(`📥 API Response Status: ${response.data.status}`);
             logger.debug(`📥 API Response:`, JSON.stringify(response.data, null, 2));
 
-            // ✅ Handle different Google Maps API error codes
             if (response.data.status === 'ZERO_RESULTS') {
                 logger.warn(`⚠️ Geocoding: No results found for [${latitude}, ${longitude}]`);
                 return {
@@ -125,7 +124,6 @@ class TripDetectionService {
                 logger.debug(`✅ Found ${response.data.results.length} result(s)`);
                 logger.debug(`✅ First result formatted_address: ${result.formatted_address}`);
 
-                // Extract components
                 let neighborhood = null;
                 let locality = null;
                 let sublocality = null;
@@ -156,7 +154,6 @@ class TripDetectionService {
                     administrativeArea
                 });
 
-                // Priority: route + locality > route + sublocality > route > sublocality > neighborhood > locality
                 let address;
                 if (route && locality) {
                     address = `${route}, ${locality}`;
@@ -173,7 +170,6 @@ class TripDetectionService {
                 } else if (administrativeArea) {
                     address = administrativeArea;
                 } else {
-                    // Fallback to first part of formatted address
                     address = result.formatted_address.split(',')[0];
                 }
 
@@ -1043,13 +1039,11 @@ class TripDetectionService {
         try {
             logger.info(`🗺️ Geocoding start address...`);
 
-            // ✅ IMMEDIATE geocoding (blocking)
             const startAddressData = await this.reverseGeocode(
                 startLocation.latitude,
                 startLocation.longitude
             );
 
-            // Create trip with geocoded address
             const trip = await Trip.create({
                 vehicle_id: vehicleId,
                 mac_id_gps: macIdGps,
@@ -1057,12 +1051,12 @@ class TripDetectionService {
                 end_time: startLocation.sys_time,
                 start_latitude: startLocation.latitude,
                 start_longitude: startLocation.longitude,
-                start_address: startAddressData.address, // ✅ IMMEDIATE
-                start_address_status: startAddressData.status, // ✅ 'geocoded' or 'failed'
+                start_address: startAddressData.address,
+                start_address_status: startAddressData.status,
                 end_latitude: startLocation.latitude,
                 end_longitude: startLocation.longitude,
-                end_address: startAddressData.address, // ✅ IMMEDIATE (same as start initially)
-                end_address_status: startAddressData.status, // ✅ 'geocoded' or 'failed'
+                end_address: startAddressData.address,
+                end_address_status: startAddressData.status,
                 status: 'ongoing',
                 duration_minutes: 0,
                 total_distance_km: 0,
@@ -1253,7 +1247,6 @@ class TripDetectionService {
                 return false;
             }
 
-            // ✅ IMMEDIATE geocoding for end address
             logger.info(`🗺️ Geocoding end address...`);
             const endAddressData = await this.reverseGeocode(
                 endLocation.latitude,
@@ -1264,8 +1257,8 @@ class TripDetectionService {
                 end_time: endLocation.sys_time,
                 end_latitude: endLocation.latitude,
                 end_longitude: endLocation.longitude,
-                end_address: endAddressData.address, // ✅ IMMEDIATE
-                end_address_status: endAddressData.status, // ✅ 'geocoded' or 'failed'
+                end_address: endAddressData.address,
+                end_address_status: endAddressData.status,
                 duration_minutes: Math.round(metrics.durationMinutes),
                 total_distance_km: parseFloat(metrics.totalDistanceKm.toFixed(2)),
                 avg_speed_kmh: parseFloat(metrics.avgSpeed.toFixed(2)),

@@ -164,15 +164,27 @@ exports.sendToUser = async (userId, notification) => {
 };
 
 /**
- * ✅ Send safe zone alert
+ * ✅ Send safe zone alert - FIXED to handle both "left" and "returned" actions
  */
-exports.sendSafeZoneAlert = async (userId, vehicleName, zoneName) => {
-    console.log(`🛡️ Sending safe zone alert to user ${userId}`);
+exports.sendSafeZoneAlert = async (userId, vehicleName, zoneName, action = 'left') => {
+    console.log(`🛡️ Sending safe zone alert to user ${userId} - Action: ${action}`);
+
+    let title, body;
+
+    if (action === 'returned') {
+        title = '✅ Safe Zone Alert';
+        body = `${vehicleName} returned to safe zone "${zoneName}"`;
+    } else {
+        title = '🚨 Safe Zone Alert';
+        body = `${vehicleName} left safe zone "${zoneName}"`;
+    }
+
     return await exports.sendToUser(userId, {
-        title: '🛡️ Safe Zone Alert',
-        body: `${vehicleName} left safe zone "${zoneName}"`,
+        title: title,
+        body: body,
         data: {
             type: 'safe_zone',
+            action: action,
             vehicle: vehicleName,
             zone: zoneName,
             timestamp: new Date().toISOString()
@@ -298,5 +310,7 @@ exports.sendTestNotification = async (req, res) => {
         });
     }
 };
+
+
 
 module.exports = exports;

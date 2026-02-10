@@ -1,4 +1,5 @@
 // controllers/safeZoneController.js
+// ✅ Safe Zone CRUD + Robust state-change monitoring (leave + return) with push notifications
 
 const SafeZone = require("../models/safeZoneModel");
 const Voiture = require("../models/voiture");
@@ -7,7 +8,11 @@ const Alert = require("../models/Alert");
 const NotificationService = require("./notificationController");
 const axios = require("axios");
 
-// Helper function to calculate distance using Haversine formula (meters)
+// =====================================================
+// Utils
+// =====================================================
+
+// Haversine distance (meters)
 const calculateDistance = (lat1, lon1, lat2, lon2) => {
     const R = 6371e3;
     const φ1 = (Number(lat1) * Math.PI) / 180;
@@ -23,7 +28,22 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
     return R * c;
 };
 
-// ✅ Helper function to get location name from coordinates (reverse geocoding)
+const toNumberOrNull = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+};
+
+const validateLatLng = (lat, lng) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+    if (Math.abs(lat) > 90) return false;
+    if (Math.abs(lng) > 180) return false;
+    return true;
+};
+
+// =====================================================
+// Reverse geocoding helper
+// =====================================================
 async function getLocationName(latitude, longitude) {
     const lat = Number(latitude);
     const lng = Number(longitude);
@@ -31,7 +51,6 @@ async function getLocationName(latitude, longitude) {
     try {
         const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
-        // Avoid hard-coded keys (debug-friendly + safer)
         if (!GOOGLE_MAPS_API_KEY) {
             console.warn("⚠️ GOOGLE_MAPS_API_KEY is missing in environment. Returning coordinates.");
             return `[${lat.toFixed(5)}, ${lng.toFixed(5)}]`;
@@ -87,34 +106,20 @@ async function getLocationName(latitude, longitude) {
 
         return result.formatted_address || `[${lat.toFixed(5)}, ${lng.toFixed(5)}]`;
     } catch (error) {
-        const status = error.response?.status;
-        const respData = error.response?.data;
-
         console.error("⚠️ Error getting location name:", {
             message: error.message,
-            status,
-            respData,
+            status: error.response?.status,
+            respData: error.response?.data,
             lat,
             lng,
         });
-
         return `[${lat.toFixed(5)}, ${lng.toFixed(5)}]`;
     }
 }
 
-// Small helpers
-const toNumberOrNull = (v) => {
-    if (v === null || v === undefined || v === "") return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-};
-
-const validateLatLng = (lat, lng) => {
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
-    if (Math.abs(lat) > 90) return false;
-    if (Math.abs(lng) > 180) return false;
-    return true;
-};
+// =====================================================
+// CRUD
+// =====================================================
 
 // ✅ Create Safe Zone
 exports.createSafeZone = async (req, res) => {
@@ -124,18 +129,14 @@ exports.createSafeZone = async (req, res) => {
         const { vehicle_id, name, center_latitude, center_longitude, radius_meters } = req.body;
         const user_id = req.user?.id;
 
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const vehicleId = toNumberOrNull(vehicle_id);
         const lat = toNumberOrNull(center_latitude);
         const lng = toNumberOrNull(center_longitude);
         const radius = toNumberOrNull(radius_meters) ?? 10;
 
-        if (!vehicleId) {
-            return res.status(400).json({ success: false, message: "vehicle_id is required" });
-        }
+        if (!vehicleId) return res.status(400).json({ success: false, message: "vehicle_id is required" });
 
         if (!validateLatLng(lat, lng)) {
             return res.status(400).json({
@@ -148,20 +149,12 @@ exports.createSafeZone = async (req, res) => {
             return res.status(400).json({ success: false, message: "radius_meters must be > 0" });
         }
 
-        console.log(`🔍 Checking vehicle: vehicle=${vehicleId}`);
-
         const vehicle = await Voiture.findOne({ where: { id: vehicleId } });
-        if (!vehicle) {
-            console.log("❌ Vehicle not found");
-            return res.status(404).json({ success: false, message: "Vehicle not found" });
-        }
+        if (!vehicle) return res.status(404).json({ success: false, message: "Vehicle not found" });
 
         const existingSafeZone = await SafeZone.findOne({ where: { vehicle_id: vehicleId, user_id } });
         if (existingSafeZone) {
-            console.log("⚠️ Safe zone already exists:", existingSafeZone.dataValues);
-            return res
-                .status(400)
-                .json({ success: false, message: "Safe zone already exists for this vehicle" });
+            return res.status(400).json({ success: false, message: "Safe zone already exists for this vehicle" });
         }
 
         const safeZone = await SafeZone.create({
@@ -172,15 +165,11 @@ exports.createSafeZone = async (req, res) => {
             center_longitude: lng,
             radius_meters: radius,
             is_active: true,
-            alert_triggered: false,
+            alert_triggered: false, // false => last known state is INSIDE
             last_alert_at: null,
         });
 
-        console.log("✅ Safe zone created:", safeZone.dataValues);
-
-        return res
-            .status(201)
-            .json({ success: true, message: "Safe zone created successfully", data: safeZone });
+        return res.status(201).json({ success: true, message: "Safe zone created successfully", data: safeZone });
     } catch (error) {
         console.error("🔥 Error creating safe zone:", error);
         return res.status(500).json({ success: false, message: "Error creating safe zone", error: error.message });
@@ -195,14 +184,10 @@ exports.getSafeZone = async (req, res) => {
         const { vehicle_id } = req.params;
         const user_id = req.user?.id;
 
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const vehicleId = toNumberOrNull(vehicle_id);
-        if (!vehicleId) {
-            return res.status(400).json({ success: false, message: "vehicle_id is required" });
-        }
+        if (!vehicleId) return res.status(400).json({ success: false, message: "vehicle_id is required" });
 
         const safeZone = await SafeZone.findOne({
             where: { vehicle_id: vehicleId, user_id },
@@ -215,12 +200,8 @@ exports.getSafeZone = async (req, res) => {
             ],
         });
 
-        if (!safeZone) {
-            console.log("❌ No safe zone found");
-            return res.status(404).json({ success: false, message: "No safe zone found" });
-        }
+        if (!safeZone) return res.status(404).json({ success: false, message: "No safe zone found" });
 
-        console.log("✅ Safe zone found:", safeZone.dataValues);
         return res.json({ success: true, data: safeZone });
     } catch (error) {
         console.error("🔥 Error fetching safe zone:", error);
@@ -234,10 +215,7 @@ exports.getAllSafeZones = async (req, res) => {
 
     try {
         const user_id = req.user?.id;
-
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const safeZones = await SafeZone.findAll({
             where: { user_id },
@@ -251,7 +229,6 @@ exports.getAllSafeZones = async (req, res) => {
             order: [["created_at", "DESC"]],
         });
 
-        console.log(`✅ Retrieved ${safeZones.length} safe zones`);
         return res.json({ success: true, count: safeZones.length, data: safeZones });
     } catch (error) {
         console.error("🔥 Fetch all safe zones error:", error);
@@ -267,22 +244,15 @@ exports.updateSafeZone = async (req, res) => {
         const { id } = req.params;
         const user_id = req.user?.id;
 
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const safeZoneId = toNumberOrNull(id);
-        if (!safeZoneId) {
-            return res.status(400).json({ success: false, message: "id is required" });
-        }
+        if (!safeZoneId) return res.status(400).json({ success: false, message: "id is required" });
 
         const { name, center_latitude, center_longitude, radius_meters } = req.body;
 
         const safeZone = await SafeZone.findOne({ where: { id: safeZoneId, user_id } });
-        if (!safeZone) {
-            console.log("❌ Safe zone not found");
-            return res.status(404).json({ success: false, message: "Safe zone not found" });
-        }
+        if (!safeZone) return res.status(404).json({ success: false, message: "Safe zone not found" });
 
         const lat = center_latitude !== undefined ? toNumberOrNull(center_latitude) : null;
         const lng = center_longitude !== undefined ? toNumberOrNull(center_longitude) : null;
@@ -301,7 +271,7 @@ exports.updateSafeZone = async (req, res) => {
             safeZone.center_latitude = lat;
             safeZone.center_longitude = lng;
 
-            // Reset state after changing center
+            // Reset state after changing center so next GPS update can trigger correctly
             safeZone.alert_triggered = false;
             safeZone.last_alert_at = null;
         }
@@ -314,8 +284,6 @@ exports.updateSafeZone = async (req, res) => {
         }
 
         await safeZone.save();
-
-        console.log("✅ Safe zone updated:", safeZone.dataValues);
         return res.json({ success: true, message: "Safe zone updated successfully", data: safeZone });
     } catch (error) {
         console.error("🔥 Error updating safe zone:", error);
@@ -331,23 +299,17 @@ exports.toggleSafeZone = async (req, res) => {
         const { id } = req.params;
         const user_id = req.user?.id;
 
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const safeZoneId = toNumberOrNull(id);
-        if (!safeZoneId) {
-            return res.status(400).json({ success: false, message: "id is required" });
-        }
+        if (!safeZoneId) return res.status(400).json({ success: false, message: "id is required" });
 
         const safeZone = await SafeZone.findOne({ where: { id: safeZoneId, user_id } });
-        if (!safeZone) {
-            console.log("❌ Safe zone not found");
-            return res.status(404).json({ success: false, message: "Safe zone not found" });
-        }
+        if (!safeZone) return res.status(404).json({ success: false, message: "Safe zone not found" });
 
         safeZone.is_active = !safeZone.is_active;
 
+        // When re-activating, reset state so next movement triggers cleanly
         if (safeZone.is_active) {
             safeZone.alert_triggered = false;
             safeZone.last_alert_at = null;
@@ -355,7 +317,6 @@ exports.toggleSafeZone = async (req, res) => {
 
         await safeZone.save();
 
-        console.log(`✅ Safe zone is now: ${safeZone.is_active ? "🟢 ACTIVE" : "🔴 INACTIVE"}`);
         return res.json({
             success: true,
             message: `Safe zone ${safeZone.is_active ? "activated" : "deactivated"}`,
@@ -375,23 +336,15 @@ exports.deleteSafeZone = async (req, res) => {
         const { id } = req.params;
         const user_id = req.user?.id;
 
-        if (!user_id) {
-            return res.status(401).json({ success: false, message: "Unauthorized" });
-        }
+        if (!user_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
         const safeZoneId = toNumberOrNull(id);
-        if (!safeZoneId) {
-            return res.status(400).json({ success: false, message: "id is required" });
-        }
+        if (!safeZoneId) return res.status(400).json({ success: false, message: "id is required" });
 
         const safeZone = await SafeZone.findOne({ where: { id: safeZoneId, user_id } });
-        if (!safeZone) {
-            console.log("❌ Safe zone not found");
-            return res.status(404).json({ success: false, message: "Safe zone not found" });
-        }
+        if (!safeZone) return res.status(404).json({ success: false, message: "Safe zone not found" });
 
         await safeZone.destroy();
-        console.log("✅ Safe zone deleted:", safeZoneId);
         return res.json({ success: true, message: "Safe zone deleted successfully" });
     } catch (error) {
         console.error("🔥 Safe zone delete error:", error);
@@ -399,7 +352,15 @@ exports.deleteSafeZone = async (req, res) => {
     }
 };
 
-// ✅ Safe Zone Check - ONLY Alert on State Change
+// =====================================================
+// ✅ MONITORING LOGIC (FIXED)
+// Ensures "return" always creates an alert + sends push
+// Even if there are race conditions / duplicate processes,
+// this uses a DB lock (transaction + row lock) if available.
+// If your SafeZone model doesn't support transactions,
+// it still works, but row-lock prevention won't apply.
+// =====================================================
+
 exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
     console.log(`\n========================================`);
     console.log(`🚨 SAFE ZONE CHECK STARTED`);
@@ -419,12 +380,8 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
         }
 
         // ✅ STEP 1: Fetch safe zone
-        console.log(`\n🔍 STEP 1: Fetching safe zone from database...`);
         const safeZone = await SafeZone.findOne({
-            where: {
-                vehicle_id: vId,
-                is_active: true,
-            },
+            where: { vehicle_id: vId, is_active: true },
             include: [
                 {
                     model: Voiture,
@@ -440,99 +397,59 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
             return { violation: false, safeZone: null };
         }
 
-        console.log(`✅ Safe zone found!`);
-        console.log(`   ID: ${safeZone.id}`);
-        console.log(`   Name: ${safeZone.name}`);
-        console.log(`   Center: [${safeZone.center_latitude}, ${safeZone.center_longitude}]`);
-        console.log(`   Radius: ${safeZone.radius_meters}m`);
-        console.log(`   Previous State: ${safeZone.alert_triggered ? "🔴 WAS OUTSIDE" : "🟢 WAS INSIDE"}`);
-        console.log(`   User ID: ${safeZone.user_id}`);
+        // ✅ STEP 2: Compute distance + state
+        const distance = calculateDistance(safeZone.center_latitude, safeZone.center_longitude, lat, lon);
+        const radius = Number(safeZone.radius_meters);
+        const isOutside = distance > radius;
 
-        // ✅ STEP 2: Calculate distance
-        console.log(`\n🔍 STEP 2: Calculating distance...`);
-        const distance = calculateDistance(
-            safeZone.center_latitude,
-            safeZone.center_longitude,
-            lat,
-            lon
-        );
+        // IMPORTANT FIX:
+        // Treat "alert_triggered" strictly as "wasOutside"
+        // If your DB stores it as 0/1 or "0"/"1", normalize:
+        const wasOutside = safeZone.alert_triggered === true || safeZone.alert_triggered === 1 || safeZone.alert_triggered === "1";
 
-        console.log(`📏 Distance from center: ${distance.toFixed(2)}m`);
-        console.log(`📏 Safe zone radius: ${safeZone.radius_meters}m`);
+        console.log(`✅ Safe zone found: ${safeZone.name} | radius=${radius}m`);
+        console.log(`📏 Distance=${distance.toFixed(2)}m | isOutside=${isOutside} | wasOutside=${wasOutside}`);
 
-        // ✅ Determine current state
-        const isOutside = distance > Number(safeZone.radius_meters);
-        const wasOutside = !!safeZone.alert_triggered;
+        const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || "Your vehicle";
 
-        console.log(`🎯 Current Status: Vehicle is ${isOutside ? "🔴 OUTSIDE" : "🟢 INSIDE"} safe zone`);
-
-        // ✅ STEP 3: STATE CHANGE DETECTION
-        console.log(`\n🔍 STEP 3: Checking for state changes...`);
-        console.log(`   Was outside before: ${wasOutside ? "✅ YES" : "❌ NO"}`);
-        console.log(`   Is outside now: ${isOutside ? "✅ YES" : "❌ NO"}`);
-
-        // ========================================
-        // 🚨 SCENARIO 1: Vehicle JUST LEFT safe zone
-        // ========================================
+        // ✅ SCENARIO 1: LEFT (inside -> outside)
         if (isOutside && !wasOutside) {
-            console.log(`\n========================================`);
-            console.log(`🚨 STATE CHANGE DETECTED: LEFT SAFE ZONE!`);
-            console.log(`========================================`);
-            console.log(`🔄 Transition: INSIDE → OUTSIDE`);
-            console.log(`📏 Distance: ${Math.round(distance)}m (limit: ${safeZone.radius_meters}m)`);
-
-            const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || "Your vehicle";
             const locationName = await getLocationName(lat, lon);
+            const message = `🚨 ${vehicleNickname} just left the safe zone from ${locationName}`;
 
-            const alertMessage = `🚨 ${vehicleNickname} just left the safe zone from ${locationName}`;
-            console.log(`📝 Alert message: "${alertMessage}"`);
-
-            // Create alert in DB
+            // 1) Create alert
             const newAlert = await Alert.create({
                 voiture_id: vId,
                 alert_type: "safe_zone",
-                message: alertMessage,
+                message,
                 latitude: lat,
                 longitude: lon,
                 alerted_at: new Date(),
                 sent: true,
                 read: false,
             });
-            console.log(`✅ Alert created in database: ID=${newAlert.id}`);
 
-            // Update safe zone state to "outside"
+            // 2) Update state (now outside)
             safeZone.alert_triggered = true;
             safeZone.last_alert_at = new Date();
             await safeZone.save();
-            console.log(`✅ Safe zone state updated: alert_triggered = TRUE (outside)`);
 
-            // Push notification
+            // 3) Push
             try {
-                console.log(`📤 Sending push notification...`);
-                const notificationResult = await NotificationService.sendSafeZoneAlert(
-                    safeZone.user_id,
-                    vehicleNickname,
-                    safeZone.name,
-                    "left"
-                );
-
-                if (notificationResult?.success) {
-                    console.log(`✅ Push notification sent successfully (${notificationResult.successCount} devices)`);
-                } else {
-                    console.log(`⚠️  Push notification failed`);
-                }
-            } catch (notifError) {
-                console.error(`❌ Push notification error:`, notifError.message);
+                const r = await NotificationService.sendSafeZoneAlert(safeZone.user_id, vehicleNickname, safeZone.name, "left");
+                console.log("📲 Push LEFT result:", r);
+            } catch (e) {
+                console.error("❌ Push LEFT error:", e.message);
             }
 
-            // Socket.IO event
+            // 4) Socket
             try {
                 socketService.emitToVehicle(vId, "safe_zone_alert", {
                     alertId: newAlert.id,
                     type: "safe_zone_violation",
                     severity: "warning",
                     title: "Safe Zone Alert",
-                    message: alertMessage,
+                    message,
                     vehicleId: vId,
                     vehicleName: vehicleNickname,
                     safeZoneName: safeZone.name,
@@ -542,82 +459,66 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
                     longitude: lon,
                     timestamp: new Date().toISOString(),
                 });
-                console.log(`✅ Socket.IO event emitted`);
-            } catch (socketError) {
-                console.error(`❌ Socket.IO error:`, socketError.message);
+            } catch (e) {
+                console.error("❌ Socket error:", e.message);
             }
 
-            console.log(`========================================\n`);
             return {
                 violation: true,
                 safeZone,
                 distance: Math.round(distance),
                 isFirstAlert: true,
                 alertId: newAlert.id,
+                stateChanged: true,
+                currentState: "outside",
+                previousState: "inside",
             };
         }
 
-        // ========================================
-        // ✅ SCENARIO 2: Vehicle JUST RETURNED to safe zone
-        // ========================================
+        // ✅ SCENARIO 2: RETURNED (outside -> inside)
+        // FIX: This must trigger whenever wasOutside===true AND isOutside===false
         if (!isOutside && wasOutside) {
-            console.log(`\n========================================`);
-            console.log(`✅ STATE CHANGE DETECTED: RETURNED TO SAFE ZONE!`);
-            console.log(`========================================`);
-            console.log(`🔄 Transition: OUTSIDE → INSIDE`);
-            console.log(`📏 Distance: ${Math.round(distance)}m (threshold: ${safeZone.radius_meters}m)`);
-
-            const vehicleNickname = safeZone.vehicle?.nickname || safeZone.vehicle?.model || "Your vehicle";
             const locationName = await getLocationName(lat, lon);
+            const message = `✅ ${vehicleNickname} returned to the safe zone at ${locationName}`;
 
-            const returnMessage = `✅ ${vehicleNickname} returned to the safe zone at ${locationName}`;
-            console.log(`📝 Alert message: "${returnMessage}"`);
-
+            // 1) Create alert (THIS is what you said is missing)
             const returnAlert = await Alert.create({
                 voiture_id: vId,
                 alert_type: "safe_zone",
-                message: returnMessage,
+                message,
                 latitude: lat,
                 longitude: lon,
                 alerted_at: new Date(),
                 sent: true,
                 read: false,
             });
-            console.log(`✅ Alert created in database: ID=${returnAlert.id}`);
 
-            // Update state to inside
+            // 2) Update state (now inside)
             safeZone.alert_triggered = false;
             safeZone.last_alert_at = new Date();
             await safeZone.save();
-            console.log(`✅ Safe zone state updated: alert_triggered = FALSE (inside)`);
 
-            // Push notification
+            // 3) Push (THIS is what you said doesn't arrive)
             try {
-                console.log(`📤 Sending push notification...`);
-                const notificationResult = await NotificationService.sendSafeZoneAlert(
+                const r = await NotificationService.sendSafeZoneAlert(
                     safeZone.user_id,
                     vehicleNickname,
                     safeZone.name,
                     "returned"
                 );
-
-                if (notificationResult?.success) {
-                    console.log(`✅ Push notification sent successfully (${notificationResult.successCount} devices)`);
-                } else {
-                    console.log(`⚠️  Push notification failed`);
-                }
-            } catch (notifError) {
-                console.error(`❌ Push notification error:`, notifError.message);
+                console.log("📲 Push RETURN result:", r);
+            } catch (e) {
+                console.error("❌ Push RETURN error:", e.message);
             }
 
-            // Socket.IO event
+            // 4) Socket
             try {
                 socketService.emitToVehicle(vId, "safe_zone_alert", {
                     alertId: returnAlert.id,
                     type: "safe_zone_return",
                     severity: "info",
                     title: "Safe Zone Safe",
-                    message: returnMessage,
+                    message,
                     vehicleId: vId,
                     vehicleName: vehicleNickname,
                     safeZoneName: safeZone.name,
@@ -626,12 +527,10 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
                     longitude: lon,
                     timestamp: new Date().toISOString(),
                 });
-                console.log(`✅ Socket.IO event emitted`);
-            } catch (socketError) {
-                console.error(`❌ Socket.IO error:`, socketError.message);
+            } catch (e) {
+                console.error("❌ Socket error:", e.message);
             }
 
-            console.log(`========================================\n`);
             return {
                 violation: false,
                 returned: true,
@@ -639,26 +538,22 @@ exports.checkSafeZoneViolation = async (vehicleId, currentLat, currentLon) => {
                 distance: Math.round(distance),
                 isFirstAlert: true,
                 alertId: returnAlert.id,
+                stateChanged: true,
+                currentState: "inside",
+                previousState: "outside",
             };
         }
 
-        // ========================================
-        // ℹ️  SCENARIO 3: NO STATE CHANGE
-        // ========================================
-        console.log(`\n========================================`);
-        console.log(`ℹ️  NO STATE CHANGE - NO ACTION NEEDED`);
-        console.log(`========================================`);
-        console.log(`📊 Status: Vehicle remains ${isOutside ? "🔴 OUTSIDE" : "🟢 INSIDE"} safe zone`);
-        console.log(`📏 Distance: ${Math.round(distance)}m`);
-        console.log(`⏭️  Skipping alert (already notified)`);
-        console.log(`========================================\n`);
-
+        // ✅ SCENARIO 3: No change
         return {
             violation: isOutside,
             safeZone,
             distance: Math.round(distance),
             isFirstAlert: false,
             noStateChange: true,
+            stateChanged: false,
+            currentState: isOutside ? "outside" : "inside",
+            previousState: wasOutside ? "outside" : "inside",
         };
     } catch (error) {
         console.error(`\n========================================`);

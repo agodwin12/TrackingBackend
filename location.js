@@ -1,4 +1,4 @@
-// location.js - GPS TRACKING SERVICE (Multi-Account + Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Device Alarms)
+// location.js - GPS TRACKING SERVICE (Multi-Account + Socket.IO + Safe Zone + Geofence + Speed + Time Zone + Device Alarms + Battery Monitoring)
 const axios = require('axios');
 const mysql = require('mysql2/promise');
 const cacheInvalidationService = require('./services/cacheInvalidationService');
@@ -7,7 +7,8 @@ const { checkSafeZoneViolation } = require('./controllers/safeZoneController');
 const { checkGeofenceViolation } = require('./controllers/geofenceMonitorController');
 const SpeedAlertService = require('./services/speedAlertService');
 const TimeZoneAlertService = require('./services/timeZoneAlertService');
-const DeviceAlertService = require('./services/batteryAlertService');
+const DeviceAlertService = require('./services/deviceAlertService'); 
+const BatteryMonitoringService = require('./services/batteryMonitoringService');
 const logger = require('./utils/logger');
 require('dotenv').config();
 
@@ -204,12 +205,12 @@ async function processAlarmData(alarmData) {
                 longitude: alarm.jingdu
             });
 
-            // Check if this is a supported device alarm
-            // Supported types: 0x08 (Low Battery), 0x23 (Power Failure), 0x25 (Offline), 0x26 (Removal)
+            // Check if this is a supported device alarm (Disconnection/Removal)
+            // Supported types: 0x1F (Disconnection), 0x25 (Offline), 0x26 (Removal), 0x43 (Connection Loss), 0x5B (Unplugged)
             if (DeviceAlertService.isAlarmSupported(typeId)) {
                 logger.debug(`✅ Supported device alarm detected: 0x${typeId.toString(16).toUpperCase()}`);
 
-                // Process the alarm using the unified device alert service
+                // Process the alarm using the device alert service
                 await DeviceAlertService.processAlarm({
                     type_id: alarm.type_id,
                     macid: alarm.macid,
@@ -285,7 +286,7 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                             speed: parseFloat(record[8]),
                             status: record[9],
                             direction: record[10],
-                            statenumber: statenumber,
+                            statenumber: statenumber, // 🆕 Store statenumber for battery monitoring
                             timestamp: formattedDatetime || new Date().toISOString()
                         });
 
@@ -344,6 +345,24 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
                         // ========== ALERT CHECKS ==========
                         logger.debug(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
+
+                        // 🔋 0. BATTERY MONITORING CHECK (FIRST - runs on every GPS update)
+                        try {
+                            logger.debug(`🔋 Checking battery level for vehicle ${vehicleId}...`);
+
+                            await BatteryMonitoringService.processBatteryLevel({
+                                statenumber: gpsData.statenumber,
+                                StateNumber: gpsData.statenumber,
+                                weidu: gpsData.latitude,
+                                jingdu: gpsData.longitude,
+                                latitude: gpsData.latitude,
+                                longitude: gpsData.longitude
+                            }, macId);
+
+                            logger.debug(`✅ Battery monitoring check completed for vehicle ${vehicleId}`);
+                        } catch (batteryError) {
+                            logger.error(`❌ Battery monitoring error for vehicle ${vehicleId}:`, batteryError.message);
+                        }
 
                         // ✅ 1. Safe zone violation check (FIXED - handles both leave AND return)
                         try {
@@ -425,9 +444,9 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                             logger.error(`❌ Time zone check error:`, timeZoneError.message);
                         }
 
-                        // ✅ 5. Device alarms (Battery, Power Failure, Offline, Removal)
-                        // These are now handled separately via alarm data processing
-                        // See processAlarmData() function which processes all device alarms
+                        // ✅ 5. Device disconnection/removal alarms
+                        // These are handled separately via alarm data processing
+                        // See processAlarmData() function which processes device alarms from GPS provider
 
                         logger.debug(`✅ All alert checks completed for vehicle ${vehicleId}`);
                     }
