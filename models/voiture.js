@@ -92,23 +92,8 @@ const Voiture = sequelize.define(
             allowNull: true,
             comment: 'Last known longitude',
         },
-        geofence_latitude: {
-            type: DataTypes.DECIMAL(10, 8),
-            allowNull: true,
-            comment: 'Geofence center latitude',
-        },
-        geofence_longitude: {
-            type: DataTypes.DECIMAL(11, 8),
-            allowNull: true,
-            comment: 'Geofence center longitude',
-        },
-        geofence_radius: {
-            type: DataTypes.INTEGER,
-            allowNull: true,
-            comment: 'Geofence radius in meters',
-        },
 
-        // 🆕 Battery tracking fields
+
         battery_level: {
             type: DataTypes.INTEGER,
             allowNull: true,

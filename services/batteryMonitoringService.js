@@ -17,6 +17,33 @@ class BatteryMonitoringService {
         this.vehicleBatteryCache = new Map();
     }
 
+    // ✅ Only the columns that actually exist in the voitures table
+    get VOITURE_ATTRIBUTES() {
+        return [
+            'id',
+            'voiture_unique_id',
+            'immatriculation',
+            'mac_id_gps',
+            'marque',
+            'model',
+            'couleur',
+            'photo',
+            'time_zone_start',
+            'time_zone_end',
+            'speed_zone',
+            'region_id',
+            'region_name',
+            'geofence_zone',
+            'nickname',
+            'latitude',
+            'longitude',
+            'battery_level',
+            'last_battery_check',
+            'created_at',
+            'updated_at'
+        ];
+    }
+
     /**
      * Process battery level from GPS update
      * @param {Object} gpsData - GPS data containing statenumber field
@@ -38,9 +65,10 @@ class BatteryMonitoringService {
 
             console.log(`🔋 Current Battery Level: ${batteryLevel}%`);
 
-            // Get vehicle
+            // ✅ Only fetch columns that exist in the table
             const vehicle = await Voiture.findOne({
-                where: { mac_id_gps: macId }
+                where: { mac_id_gps: macId },
+                attributes: this.VOITURE_ATTRIBUTES
             });
 
             if (!vehicle) {
@@ -67,7 +95,6 @@ class BatteryMonitoringService {
                 await this.checkThresholdCrossings(vehicle, lastBatteryLevel, batteryLevel, gpsData);
             } else {
                 console.log('ℹ️ First battery reading for this vehicle - checking current threshold');
-                // For first reading, check if we're already below a threshold
                 await this.checkInitialThreshold(vehicle, batteryLevel, gpsData);
             }
 
@@ -91,8 +118,6 @@ class BatteryMonitoringService {
      */
     extractBatteryLevel(gpsData) {
         try {
-            // The statenumber field contains 16 comma-separated values
-            // 5th digit (index 4) is backup battery power (batteryV)
             const statenumber = gpsData.statenumber || gpsData.StateNumber;
 
             if (!statenumber) {
@@ -102,7 +127,6 @@ class BatteryMonitoringService {
 
             console.log(`📊 Raw statenumber: ${statenumber}`);
 
-            // Split by comma to get individual values
             const values = statenumber.split(',');
 
             if (values.length < 5) {
@@ -110,7 +134,6 @@ class BatteryMonitoringService {
                 return null;
             }
 
-            // Get 5th value (index 4) - battery power
             const batteryValue = parseFloat(values[4]);
 
             if (isNaN(batteryValue)) {
@@ -120,23 +143,14 @@ class BatteryMonitoringService {
 
             console.log(`🔍 Raw battery value: ${batteryValue}`);
 
-            // According to API docs:
-            // - Values < 100 = percentage
-            // - Values > 100 = voltage (subtract 100 to get volts)
             let batteryPercentage;
 
             if (batteryValue < 100) {
-                // Direct percentage
                 batteryPercentage = batteryValue;
                 console.log(`✅ Battery value is percentage: ${batteryPercentage}%`);
             } else {
-                // Convert voltage to approximate percentage
                 const voltage = batteryValue - 100;
                 console.log(`⚡ Battery value is voltage: ${voltage}V`);
-
-                // Simple voltage to percentage conversion
-                // 12V system: 12.6V = 100%, 11.8V = 0%
-                // This is a rough estimate
                 batteryPercentage = Math.max(0, Math.min(100, ((voltage - 11.8) / (12.6 - 11.8)) * 100));
                 console.log(`🔄 Converted to percentage: ${batteryPercentage.toFixed(1)}%`);
             }
@@ -155,23 +169,16 @@ class BatteryMonitoringService {
     async checkThresholdCrossings(vehicle, oldLevel, newLevel, gpsData) {
         console.log(`\n🔍 Checking threshold crossings: ${oldLevel}% → ${newLevel}%`);
 
-        // Check if battery is dropping (going down)
         if (newLevel < oldLevel) {
             console.log('📉 Battery level is DROPPING');
-
-            // Find which thresholds were crossed going DOWN
             for (const threshold of this.BATTERY_THRESHOLDS) {
                 if (oldLevel > threshold && newLevel <= threshold) {
                     console.log(`⚠️ CROSSED THRESHOLD: ${threshold}% (going down)`);
                     await this.createBatteryAlert(vehicle, newLevel, threshold, 'low', gpsData);
                 }
             }
-        }
-        // Check if battery is recovering (going up)
-        else if (newLevel > oldLevel) {
+        } else if (newLevel > oldLevel) {
             console.log('📈 Battery level is RECOVERING');
-
-            // Find which thresholds were crossed going UP
             for (const threshold of this.BATTERY_THRESHOLDS) {
                 if (oldLevel <= threshold && newLevel > threshold) {
                     console.log(`✅ CROSSED THRESHOLD: ${threshold}% (going up - RECOVERY)`);
@@ -189,12 +196,11 @@ class BatteryMonitoringService {
     async checkInitialThreshold(vehicle, currentLevel, gpsData) {
         console.log(`\n🔍 Checking initial battery threshold: ${currentLevel}%`);
 
-        // Find the highest threshold that current level is at or below
         for (const threshold of this.BATTERY_THRESHOLDS) {
             if (currentLevel <= threshold) {
                 console.log(`⚠️ Battery is at or below ${threshold}% threshold`);
                 await this.createBatteryAlert(vehicle, currentLevel, threshold, 'low', gpsData);
-                break; // Only alert for the highest applicable threshold
+                break;
             }
         }
     }
@@ -207,7 +213,6 @@ class BatteryMonitoringService {
             const alertType = direction === 'recovery' ? 'battery_recovery' : 'low_battery';
             console.log(`\n🚨 Creating ${alertType} alert for ${threshold}% threshold...`);
 
-            // Get user for this vehicle
             const [user] = await sequelize.query(`
                 SELECT u.*
                 FROM users u
@@ -226,7 +231,6 @@ class BatteryMonitoringService {
 
             console.log(`✅ User found: ${user.nom} ${user.prenom} (ID: ${user.id})`);
 
-            // Check cooldown
             const lastAlert = await this.getLastBatteryAlert(vehicle.id, threshold, direction);
 
             if (lastAlert) {
@@ -239,7 +243,6 @@ class BatteryMonitoringService {
                 }
             }
 
-            // Create alert message
             const message = this.getAlertMessage(vehicle.nickname, batteryLevel, threshold, direction);
             const title = direction === 'recovery' ? 'Battery Recovering' : 'Low Battery Warning';
             const severity = this.getSeverity(threshold, direction);
@@ -248,11 +251,9 @@ class BatteryMonitoringService {
             console.log(`📝 Alert Message: ${message}`);
             console.log(`⚠️ Severity: ${severity}`);
 
-            // Get location from GPS data
             const latitude = gpsData.weidu || gpsData.latitude || null;
             const longitude = gpsData.jingdu || gpsData.longitude || null;
 
-            // Create alert in database
             const alert = await Alert.create({
                 voiture_id: vehicle.id,
                 alert_type: alertType,
@@ -272,7 +273,6 @@ class BatteryMonitoringService {
 
             console.log(`✅ ${emoji} Battery alert saved to database with ID: ${alert.id}`);
 
-            // Send push notification
             if (user.fcm_token) {
                 console.log('📲 Sending Firebase notification...');
                 await firebaseService.sendNotification(
@@ -316,7 +316,6 @@ class BatteryMonitoringService {
                 order: [['alerted_at', 'DESC']]
             });
 
-            // Check if it's for the same threshold
             if (alert && alert.metadata) {
                 const metadata = JSON.parse(alert.metadata);
                 if (metadata.threshold === threshold) {
@@ -339,7 +338,6 @@ class BatteryMonitoringService {
             return `Battery recovering for ${vehicleName}. Battery level is now ${batteryLevel}% (above ${threshold}% threshold)`;
         }
 
-        // Low battery messages
         if (threshold === 0) {
             return `🚨 CRITICAL: ${vehicleName} battery is DEAD (${batteryLevel}%)! Device may shut down soon!`;
         } else if (threshold <= 5) {
@@ -357,10 +355,7 @@ class BatteryMonitoringService {
      * Get severity level based on threshold
      */
     getSeverity(threshold, direction) {
-        if (direction === 'recovery') {
-            return 'info';
-        }
-
+        if (direction === 'recovery') return 'info';
         if (threshold === 0) return 'critical';
         if (threshold <= 5) return 'critical';
         if (threshold <= 10) return 'high';
@@ -369,7 +364,7 @@ class BatteryMonitoringService {
     }
 
     /**
-     * Clear battery cache for a vehicle (useful for testing)
+     * Clear battery cache for a vehicle
      */
     clearCache(vehicleId) {
         this.vehicleBatteryCache.delete(vehicleId);

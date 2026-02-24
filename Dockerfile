@@ -1,24 +1,38 @@
-# Use Node.js 18 LTS
-FROM node:18-alpine
 
-# Set working directory
+FROM node:18-alpine AS builder
+
 WORKDIR /app
 
-# Copy package files
+# Copy package
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install --production
+# Install all dependencies
+RUN npm ci
 
-# Copy application code
+# Copy source code
 COPY . .
 
-# Expose port (adjust if your backend uses different port)
+
+FROM node:18-alpine AS production
+
+WORKDIR /app
+
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY --from=builder /app .
+
+
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+
 EXPOSE 5000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:5000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-# Start the application
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+# Start the app
 CMD ["node", "server.js"]
