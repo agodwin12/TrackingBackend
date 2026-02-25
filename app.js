@@ -27,7 +27,7 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const userSettingsRoutes = require('./routes/userSettingsRoutes');
 const pinRoutes = require('./routes/pinRoutes');
 const geofenceRoutes = require('./routes/geofenceRoutes');
-
+const paygate = require('./routes/payGate.routes')
 // ========== EXPRESS APP SETUP ==========
 const app = express();
 
@@ -168,6 +168,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/users-settings', userSettingsRoutes);
 app.use('/api/pin', pinRoutes);
 app.use('/api/geofence', geofenceRoutes);
+app.use('/api',paygate);
 
 // ========== 404 HANDLER ==========
 app.use((req, res) => {
