@@ -12,12 +12,12 @@ const API_KEY = process.env.PAYGATE_API_KEY;
 const generateReference = (prefix = 'TRX') => {
     const now = new Date();
 
-    const yy = now.getFullYear().toString().slice(-2);
-    const mm = (now.getMonth() + 1).toString().padStart(2, '0');
-    const dd = now.getDate().toString().padStart(2, '0');
+    const yy  = now.getFullYear().toString().slice(-2);
+    const mm  = (now.getMonth() + 1).toString().padStart(2, '0');
+    const dd  = now.getDate().toString().padStart(2, '0');
     const datePart = `${yy}${mm}${dd}`;
 
-    const hh = now.getHours().toString().padStart(2, '0');
+    const hh  = now.getHours().toString().padStart(2, '0');
     const min = now.getMinutes().toString().padStart(2, '0');
     const timePart = `${hh}${min}`;
 
@@ -28,23 +28,24 @@ const generateReference = (prefix = 'TRX') => {
 
 /**
  * Initialise une session de paiement auprès du Paygate
- * @param {number} amount - Le montant (ex: 1000)
- * @param {string} [phone] - (Optionnel) Numéro de téléphone
- * @param {string} [provider] - (Optionnel) MTNMOMO ou CMORANGEOM
- * @param {string} [customRef] - (Optionnel) Référence externe personnalisée
+ * @param {number} amount        - Le montant (ex: 1000)
+ * @param {string} [phone]       - (Optionnel) Numéro de téléphone sans indicatif pays
+ * @param {string} [provider]    - (Optionnel) MTNMOMO ou CMORANGEOM
+ * @param {string} [customRef]   - (Optionnel) Référence externe personnalisée
+ * @param {string} [countryCode] - (Optionnel) Code ISO 2 lettres ex: CM, FR, NG
  */
-const initiatePayment = async (amount, phone = '', provider = '', customRef = '') => {
-    if (!API_KEY) throw new Error("Configuration PayGate manquante");
+const initiatePayment = async (amount, phone = '', provider = '', customRef = '', countryCode = null) => {
+    if (!API_KEY) throw new Error('Configuration PayGate manquante');
 
     // Utilise la référence fournie ou en génère une nouvelle
-    const uniqueRef = customRef || generateReference('HOS'); // HOS pour Hôpital par exemple
+    const uniqueRef = customRef || generateReference('WGO'); // WGO pour WEGO
 
     try {
         // Construction dynamique du payload
         const payload = {
-            amount: amount,
+            amount:             amount,
             external_reference: uniqueRef,
-            success_url: process.env.PAYGATE_SUCCESS_URL,
+            success_url:        process.env.PAYGATE_SUCCESS_URL,
         };
 
         // Ajout des champs optionnels s'ils existent
@@ -57,33 +58,35 @@ const initiatePayment = async (amount, phone = '', provider = '', customRef = ''
         if (provider) {
             payload.provider = provider;
         }
+        if (countryCode) {
+            payload.country_code = countryCode;
+        }
 
-        console.log(`🚀 [PAYGATE] Init Transaction | Ref: ${uniqueRef} | Montant: ${amount}`);
+        console.log(`🚀 [PAYGATE] Init Transaction | Ref: ${uniqueRef} | Montant: ${amount}${countryCode ? ` | Country: ${countryCode}` : ''}`);
 
-        // Attention : On utilise le bon endpoint de ton nouveau backend Django
         const response = await axios.post(
             `${PAYGATE_BASE_URL}/create-checkout-session/`,
             payload,
             {
                 headers: {
                     'Authorization': `Api-Key ${API_KEY}`,
-                    'Content-Type': 'application/json'
+                    'Content-Type':  'application/json',
                 }
             }
         );
 
-        // On retourne toutes les infos de Django (notamment session_token et redirect_url)
+        // On retourne toutes les infos (notamment session_token et redirect_url)
         return {
             ...response.data,
-            generated_ref: uniqueRef
+            generated_ref: uniqueRef,
         };
 
     } catch (error) {
         if (error.response) {
-            console.error("❌ [PAYGATE REFUS] Status:", error.response.status);
-            console.error("❌ [PAYGATE REFUS] Data:", JSON.stringify(error.response.data));
+            console.error('❌ [PAYGATE REFUS] Status:', error.response.status);
+            console.error('❌ [PAYGATE REFUS] Data:', JSON.stringify(error.response.data));
         } else {
-            console.error("❌ [PAYGATE ERREUR]", error.message);
+            console.error('❌ [PAYGATE ERREUR]', error.message);
         }
         throw new Error("Impossible d'initialiser le paiement PayGate");
     }
@@ -94,17 +97,18 @@ const initiatePayment = async (amount, phone = '', provider = '', customRef = ''
  * @param {string} reference - La référence unique
  */
 const verifyTransaction = async (reference) => {
-    if (!API_KEY) throw new Error("Config manquante");
+    if (!API_KEY) throw new Error('Config manquante');
 
     try {
         console.log(`🔎 [PAYGATE] Vérification ref: ${reference}`);
+
         const response = await axios.get(
-            `${PAYGATE_BASE_URL}/transaction/status`, // À adapter si ton endpoint Django est différent
+            `${PAYGATE_BASE_URL}/transaction/status`,
             {
-                params: { ref: reference },
+                params:  { ref: reference },
                 headers: {
                     'Authorization': `Api-Key ${API_KEY}`,
-                    'Content-Type': 'application/json'
+                    'Content-Type':  'application/json',
                 }
             }
         );
@@ -112,8 +116,8 @@ const verifyTransaction = async (reference) => {
         return response.data;
 
     } catch (error) {
-        console.error("❌ [PAYGATE VERIFY ERROR]", error.response?.data || error.message);
-        throw new Error("Impossible de vérifier la transaction");
+        console.error('❌ [PAYGATE VERIFY ERROR]', error.response?.data || error.message);
+        throw new Error('Impossible de vérifier la transaction');
     }
 };
 

@@ -19,24 +19,24 @@ class TripDetectionService {
     static TRIP_MERGE_THRESHOLD_MINUTES = Number(process.env.TRIP_MERGE_MINUTES ?? 3);
 
     // 🎯 MINIMUM TRIP REQUIREMENTS - ✅ REDUCED
-    static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 2); // ✅ REDUCED from 5 to 2
-    static MIN_TRIP_DISTANCE_KM = Number(process.env.TRIP_MIN_DISTANCE_KM ?? 0.5); // ✅ REDUCED from 1.5 to 0.5
+    static MIN_TRIP_DURATION_MIN = Number(process.env.TRIP_MIN_DURATION ?? 2);
+    static MIN_TRIP_DISTANCE_KM = Number(process.env.TRIP_MIN_DISTANCE_KM ?? 0.5);
 
     // 📍 GPS DRIFT DETECTION
     static GPS_DRIFT_THRESHOLD_METERS = Number(process.env.GPS_DRIFT_METERS ?? 100);
     static MAX_PARKED_SPEED = 3;
 
     // 🆕 TRIP START CONFIRMATION - ✅ RELAXED
-    static MIN_CONSECUTIVE_MOVING_POINTS = 3; // ✅ REDUCED from 5 to 3
-    static MIN_DISTANCE_TO_START_TRIP_METERS = 100; // ✅ REDUCED from 200 to 100
+    static MIN_CONSECUTIVE_MOVING_POINTS = 3;
+    static MIN_DISTANCE_TO_START_TRIP_METERS = 100;
     static PARKING_LOT_RADIUS_METERS = 100;
 
     // 🆕 GPS POSITION CORRECTION THRESHOLDS - ✅ RELAXED
-    static MAX_SPEED_KMPH = 200; // ✅ Increased from 180
-    static MAX_JUMP_DISTANCE_METERS = 1000; // ✅ DOUBLED from 500
-    static MIN_JUMP_TIME_SECONDS = 2; // ✅ REDUCED from 3
-    static DIRECTION_CHANGE_THRESHOLD = 170; // ✅ RELAXED from 135 to 170 (allows sharper turns)
-    static DOUGLAS_PEUCKER_TOLERANCE = 0.0001; // ✅ REDUCED from 0.00005 (less aggressive simplification)
+    static MAX_SPEED_KMPH = 200;
+    static MAX_JUMP_DISTANCE_METERS = 1000;
+    static MIN_JUMP_TIME_SECONDS = 2;
+    static DIRECTION_CHANGE_THRESHOLD = 170;
+    static DOUGLAS_PEUCKER_TOLERANCE = 0.0001;
 
     // ⚡ PERFORMANCE SETTINGS
     static MAX_LOCATIONS_PER_BATCH = 10000;
@@ -47,12 +47,9 @@ class TripDetectionService {
 
     // ==================== IMMEDIATE GEOCODING ====================
 
-    /**
-     * ✅ IMPROVED reverse geocoding with detailed error logging
-     */
     static async reverseGeocode(latitude, longitude) {
         try {
-            logger.info(`📍 Geocoding coordinates: [${latitude}, ${longitude}]`);
+            // logger.info(`📍 Geocoding coordinates: [${latitude}, ${longitude}]`);
 
             const url = 'https://maps.googleapis.com/maps/api/geocode/json';
             const params = {
@@ -61,19 +58,19 @@ class TripDetectionService {
                 language: 'en'
             };
 
-            logger.debug(`🌐 Google Maps API URL: ${url}`);
-            logger.debug(`🌐 Request params:`, params);
+            // logger.debug(`🌐 Google Maps API URL: ${url}`);
+            // logger.debug(`🌐 Request params:`, params);
 
             const response = await axios.get(url, {
                 params: params,
                 timeout: 10000
             });
 
-            logger.debug(`📥 API Response Status: ${response.data.status}`);
-            logger.debug(`📥 API Response:`, JSON.stringify(response.data, null, 2));
+            // logger.debug(`📥 API Response Status: ${response.data.status}`);
+            // logger.debug(`📥 API Response:`, JSON.stringify(response.data, null, 2));
 
             if (response.data.status === 'ZERO_RESULTS') {
-                logger.warn(`⚠️ Geocoding: No results found for [${latitude}, ${longitude}]`);
+                // logger.warn(`⚠️ Geocoding: No results found for [${latitude}, ${longitude}]`);
                 return {
                     address: 'Unknown Location',
                     status: 'failed',
@@ -82,7 +79,7 @@ class TripDetectionService {
             }
 
             if (response.data.status === 'OVER_QUERY_LIMIT') {
-                logger.error(`❌ Geocoding: API quota exceeded or rate limit reached`);
+                // logger.error(`❌ Geocoding: API quota exceeded or rate limit reached`);
                 return {
                     address: 'Location unavailable (rate limit)',
                     status: 'failed',
@@ -91,8 +88,8 @@ class TripDetectionService {
             }
 
             if (response.data.status === 'REQUEST_DENIED') {
-                logger.error(`❌ Geocoding: API request denied - check API key and restrictions`);
-                logger.error(`❌ Error message: ${response.data.error_message || 'No error message'}`);
+                // logger.error(`❌ Geocoding: API request denied - check API key and restrictions`);
+                // logger.error(`❌ Error message: ${response.data.error_message || 'No error message'}`);
                 return {
                     address: 'Location unavailable (API error)',
                     status: 'failed',
@@ -101,7 +98,7 @@ class TripDetectionService {
             }
 
             if (response.data.status === 'INVALID_REQUEST') {
-                logger.error(`❌ Geocoding: Invalid request - check coordinates format`);
+                // logger.error(`❌ Geocoding: Invalid request - check coordinates format`);
                 return {
                     address: 'Location unavailable (invalid request)',
                     status: 'failed',
@@ -110,7 +107,7 @@ class TripDetectionService {
             }
 
             if (response.data.status === 'UNKNOWN_ERROR') {
-                logger.error(`❌ Geocoding: Server error - will retry later`);
+                // logger.error(`❌ Geocoding: Server error - will retry later`);
                 return {
                     address: 'Location unavailable (server error)',
                     status: 'failed',
@@ -121,8 +118,8 @@ class TripDetectionService {
             if (response.data.status === 'OK' && response.data.results && response.data.results.length > 0) {
                 const result = response.data.results[0];
 
-                logger.debug(`✅ Found ${response.data.results.length} result(s)`);
-                logger.debug(`✅ First result formatted_address: ${result.formatted_address}`);
+                // logger.debug(`✅ Found ${response.data.results.length} result(s)`);
+                // logger.debug(`✅ First result formatted_address: ${result.formatted_address}`);
 
                 let neighborhood = null;
                 let locality = null;
@@ -146,13 +143,13 @@ class TripDetectionService {
                     }
                 }
 
-                logger.debug(`📍 Extracted components:`, {
-                    route,
-                    sublocality,
-                    neighborhood,
-                    locality,
-                    administrativeArea
-                });
+                // logger.debug(`📍 Extracted components:`, {
+                //     route,
+                //     sublocality,
+                //     neighborhood,
+                //     locality,
+                //     administrativeArea
+                // });
 
                 let address;
                 if (route && locality) {
@@ -173,14 +170,14 @@ class TripDetectionService {
                     address = result.formatted_address.split(',')[0];
                 }
 
-                logger.info(`✅ Geocoded successfully: "${address}"`);
+                // logger.info(`✅ Geocoded successfully: "${address}"`);
                 return {
                     address: address || 'Unknown Location',
                     status: 'geocoded',
                     success: true
                 };
             } else {
-                logger.warn(`⚠️ Geocoding failed with status: ${response.data.status}`);
+                // logger.warn(`⚠️ Geocoding failed with status: ${response.data.status}`);
                 return {
                     address: 'Location unavailable',
                     status: 'failed',
@@ -188,23 +185,23 @@ class TripDetectionService {
                 };
             }
         } catch (error) {
-            logger.error(`❌ Geocoding exception for [${latitude}, ${longitude}]:`, error.message);
+            // logger.error(`❌ Geocoding exception for [${latitude}, ${longitude}]:`, error.message);
 
             if (error.code === 'ECONNABORTED') {
-                logger.error(`❌ Request timeout - Google Maps API took too long to respond`);
+                // logger.error(`❌ Request timeout - Google Maps API took too long to respond`);
             } else if (error.code === 'ENOTFOUND') {
-                logger.error(`❌ DNS error - Cannot reach maps.googleapis.com`);
+                // logger.error(`❌ DNS error - Cannot reach maps.googleapis.com`);
             } else if (error.code === 'ECONNREFUSED') {
-                logger.error(`❌ Connection refused - Check network/firewall`);
+                // logger.error(`❌ Connection refused - Check network/firewall`);
             } else if (error.response) {
-                logger.error(`❌ API returned error status: ${error.response.status}`);
-                logger.error(`❌ API response data:`, error.response.data);
+                // logger.error(`❌ API returned error status: ${error.response.status}`);
+                // logger.error(`❌ API response data:`, error.response.data);
             } else if (error.request) {
-                logger.error(`❌ No response received from API`);
-                logger.error(`❌ Request details:`, error.request);
+                // logger.error(`❌ No response received from API`);
+                // logger.error(`❌ Request details:`, error.request);
             }
 
-            logger.error(`❌ Full error stack:`, error.stack);
+            // logger.error(`❌ Full error stack:`, error.stack);
 
             return {
                 address: 'Location unavailable',
@@ -216,17 +213,17 @@ class TripDetectionService {
 
     // ==================== MAIN ENTRY POINT ====================
     static async detectAndCreateTrips() {
-        logger.info("=== 🚀 ENHANCED TRIP DETECTION WITH GPS CORRECTION START ===");
+        // logger.info("=== 🚀 ENHANCED TRIP DETECTION WITH GPS CORRECTION START ===");
 
         try {
             const macs = await this.getVehiclesWithUnprocessedData();
 
             if (macs.length === 0) {
-                logger.debug("✅ No vehicles with unprocessed data");
+                // logger.debug("✅ No vehicles with unprocessed data");
                 return { success: true, tripsCreated: 0, vehiclesProcessed: 0 };
             }
 
-            logger.info(`📍 Found ${macs.length} vehicles with unprocessed data`);
+            // logger.info(`📍 Found ${macs.length} vehicles with unprocessed data`);
 
             let totalTrips = 0;
             let mergedTrips = 0;
@@ -240,18 +237,18 @@ class TripDetectionService {
                     totalTrips += res.tripsCreated;
                     mergedTrips += res.tripsMerged || 0;
                 } catch (error) {
-                    logger.error(`🔥 Error processing vehicle ${mac}:`, error);
+                    // logger.error(`🔥 Error processing vehicle ${mac}:`, error);
                     errors++;
                 }
             }
 
-            logger.info("=== ✅ ENHANCED TRIP DETECTION COMPLETE ===", {
-                tripsCreated: totalTrips,
-                tripsMerged: mergedTrips,
-                vehiclesProcessed: macs.length - skipped,
-                vehiclesSkipped: skipped,
-                errors
-            });
+            // logger.info("=== ✅ ENHANCED TRIP DETECTION COMPLETE ===", {
+            //     tripsCreated: totalTrips,
+            //     tripsMerged: mergedTrips,
+            //     vehiclesProcessed: macs.length - skipped,
+            //     vehiclesSkipped: skipped,
+            //     errors
+            // });
 
             return {
                 success: true,
@@ -263,7 +260,7 @@ class TripDetectionService {
             };
 
         } catch (error) {
-            logger.error("🔥 Fatal error in trip detection:", error);
+            // logger.error("🔥 Fatal error in trip detection:", error);
             return { success: false, error: error.message };
         }
     }
@@ -279,12 +276,10 @@ class TripDetectionService {
             });
             return rows.map(r => r.mac_id_gps);
         } catch (error) {
-            logger.error("🔥 Error fetching vehicles with unprocessed data:", error);
+            // logger.error("🔥 Error fetching vehicles with unprocessed data:", error);
             return [];
         }
     }
-
-    // ==================== GPS POSITION CORRECTION ALGORITHMS ====================
 
     static isValidGPSPoint(currentLoc, lastValidLoc, timeDiff) {
         if (!lastValidLoc) return true;
@@ -299,13 +294,13 @@ class TripDetectionService {
         if (timeDiff > this.MIN_JUMP_TIME_SECONDS) {
             const speed = (distance / 1000) / (timeDiff / 3600);
             if (speed > this.MAX_SPEED_KMPH) {
-                logger.warn(`⚠️ GPS outlier rejected: ${speed.toFixed(1)} km/h (max: ${this.MAX_SPEED_KMPH})`);
+                // logger.warn(`⚠️ GPS outlier rejected: ${speed.toFixed(1)} km/h (max: ${this.MAX_SPEED_KMPH})`);
                 return false;
             }
         }
 
         if (distance > this.MAX_JUMP_DISTANCE_METERS && timeDiff < 10) {
-            logger.warn(`⚠️ GPS outlier rejected: ${distance.toFixed(0)}m jump in ${timeDiff.toFixed(1)}s`);
+            // logger.warn(`⚠️ GPS outlier rejected: ${distance.toFixed(0)}m jump in ${timeDiff.toFixed(1)}s`);
             return false;
         }
 
@@ -341,7 +336,7 @@ class TripDetectionService {
             ) * 1000;
 
             if (distance > 50) {
-                logger.warn(`⚠️ Inconsistent direction: ${angleDiff.toFixed(0)}° change`);
+                // logger.warn(`⚠️ Inconsistent direction: ${angleDiff.toFixed(0)}° change`);
                 return false;
             }
         }
@@ -454,7 +449,7 @@ class TripDetectionService {
 
     // ==================== VEHICLE PROCESSING ====================
     static async processVehicleLocations(macIdGps) {
-        logger.debug(`🔍 Processing vehicle: ${macIdGps}`);
+        // logger.debug(`🔍 Processing vehicle: ${macIdGps}`);
 
         try {
             const locationCount = await Location.count({
@@ -462,11 +457,11 @@ class TripDetectionService {
             });
 
             if (locationCount === 0) {
-                logger.debug(`✅ No unprocessed locations for ${macIdGps}`);
+                // logger.debug(`✅ No unprocessed locations for ${macIdGps}`);
                 return { skipped: false, tripsCreated: 0, tripsMerged: 0 };
             }
 
-            logger.info(`🔍 Found ${locationCount} unprocessed locations for ${macIdGps}`);
+            // logger.info(`🔍 Found ${locationCount} unprocessed locations for ${macIdGps}`);
 
             const vehicle = await Voiture.findOne({
                 where: { mac_id_gps: macIdGps },
@@ -475,7 +470,7 @@ class TripDetectionService {
             });
 
             if (!vehicle) {
-                logger.warn(`⚠️ Vehicle not found for MAC: ${macIdGps} - marking locations as processed`);
+                // logger.warn(`⚠️ Vehicle not found for MAC: ${macIdGps} - marking locations as processed`);
                 await Location.update(
                     { processed: true },
                     { where: { mac_id_gps: macIdGps, processed: false } }
@@ -483,12 +478,12 @@ class TripDetectionService {
                 return { skipped: false, tripsCreated: 0, tripsMerged: 0 };
             }
 
-            logger.debug(`🔍 Vehicle found: ${vehicle.immatriculation} (ID: ${vehicle.id})`);
+            // logger.debug(`🔍 Vehicle found: ${vehicle.immatriculation} (ID: ${vehicle.id})`);
 
             const userCheck = await this.checkUserTripTracking(vehicle.id);
 
             if (!userCheck.enabled) {
-                logger.debug(`🔍 Trip tracking disabled for vehicle ${vehicle.id} - ${userCheck.reason}`);
+                // logger.debug(`🔍 Trip tracking disabled for vehicle ${vehicle.id} - ${userCheck.reason}`);
                 await Location.update(
                     { processed: true },
                     { where: { mac_id_gps: macIdGps, processed: false } }
@@ -496,7 +491,7 @@ class TripDetectionService {
                 return { skipped: true, tripsCreated: 0, tripsMerged: 0 };
             }
 
-            logger.debug(`✅ Trip tracking enabled for vehicle ${vehicle.id} - processing trips`);
+            // logger.debug(`✅ Trip tracking enabled for vehicle ${vehicle.id} - processing trips`);
 
             const ongoingTrip = await this.getOngoingTrip(vehicle.id, macIdGps);
 
@@ -504,7 +499,7 @@ class TripDetectionService {
             let totalTripsMerged = 0;
 
             if (locationCount > this.MAX_LOCATIONS_PER_BATCH) {
-                logger.info(`📊 Large location set (${locationCount}), using batch processing`);
+                // logger.info(`📊 Large location set (${locationCount}), using batch processing`);
 
                 let offset = 0;
                 let currentTrip = ongoingTrip;
@@ -553,13 +548,13 @@ class TripDetectionService {
             }
 
             if (totalTripsProcessed > 0) {
-                logger.info(`🔄 Post-processing: Checking for trips to merge...`);
+                // logger.info(`🔄 Post-processing: Checking for trips to merge...`);
                 const additionalMerges = await this.mergeNearbyTrips(vehicle.id, macIdGps);
                 totalTripsMerged += additionalMerges;
             }
 
             if (totalTripsProcessed > 0) {
-                logger.info(`✅ Processed ${totalTripsProcessed} trips (${totalTripsMerged} merged) for vehicle ${vehicle.immatriculation}`);
+                // logger.info(`✅ Processed ${totalTripsProcessed} trips (${totalTripsMerged} merged) for vehicle ${vehicle.immatriculation}`);
             }
 
             return {
@@ -569,7 +564,7 @@ class TripDetectionService {
             };
 
         } catch (error) {
-            logger.error(`🔥 Error processing vehicle locations for ${macIdGps}:`, error);
+            // logger.error(`🔥 Error processing vehicle locations for ${macIdGps}:`, error);
             throw error;
         }
     }
@@ -583,7 +578,7 @@ class TripDetectionService {
             });
 
             if (!association) {
-                logger.debug(`⚠️ No user association found for vehicle ${vehicleId}`);
+                // logger.debug(`⚠️ No user association found for vehicle ${vehicleId}`);
                 return { enabled: true, reason: "No user associated - default enabled" };
             }
 
@@ -593,22 +588,22 @@ class TripDetectionService {
             });
 
             if (!user) {
-                logger.debug(`⚠️ User not found for association (vehicle ${vehicleId})`);
+                // logger.debug(`⚠️ User not found for association (vehicle ${vehicleId})`);
                 return { enabled: true, reason: "User not found - default enabled" };
             }
 
             const isEnabled = user.trip_tracking_enabled !== false;
 
             if (!isEnabled) {
-                logger.debug(`🔍 Trip tracking disabled by user ${user.id} for vehicle ${vehicleId}`);
+                // logger.debug(`🔍 Trip tracking disabled by user ${user.id} for vehicle ${vehicleId}`);
                 return { enabled: false, reason: "Trip tracking disabled by user" };
             }
 
-            logger.debug(`✅ Trip tracking enabled for vehicle ${vehicleId}`);
+            // logger.debug(`✅ Trip tracking enabled for vehicle ${vehicleId}`);
             return { enabled: true, userId: user.id };
 
         } catch (error) {
-            logger.error(`🔥 Error checking user trip tracking for vehicle ${vehicleId}:`, error);
+            // logger.error(`🔥 Error checking user trip tracking for vehicle ${vehicleId}:`, error);
             return { enabled: false, reason: "Error checking settings" };
         }
     }
@@ -627,7 +622,7 @@ class TripDetectionService {
             });
 
             if (ongoingTrip) {
-                logger.debug(`🔍 Found ongoing trip ${ongoingTrip.id} started at ${ongoingTrip.start_time}`);
+                // logger.debug(`🔍 Found ongoing trip ${ongoingTrip.id} started at ${ongoingTrip.start_time}`);
 
                 const waypointCount = await TripWaypoint.count({
                     where: { trip_id: ongoingTrip.id }
@@ -639,11 +634,11 @@ class TripDetectionService {
                 };
             }
 
-            logger.debug("✅ No ongoing trip found");
+            // logger.debug("✅ No ongoing trip found");
             return null;
 
         } catch (error) {
-            logger.error("🔥 Error fetching ongoing trip:", error);
+            // logger.error("🔥 Error fetching ongoing trip:", error);
             return null;
         }
     }
@@ -667,7 +662,7 @@ class TripDetectionService {
 
         if (currentTrip) {
             lastMovingTime = new Date(currentTrip.end_time);
-            logger.debug(`🔄 Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
+            // logger.debug(`🔄 Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
         }
 
         for (let i = 0; i < locations.length; i++) {
@@ -680,7 +675,7 @@ class TripDetectionService {
 
             if (!isValidPoint) {
                 rejectedOutliers++;
-                logger.debug(`❌ Rejected GPS outlier at point ${i + 1}`);
+                // logger.debug(`❌ Rejected GPS outlier at point ${i + 1}`);
                 continue;
             }
 
@@ -689,7 +684,7 @@ class TripDetectionService {
                 const isConsistent = this.isConsistentDirection(lastValidPosition, loc, nextLoc);
                 if (!isConsistent) {
                     rejectedDirectionErrors++;
-                    logger.debug(`❌ Rejected direction inconsistency at point ${i + 1}`);
+                    // logger.debug(`❌ Rejected direction inconsistency at point ${i + 1}`);
                     continue;
                 }
             }
@@ -700,7 +695,7 @@ class TripDetectionService {
             const isRealMovement = this.isRealMovement(loc, lastValidPosition, actualSpeed);
             const isMoving = actualSpeed >= this.MIN_SPEED_THRESHOLD && isRealMovement;
 
-            logger.debug(`📍 Location ${i + 1}/${locations.length}: reported=${reportedSpeed.toFixed(1)} km/h, calculated=${calculatedSpeed.toFixed(1)} km/h, moving=${isMoving}`);
+            // logger.debug(`📍 Location ${i + 1}/${locations.length}: reported=${reportedSpeed.toFixed(1)} km/h, calculated=${calculatedSpeed.toFixed(1)} km/h, moving=${isMoving}`);
 
             if (!currentTrip) {
                 if (isMoving) {
@@ -724,7 +719,7 @@ class TripDetectionService {
                         const isCircularMovement = this.isCircularMovement(tripStartBuffer);
 
                         if (isCircularMovement) {
-                            logger.warn(`⚠️ Circular movement detected (parking lot drift) - NOT starting trip`);
+                            // logger.warn(`⚠️ Circular movement detected (parking lot drift) - NOT starting trip`);
                             consecutiveMovingPoints = [];
                             tripStartBuffer = [];
                             totalDistanceTraveled = 0;
@@ -732,12 +727,12 @@ class TripDetectionService {
                         }
 
                         const startLoc = tripStartBuffer[0];
-                        logger.info(`🚗 Starting new trip after ${consecutiveMovingPoints.length} consecutive moving points, ${totalDistanceTraveled.toFixed(0)}m traveled`);
+                        // logger.info(`🚗 Starting new trip after ${consecutiveMovingPoints.length} consecutive moving points, ${totalDistanceTraveled.toFixed(0)}m traveled`);
 
                         currentTrip = await this.createNewTrip(vehicleId, macIdGps, startLoc);
 
                         if (!currentTrip) {
-                            logger.error("🔥 Failed to create new trip - resetting buffers");
+                            // logger.error("🔥 Failed to create new trip - resetting buffers");
                             consecutiveMovingPoints = [];
                             tripStartBuffer = [];
                             totalDistanceTraveled = 0;
@@ -760,7 +755,7 @@ class TripDetectionService {
                     }
                 } else {
                     if (consecutiveMovingPoints.length > 0) {
-                        logger.debug(`⚠️ Movement interrupted - resetting trip start buffers (had ${consecutiveMovingPoints.length} points, ${totalDistanceTraveled.toFixed(0)}m)`);
+                        // logger.debug(`⚠️ Movement interrupted - resetting trip start buffers (had ${consecutiveMovingPoints.length} points, ${totalDistanceTraveled.toFixed(0)}m)`);
                     }
                     consecutiveMovingPoints = [];
                     tripStartBuffer = [];
@@ -785,14 +780,14 @@ class TripDetectionService {
                         longitude: loc.longitude,
                         time: locTime
                     };
-                    logger.debug(`✅ Trip ${currentTrip.id} continues (speed: ${actualSpeed.toFixed(1)} km/h)`);
+                    // logger.debug(`✅ Trip ${currentTrip.id} continues (speed: ${actualSpeed.toFixed(1)} km/h)`);
                 } else {
                     const idleMinutes = (locTime - lastMovingTime) / 60000;
 
-                    logger.debug(`⏸️ Vehicle idle for ${idleMinutes.toFixed(1)} min (threshold: ${this.IDLE_THRESHOLD_MINUTES} min)`);
+                    // logger.debug(`⏸️ Vehicle idle for ${idleMinutes.toFixed(1)} min (threshold: ${this.IDLE_THRESHOLD_MINUTES} min)`);
 
                     if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
-                        logger.info(`🛑 Ending trip ${currentTrip.id} after ${idleMinutes.toFixed(1)} min idle`);
+                        // logger.info(`🛑 Ending trip ${currentTrip.id} after ${idleMinutes.toFixed(1)} min idle`);
 
                         const saved = await this.finalizeTrip(
                             currentTrip,
@@ -819,7 +814,7 @@ class TripDetectionService {
             const idleMinutes = (lastLocTime - lastMovingTime) / 60000;
 
             if (idleMinutes >= this.IDLE_THRESHOLD_MINUTES) {
-                logger.debug(`🏁 Finalizing trip ${currentTrip.id} - idle for ${idleMinutes.toFixed(1)} min`);
+                // logger.debug(`🏁 Finalizing trip ${currentTrip.id} - idle for ${idleMinutes.toFixed(1)} min`);
                 const saved = await this.finalizeTrip(
                     currentTrip,
                     lastLoc,
@@ -828,7 +823,7 @@ class TripDetectionService {
                 );
                 if (saved) tripsCreated++;
             } else {
-                logger.debug(`🔄 Trip ${currentTrip.id} still ongoing - updating (idle: ${idleMinutes.toFixed(1)} min)`);
+                // logger.debug(`🔄 Trip ${currentTrip.id} still ongoing - updating (idle: ${idleMinutes.toFixed(1)} min)`);
                 const updated = await this.updateOngoingTrip(
                     currentTrip,
                     lastLoc,
@@ -840,7 +835,7 @@ class TripDetectionService {
         }
 
         if (rejectedOutliers > 0 || rejectedDirectionErrors > 0) {
-            logger.info(`🧹 GPS Correction: Rejected ${rejectedOutliers} outliers, ${rejectedDirectionErrors} direction errors`);
+            // logger.info(`🧹 GPS Correction: Rejected ${rejectedOutliers} outliers, ${rejectedDirectionErrors} direction errors`);
         }
 
         return { tripsCreated, tripsMerged };
@@ -876,7 +871,7 @@ class TripDetectionService {
             ) * 1000;
 
             if (distance < this.GPS_DRIFT_THRESHOLD_METERS) {
-                logger.debug(`📍 GPS drift detected: ${distance.toFixed(1)}m movement at ${speed.toFixed(1)} km/h`);
+                // logger.debug(`📍 GPS drift detected: ${distance.toFixed(1)}m movement at ${speed.toFixed(1)} km/h`);
                 return false;
             }
         }
@@ -898,7 +893,7 @@ class TripDetectionService {
         ) * 1000;
 
         if (totalDistance < this.PARKING_LOT_RADIUS_METERS) {
-            logger.warn(`⚠️ Circular movement detected: ${locations.length} points, ${totalDistance.toFixed(1)}m net displacement`);
+            // logger.warn(`⚠️ Circular movement detected: ${locations.length} points, ${totalDistance.toFixed(1)}m net displacement`);
             return true;
         }
 
@@ -907,7 +902,7 @@ class TripDetectionService {
 
     static async mergeNearbyTrips(vehicleId, macIdGps) {
         try {
-            logger.info(`🔄 Checking for trips to merge for vehicle ${vehicleId}...`);
+            // logger.info(`🔄 Checking for trips to merge for vehicle ${vehicleId}...`);
 
             const recentTrips = await Trip.findAll({
                 where: {
@@ -921,7 +916,7 @@ class TripDetectionService {
             });
 
             if (recentTrips.length < 2) {
-                logger.debug(`ℹ️ Not enough trips to merge (found ${recentTrips.length})`);
+                // logger.debug(`ℹ️ Not enough trips to merge (found ${recentTrips.length})`);
                 return 0;
             }
 
@@ -934,7 +929,7 @@ class TripDetectionService {
                 const gapMinutes = (new Date(trip2.start_time) - new Date(trip1.end_time)) / 60000;
 
                 if (gapMinutes > 0 && gapMinutes <= this.TRIP_MERGE_THRESHOLD_MINUTES) {
-                    logger.info(`🔗 Merging trips ${trip1.id} and ${trip2.id} (gap: ${gapMinutes.toFixed(1)} min)`);
+                    // logger.info(`🔗 Merging trips ${trip1.id} and ${trip2.id} (gap: ${gapMinutes.toFixed(1)} min)`);
 
                     const merged = await this.mergeTwoTrips(trip1, trip2);
                     if (merged) {
@@ -946,13 +941,13 @@ class TripDetectionService {
             }
 
             if (mergeCount > 0) {
-                logger.info(`✅ Merged ${mergeCount} trip pairs`);
+                // logger.info(`✅ Merged ${mergeCount} trip pairs`);
             }
 
             return mergeCount;
 
         } catch (error) {
-            logger.error("🔥 Error merging trips:", error);
+            // logger.error("🔥 Error merging trips:", error);
             return 0;
         }
     }
@@ -961,7 +956,7 @@ class TripDetectionService {
         const transaction = await sequelize.transaction();
 
         try {
-            logger.debug(`🔗 Merging trip ${trip1.id} with trip ${trip2.id}`);
+            // logger.debug(`🔗 Merging trip ${trip1.id} with trip ${trip2.id}`);
 
             const waypoints1 = await TripWaypoint.findAll({
                 where: { trip_id: trip1.id },
@@ -1020,24 +1015,19 @@ class TripDetectionService {
 
             await transaction.commit();
 
-            logger.info(`✅ Successfully merged trip ${trip2.id} into trip ${trip1.id}`);
+            // logger.info(`✅ Successfully merged trip ${trip2.id} into trip ${trip1.id}`);
             return true;
 
         } catch (error) {
             await transaction.rollback();
-            logger.error(`🔥 Error merging trips:`, error);
+            // logger.error(`🔥 Error merging trips:`, error);
             return false;
         }
     }
 
-    // ==================== TRIP OPERATIONS ====================
-
-    /**
-     * ✅ UPDATED: Create trip with IMMEDIATE geocoding
-     */
     static async createNewTrip(vehicleId, macIdGps, startLocation) {
         try {
-            logger.info(`🗺️ Geocoding start address...`);
+            // logger.info(`🗺️ Geocoding start address...`);
 
             const startAddressData = await this.reverseGeocode(
                 startLocation.latitude,
@@ -1065,7 +1055,7 @@ class TripDetectionService {
                 waypoint_count: 0
             });
 
-            logger.info(`✅ Created trip ${trip.id} with start address: "${startAddressData.address}"`);
+            // logger.info(`✅ Created trip ${trip.id} with start address: "${startAddressData.address}"`);
 
             return {
                 id: trip.id,
@@ -1078,7 +1068,7 @@ class TripDetectionService {
             };
 
         } catch (error) {
-            logger.error("🔥 Error creating trip:", error);
+            // logger.error("🔥 Error creating trip:", error);
             return null;
         }
     }
@@ -1100,10 +1090,10 @@ class TripDetectionService {
                         const batch = waypointsToInsert.slice(i, i + this.WAYPOINT_BATCH_SIZE);
                         await TripWaypoint.bulkCreate(batch, { transaction });
                     }
-                    logger.debug(`📊 Added ${waypointsToInsert.length} corrected waypoints in ${Math.ceil(waypointsToInsert.length / this.WAYPOINT_BATCH_SIZE)} batches`);
+                    // logger.debug(`📊 Added ${waypointsToInsert.length} corrected waypoints in ${Math.ceil(waypointsToInsert.length / this.WAYPOINT_BATCH_SIZE)} batches`);
                 } else {
                     await TripWaypoint.bulkCreate(waypointsToInsert, { transaction });
-                    logger.debug(`📍 Added ${correctedWaypoints.length} corrected waypoints to trip ${currentTrip.id}`);
+                    // logger.debug(`📍 Added ${correctedWaypoints.length} corrected waypoints to trip ${currentTrip.id}`);
                 }
             }
 
@@ -1140,24 +1130,21 @@ class TripDetectionService {
 
             await transaction.commit();
 
-            logger.info(`✅ Updated ongoing trip ${currentTrip.id}:`, {
-                waypoints: allWaypoints.length,
-                duration: `${Math.round(metrics.durationMinutes)} min`,
-                distance: `${metrics.totalDistanceKm.toFixed(2)} km`
-            });
+            // logger.info(`✅ Updated ongoing trip ${currentTrip.id}:`, {
+            //     waypoints: allWaypoints.length,
+            //     duration: `${Math.round(metrics.durationMinutes)} min`,
+            //     distance: `${metrics.totalDistanceKm.toFixed(2)} km`
+            // });
 
             return true;
 
         } catch (error) {
             await transaction.rollback();
-            logger.error(`🔥 Error updating ongoing trip ${currentTrip.id}:`, error);
+            // logger.error(`🔥 Error updating ongoing trip ${currentTrip.id}:`, error);
             return false;
         }
     }
 
-    /**
-     * ✅ UPDATED: Finalize trip with IMMEDIATE end address geocoding
-     */
     static async finalizeTrip(currentTrip, endLocation, newWaypoints, locationIds) {
         const transaction = await sequelize.transaction();
 
@@ -1188,11 +1175,11 @@ class TripDetectionService {
                 transaction
             });
 
-            logger.info(`📍 Trip ${currentTrip.id}: ${allWaypoints.length} raw waypoints before simplification`);
+            // logger.info(`📍 Trip ${currentTrip.id}: ${allWaypoints.length} raw waypoints before simplification`);
             const simplifiedWaypoints = this.simplifyPath(allWaypoints);
 
             if (simplifiedWaypoints.length < allWaypoints.length) {
-                logger.info(`✅ Path simplified: ${allWaypoints.length} → ${simplifiedWaypoints.length} waypoints (${((1 - simplifiedWaypoints.length / allWaypoints.length) * 100).toFixed(1)}% reduction)`);
+                // logger.info(`✅ Path simplified: ${allWaypoints.length} → ${simplifiedWaypoints.length} waypoints (${((1 - simplifiedWaypoints.length / allWaypoints.length) * 100).toFixed(1)}% reduction)`);
 
                 await TripWaypoint.destroy({
                     where: { trip_id: currentTrip.id },
@@ -1217,10 +1204,10 @@ class TripDetectionService {
             if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM) {
 
-                logger.warn(`⚠️ Trip ${currentTrip.id} doesn't meet minimum requirements - deleting`, {
-                    duration: `${metrics.durationMinutes.toFixed(1)} min (min: ${this.MIN_TRIP_DURATION_MIN})`,
-                    distance: `${metrics.totalDistanceKm.toFixed(2)} km (min: ${this.MIN_TRIP_DISTANCE_KM})`,
-                });
+                // logger.warn(`⚠️ Trip ${currentTrip.id} doesn't meet minimum requirements - deleting`, {
+                //     duration: `${metrics.durationMinutes.toFixed(1)} min (min: ${this.MIN_TRIP_DURATION_MIN})`,
+                //     distance: `${metrics.totalDistanceKm.toFixed(2)} km (min: ${this.MIN_TRIP_DISTANCE_KM})`,
+                // });
 
                 await TripWaypoint.destroy({
                     where: { trip_id: currentTrip.id },
@@ -1243,11 +1230,11 @@ class TripDetectionService {
                 );
 
                 await transaction.commit();
-                logger.info(`🗑️ Trip ${currentTrip.id} deleted successfully (doesn't meet minimums)`);
+                // logger.info(`🗑️ Trip ${currentTrip.id} deleted successfully (doesn't meet minimums)`);
                 return false;
             }
 
-            logger.info(`🗺️ Geocoding end address...`);
+            // logger.info(`🗺️ Geocoding end address...`);
             const endAddressData = await this.reverseGeocode(
                 endLocation.latitude,
                 endLocation.longitude
@@ -1277,19 +1264,19 @@ class TripDetectionService {
 
             await transaction.commit();
 
-            logger.info(`✅ Trip ${currentTrip.id} finalized with end address: "${endAddressData.address}"`, {
-                duration: `${Math.round(metrics.durationMinutes)} min`,
-                distance: `${metrics.totalDistanceKm.toFixed(2)} km`,
-                avgSpeed: `${metrics.avgSpeed.toFixed(2)} km/h`,
-                maxSpeed: `${metrics.maxSpeed.toFixed(2)} km/h`,
-                waypoints: finalWaypoints.length
-            });
+            // logger.info(`✅ Trip ${currentTrip.id} finalized with end address: "${endAddressData.address}"`, {
+            //     duration: `${Math.round(metrics.durationMinutes)} min`,
+            //     distance: `${metrics.totalDistanceKm.toFixed(2)} km`,
+            //     avgSpeed: `${metrics.avgSpeed.toFixed(2)} km/h`,
+            //     maxSpeed: `${metrics.maxSpeed.toFixed(2)} km/h`,
+            //     waypoints: finalWaypoints.length
+            // });
 
             return true;
 
         } catch (error) {
             await transaction.rollback();
-            logger.error(`🔥 Error finalizing trip ${currentTrip.id}:`, error);
+            // logger.error(`🔥 Error finalizing trip ${currentTrip.id}:`, error);
             return false;
         }
     }

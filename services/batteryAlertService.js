@@ -1,6 +1,6 @@
 // services/deviceAlertService.js
 const Voiture = require('../models/voiture');
-const Alert = require('../models/alert');
+const Alert = require('../models/Alert');
 const User = require('../models/userModel');
 const firebaseService = require('./notificationService');
 const sequelize = require('../config/database');

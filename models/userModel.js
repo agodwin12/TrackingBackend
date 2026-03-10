@@ -44,6 +44,12 @@ const User = sequelize.define("users", {
         allowNull: false,
         unique: true,
     },
+    country_code: {
+        type: DataTypes.CHAR(2),
+        allowNull: true,
+        defaultValue: 'CM',
+        comment: 'ISO 3166-1 alpha-2 country code (e.g. CM, NG, CI, US)',
+    },
     email: {
         type: DataTypes.STRING,
         allowNull: true,

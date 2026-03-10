@@ -1,13 +1,12 @@
 // services/deviceAlertService.js
 const Voiture = require('../models/voiture');
-const Alert = require('../models/alert');
+const Alert = require('../models/Alert');
 const User = require('../models/userModel');
 const firebaseService = require('./notificationService');
 const sequelize = require('../config/database');
 
 class DeviceAlertService {
     constructor() {
-        // Alarm type codes from GPS API - ONLY DISCONNECTION/REMOVAL ALARMS
         this.ALARM_TYPES = {
             OFFLINE: 37,              // 0x25 - Device offline
             REMOVAL: 38,              // 0x26 - Device removal/disassembly

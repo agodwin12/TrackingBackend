@@ -1,10 +1,12 @@
 // controllers/authController.js
 const User = require("../models/userModel");
 const Voiture = require("../models/voiture");
+const Subscription = require("../models/subscription");
 const AssociationUserVoiture = require("../models/AssociationUserVoiture");
 const AssociationChauffeurVoiturePartner = require("../models/associationChauffeurVoiturePartner");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { Op } = require("sequelize");
 const { validationResult } = require("express-validator");
 
 // ✅ Only fetch columns that exist in the voitures table
@@ -62,6 +64,36 @@ async function fetchChauffeurVehicles(chauffeurId) {
     });
 
     return rows.map(row => row.voiture).filter(v => v !== null);
+}
+
+// ========== HELPER: Check subscription status for a list of vehicle IDs ==========
+// Returns a Map<vehicleId, boolean> — true means the vehicle has an active subscription
+async function fetchVehicleSubscriptionMap(userId, vehicleIds) {
+    if (!vehicleIds || vehicleIds.length === 0) return new Map();
+
+    const now = new Date();
+
+    const activeSubscriptions = await Subscription.findAll({
+        where: {
+            user_id: userId,
+            vehicle_id: { [Op.in]: vehicleIds },
+            status: 'ACTIVE',
+            end_date: { [Op.gt]: now },   // end_date is still in the future
+        },
+        attributes: ['vehicle_id'],
+    });
+
+    // Build a Set of vehicle IDs that have an active subscription
+    const activeVehicleIds = new Set(
+        activeSubscriptions.map(s => Number(s.vehicle_id))
+    );
+
+    const map = new Map();
+    for (const id of vehicleIds) {
+        map.set(id, activeVehicleIds.has(Number(id)));
+    }
+
+    return map;
 }
 
 // ========== LOGIN ==========
@@ -122,7 +154,26 @@ exports.login = async (req, res) => {
             });
         }
 
-        // STEP 8: Generate Access Token (90 days)
+        // STEP 8: Check subscription status for each vehicle
+        const vehicleIds = vehicles.map(v => v.id);
+        const subscriptionMap = await fetchVehicleSubscriptionMap(user.id, vehicleIds);
+
+        // Attach has_active_subscription flag to each vehicle
+        const vehiclesWithSubscription = vehicles.map(v => ({
+            ...v.toJSON(),
+            has_active_subscription: subscriptionMap.get(Number(v.id)) ?? false,
+        }));
+
+        // Overall account subscription status:
+        // ACTIVE if at least one vehicle has a valid subscription, otherwise NONE
+        const hasAnyActiveSubscription = vehiclesWithSubscription.some(
+            v => v.has_active_subscription
+        );
+        const subscriptionStatus = hasAnyActiveSubscription ? 'ACTIVE' : 'NONE';
+
+        console.log(`📋 Subscription status: ${subscriptionStatus} (${vehiclesWithSubscription.filter(v => v.has_active_subscription).length}/${vehicles.length} vehicles active)`);
+
+        // STEP 9: Generate Access Token (90 days)
         const accessToken = jwt.sign(
             {
                 id: user.id,
@@ -134,14 +185,14 @@ exports.login = async (req, res) => {
             { expiresIn: "90d" }
         );
 
-        // STEP 9: Generate Refresh Token (180 days)
+        // STEP 10: Generate Refresh Token (180 days)
         const refreshToken = jwt.sign(
             { id: user.id },
             process.env.JWT_SECRET,
             { expiresIn: "180d" }
         );
 
-        // STEP 10: Store refresh token in database
+        // STEP 11: Store refresh token in database
         const refreshTokenExpiresAt = new Date();
         refreshTokenExpiresAt.setDate(refreshTokenExpiresAt.getDate() + 180);
 
@@ -150,7 +201,7 @@ exports.login = async (req, res) => {
             refresh_token_expires_at: refreshTokenExpiresAt
         });
 
-        // STEP 11: Set refresh token in httpOnly cookie
+        // STEP 12: Set refresh token in httpOnly cookie
         res.cookie('refreshToken', refreshToken, {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
@@ -158,13 +209,14 @@ exports.login = async (req, res) => {
             maxAge: 180 * 24 * 60 * 60 * 1000
         });
 
-        console.log(`✅ Login successful — User: ${user.id} | Type: ${userType} | Vehicles: ${vehicles.length}`);
+        console.log(`✅ Login successful — User: ${user.id} | Type: ${userType} | Vehicles: ${vehicles.length} | Subscription: ${subscriptionStatus}`);
 
-        // STEP 12: Send Response
+        // STEP 13: Send Response
         return res.json({
             message: "Login successful",
             isFirstLogin: user.is_first_login,
             user_type: userType,
+            subscription_status: subscriptionStatus,   // 'ACTIVE' | 'NONE'
             user: {
                 id: user.id,
                 user_unique_id: user.user_unique_id,
@@ -177,7 +229,7 @@ exports.login = async (req, res) => {
                 photo: user.photo,
                 partner_id: user.partner_id,
             },
-            vehicles: vehicles,
+            vehicles: vehiclesWithSubscription,        // each vehicle now has has_active_subscription
             accessToken,
             refreshToken,
         });

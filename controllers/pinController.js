@@ -157,38 +157,37 @@ exports.checkPinExists = async (req, res) => {
         const { userId } = req.params;
 
         if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID is required'
-            });
+            return res.status(400).json({ success: false, message: 'User ID is required' });
         }
 
-        // Find user
         const user = await User.findByPk(userId);
         if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        const hasPinSet = user.pin_hash !== null && user.pin_hash !== '';
+        const raw = user.pin_hash; // can be null / '' / 'null' / '   '
+        const normalized = (raw ?? '').toString().trim().toLowerCase();
+
+        const hasPinSet =
+            normalized.length > 0 &&
+            normalized !== 'null' &&
+            normalized !== 'undefined';
 
         return res.status(200).json({
             success: true,
-            hasPinSet: hasPinSet
+            userId: user.id,
+            pinHashPreview: raw ? raw.substring(0, 8) + '...' : null, // debug
+            hasPinSet,
         });
-
     } catch (error) {
         console.error('❌ Error checking PIN existence:', error);
         return res.status(500).json({
             success: false,
             message: 'Error checking PIN',
-            error: error.message
+            error: error.message,
         });
     }
 };
-
 /**
  * =====================================================
  * DELETE PIN
