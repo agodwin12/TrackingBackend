@@ -1,4 +1,3 @@
-// models/associations.js
 const AssociationUserVoiture = require("./AssociationUserVoiture");
 const AssociationChauffeurVoiturePartner = require("./associationChauffeurVoiturePartner");
 const Voiture = require("./voiture");
@@ -12,19 +11,20 @@ const SubscriptionPlan = require("./subscriptionPlan");
 const Subscription = require("./subscription");
 const Payment = require("./payment");
 
-// ✅ Regular user → Voiture (with alias so authController include works)
+// ─── User / Voiture ───────────────────────────────────────────────────────────
+
 AssociationUserVoiture.belongsTo(Voiture, {
     foreignKey: "voiture_id",
     as: "voiture"
 });
 
-// ✅ Chauffeur partner → Voiture (new association)
 AssociationChauffeurVoiturePartner.belongsTo(Voiture, {
     foreignKey: "voiture_id",
     as: "voiture"
 });
 
-// ✅ Voiture → Trip (One-to-Many)
+// ─── Voiture / Trip ───────────────────────────────────────────────────────────
+
 Voiture.hasMany(Trip, {
     foreignKey: 'vehicle_id',
     as: 'trips',
@@ -35,7 +35,8 @@ Trip.belongsTo(Voiture, {
     as: 'vehicle'
 });
 
-// ✅ Trip → TripWaypoint (One-to-Many)
+// ─── Trip / TripWaypoint ──────────────────────────────────────────────────────
+
 Trip.hasMany(TripWaypoint, {
     foreignKey: 'trip_id',
     as: 'waypoints',
@@ -46,7 +47,8 @@ TripWaypoint.belongsTo(Trip, {
     as: 'trip'
 });
 
-// ✅ Trip → Location (One-to-Many)
+// ─── Trip / Location ──────────────────────────────────────────────────────────
+
 Trip.hasMany(Location, {
     foreignKey: 'trip_id',
     as: 'locations'
@@ -56,7 +58,8 @@ Location.belongsTo(Trip, {
     as: 'trip'
 });
 
-// ✅ Voiture → Alert (One-to-Many)
+// ─── Voiture / Alert ──────────────────────────────────────────────────────────
+
 Voiture.hasMany(Alert, {
     foreignKey: 'voiture_id',
     as: 'alerts',
@@ -67,7 +70,8 @@ Alert.belongsTo(Voiture, {
     as: 'vehicle'
 });
 
-// ✅ Voiture → SafeZone (One-to-Many)
+// ─── Voiture / SafeZone ───────────────────────────────────────────────────────
+
 Voiture.hasMany(SafeZone, {
     foreignKey: 'vehicle_id',
     as: 'safeZones',
@@ -79,7 +83,8 @@ SafeZone.belongsTo(Voiture, {
     constraints: false
 });
 
-// ✅ SubscriptionPlan → Subscription (One-to-Many)
+// ─── SubscriptionPlan / Subscription ─────────────────────────────────────────
+
 SubscriptionPlan.hasMany(Subscription, {
     foreignKey: 'plan_id',
     as: 'subscriptions'
@@ -89,7 +94,8 @@ Subscription.belongsTo(SubscriptionPlan, {
     as: 'plan'
 });
 
-// ✅ User → Subscription (One-to-Many)
+// ─── User / Subscription ──────────────────────────────────────────────────────
+
 User.hasMany(Subscription, {
     foreignKey: 'user_id',
     as: 'subscriptions'
@@ -99,7 +105,8 @@ Subscription.belongsTo(User, {
     as: 'user'
 });
 
-// ✅ Voiture → Subscription (One-to-Many)
+// ─── Voiture / Subscription ───────────────────────────────────────────────────
+
 Voiture.hasMany(Subscription, {
     foreignKey: 'vehicle_id',
     as: 'subscriptions'
@@ -109,27 +116,9 @@ Subscription.belongsTo(Voiture, {
     as: 'vehicle'
 });
 
-// ✅ User → Payment (One-to-Many)
-User.hasMany(Payment, {
-    foreignKey: 'user_id',
-    as: 'payments'
-});
-Payment.belongsTo(User, {
-    foreignKey: 'user_id',
-    as: 'user'
-});
+// ─── Subscription / Payment ───────────────────────────────────────────────────
 
-// ✅ Voiture → Payment (One-to-Many)
-Voiture.hasMany(Payment, {
-    foreignKey: 'vehicle_id',
-    as: 'payments'
-});
-Payment.belongsTo(Voiture, {
-    foreignKey: 'vehicle_id',
-    as: 'vehicle'
-});
-
-// ✅ Subscription → Payment (One-to-Many)
+// One subscription can have many payments (e.g. monthly renewals)
 Subscription.hasMany(Payment, {
     foreignKey: 'subscription_id',
     as: 'payments'
@@ -139,7 +128,37 @@ Payment.belongsTo(Subscription, {
     as: 'subscription'
 });
 
-// ✅ SubscriptionPlan → Payment (One-to-Many)
+// The single payment that first activated/created this subscription
+Subscription.belongsTo(Payment, {
+    foreignKey: 'payment_id',
+    as: 'activatingPayment',
+    constraints: false  // avoids circular FK constraint issues at migration time
+});
+
+// ─── User / Payment ───────────────────────────────────────────────────────────
+
+User.hasMany(Payment, {
+    foreignKey: 'user_id',
+    as: 'payments'
+});
+Payment.belongsTo(User, {
+    foreignKey: 'user_id',
+    as: 'user'
+});
+
+// ─── Voiture / Payment ────────────────────────────────────────────────────────
+
+Voiture.hasMany(Payment, {
+    foreignKey: 'vehicle_id',
+    as: 'payments'
+});
+Payment.belongsTo(Voiture, {
+    foreignKey: 'vehicle_id',
+    as: 'vehicle'
+});
+
+// ─── SubscriptionPlan / Payment ───────────────────────────────────────────────
+
 SubscriptionPlan.hasMany(Payment, {
     foreignKey: 'plan_id',
     as: 'payments'

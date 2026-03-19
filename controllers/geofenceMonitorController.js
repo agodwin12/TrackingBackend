@@ -7,9 +7,9 @@ const sequelize = require('../config/database');
 const { isInsideGeofence } = require('../services/geofenceService');
 const socketService = require('../services/socketService');
 const axios = require('axios');
+const { hasFeature, FEATURES } = require('../services/hasFeature');
 
-// Google Maps API key for geocoding
-const GOOGLE_MAPS_API_KEY = 'AIzaSyBn88TP5X-xaRCYo5gYxvGnVy_0WYotZWo';
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 // ✅ Cooldown period for geofence alerts (in minutes)
 const GEOFENCE_ALERT_COOLDOWN_MINUTES = 30;
@@ -487,6 +487,16 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
         }
 
         console.log(`✅ Geofencing is ACTIVE`);
+
+        // ✅ STEP 2b: Check subscription
+        console.log(`\n🔍 STEP 2b: Checking geofence subscription...`);
+        const hasGeofence = await hasFeature(vehicleId, FEATURES.GEOFENCE);
+        if (!hasGeofence) {
+            console.log(`ℹ️ Vehicle ${vehicleId} has no active geofence subscription — skipping`);
+            console.log(`========================================\n`);
+            return { violation: false, reason: 'No geofence subscription' };
+        }
+        console.log(`✅ Geofence subscription confirmed`);
 
         // ✅ STEP 3: Check if geofence zone is defined
         console.log(`\n🔍 STEP 3: Checking geofence zone...`);

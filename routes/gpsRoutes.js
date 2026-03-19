@@ -4,14 +4,23 @@ const {
     issueCommandToVehicle,
     getRealtimeVehicleStatus,
 } = require("../controllers/gpsController");
+const authMiddleware = require("../middleware/authMiddleware");
+const { requireFeature, FEATURES } = require("../middleware/subscriptionMiddleware");
 
+// Issue GPS command (OPENRELAY/CLOSERELAY) — engine control feature
+router.post(
+    "/gps/issue-command",
+    authMiddleware,
+    requireFeature(FEATURES.ENGINE_CONTROL),
+    issueCommandToVehicle
+);
 
-
-// Issue GPS command (OPENRELAY/CLOSERELAY)
-router.post("/gps/issue-command", issueCommandToVehicle);
-
-// Get realtime vehicle status from GPS device
-router.get("/gps/vehicle/:vehicleId/realtime-status", getRealtimeVehicleStatus);
-
+// Get realtime vehicle status — live tracking feature
+router.get(
+    "/gps/vehicle/:vehicleId/realtime-status",
+    authMiddleware,
+    requireFeature(FEATURES.LIVE_TRACKING),
+    getRealtimeVehicleStatus
+);
 
 module.exports = router;

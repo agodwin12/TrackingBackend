@@ -1,7 +1,15 @@
-// models/subscriptionPlan.js
 'use strict';
 const { DataTypes } = require('sequelize');
 const sequelize     = require('../config/database');
+
+const VALID_FEATURES = [
+    'live_tracking',
+    'geofence',
+    'safe_zone',
+    'trip_history',
+    'engine_control',
+    'report_stolen',
+];
 
 const SubscriptionPlan = sequelize.define('SubscriptionPlan', {
     id: {
@@ -14,7 +22,6 @@ const SubscriptionPlan = sequelize.define('SubscriptionPlan', {
         type:      DataTypes.STRING,
         allowNull: false,
         unique:    true,
-        // e.g. 'MONTHLY' | 'YEARLY' | 'PER_VEHICLE'
     },
 
     label: {
@@ -22,20 +29,12 @@ const SubscriptionPlan = sequelize.define('SubscriptionPlan', {
         allowNull: false,
     },
 
-
     billing_mode: {
-        type:         DataTypes.ENUM('DAY', 'MONTH'),
+        type:         DataTypes.ENUM('MONTH'),
         allowNull:    false,
-        defaultValue: 'DAY',
+        defaultValue: 'MONTH',
     },
 
-    // Used when billing_mode = 'DAY'
-    duration_days: {
-        type:      DataTypes.INTEGER,
-        allowNull: true,
-    },
-
-    // Used when billing_mode = 'MONTH'
     duration_months: {
         type:      DataTypes.INTEGER,
         allowNull: true,
@@ -52,6 +51,14 @@ const SubscriptionPlan = sequelize.define('SubscriptionPlan', {
         defaultValue: 'XAF',
     },
 
+
+    features: {
+        type:         DataTypes.STRING, // raw string — Sequelize has no native SET type
+        allowNull:    false,
+        defaultValue: '',
+        comment:      " live_tracking','geofence','safe_zone','trip_history','engine_control','report_stolen",
+    },
+
     is_active: {
         type:         DataTypes.BOOLEAN,
         allowNull:    false,
@@ -65,3 +72,4 @@ const SubscriptionPlan = sequelize.define('SubscriptionPlan', {
 });
 
 module.exports = SubscriptionPlan;
+module.exports.VALID_FEATURES = VALID_FEATURES;

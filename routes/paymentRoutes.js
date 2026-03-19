@@ -6,7 +6,8 @@ const {
     getPaymentHistory,
     getVehicleSubscription,
     getSubscriptionPlans,
-    initiatePaymentBatch
+    initiatePaymentBatch,
+    getAllVehicleSubscriptions
 } = require('../controllers/paymentController');
 
 const authMiddleware = require('../middleware/authMiddleware');
@@ -33,6 +34,11 @@ router.get('/history', authMiddleware, getPaymentHistory);
 // Get active subscription for a specific vehicle
 // ──────────────────────────────────────────
 router.get('/vehicle/:vehicle_id', authMiddleware, getVehicleSubscription);
+
+
+router.get('/subscriptions/all', authMiddleware, getAllVehicleSubscriptions);
+
+
 
 // Success redirect from Maviance
 router.get('/success', (req, res) => {

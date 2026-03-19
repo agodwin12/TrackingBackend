@@ -115,31 +115,68 @@ const initiatePaymentBatch = async (req, res) => {
 
 /**
  * GET /api/payments/history
- * Get full payment history for the logged in user
+ * Get full payment history for the logged in user, enriched with vehicle data.
  */
 const getPaymentHistory = async (req, res) => {
     try {
-        const user_id = req.user.id;
+        const user_id  = req.user.id;
+        const sequelize = require('../config/database');
 
-        const payments = await Payment.findAll({
-            where: { user_id },
-            include: [
-                { model: SubscriptionPlan, as: 'plan' },
-                { model: Subscription,     as: 'subscription' }
-            ],
-            order: [['created_at', 'DESC']]
-        });
+        // Raw JOIN so we get vehicle name/plate without needing a model association
+        const rows = await sequelize.query(
+            `SELECT
+                 p.id,
+                 p.vehicle_id,
+                 p.plan_id,
+                 p.amount,
+                 p.currency,
+                 p.method,
+                 p.provider,
+                 p.phone_number,
+                 p.status,
+                 p.transaction_ref,
+                 p.transaction_id,
+                 p.paid_at,
+                 p.created_at,
+                 sp.label       AS plan_name,
+                 sp.code        AS plan_description,
+                 v.immatriculation                                              AS vehicle_plate,
+                 COALESCE(NULLIF(v.nickname, ''), CONCAT(v.marque, ' ', v.model)) AS vehicle_name
+             FROM payments p
+                      LEFT JOIN subscription_plans sp ON sp.id = p.plan_id
+                      LEFT JOIN voitures v            ON v.id  = p.vehicle_id
+             WHERE p.user_id = :user_id
+             ORDER BY p.created_at DESC`,
+            {
+                replacements: { user_id },
+                type: sequelize.QueryTypes.SELECT,
+            }
+        );
 
-        return res.status(200).json({
-            success: true,
-            data: payments
-        });
+        const data = rows.map(p => ({
+            id:              p.id,
+            vehicle_id:      p.vehicle_id,
+            vehicle_name:    p.vehicle_name  ?? 'Unknown Vehicle',
+            vehicle_plate:   p.vehicle_plate ?? '',
+            amount:          p.amount,
+            currency:        p.currency      ?? 'XAF',
+            method:          p.method,
+            provider:        p.provider,
+            phone_number:    p.phone_number,
+            status:          p.status,
+            transaction_ref: p.transaction_ref,
+            paid_at:         p.paid_at,
+            created_at:      p.created_at,
+            plan:            p.plan_name ? { name: p.plan_name, description: p.plan_description } : null,
+        }));
+
+        return res.status(200).json({ success: true, data });
 
     } catch (error) {
         console.error('❌ [PAYMENT CONTROLLER] getPaymentHistory error:', error.message);
         return res.status(500).json({
             success: false,
-            message: 'An error occurred while fetching payment history'
+            message: 'An error occurred while fetching payment history',
         });
     }
 };
@@ -180,6 +217,93 @@ const getVehicleSubscription = async (req, res) => {
 };
 
 /**
+ * GET /api/payments/subscriptions/all
+ * Returns every vehicle the user owns together with its active subscription
+ * (if any). One query — no N+1.
+ *
+ * Response shape:
+ * {
+ *   success: true,
+ *   data: [
+ *     {
+ *       vehicle_id, vehicle_name, vehicle_plate,
+ *       subscription: { id, status, start_date, end_date, plan: { name, features, ... } } | null
+ *     }, ...
+ *   ]
+ * }
+ */
+const getAllVehicleSubscriptions = async (req, res) => {
+    try {
+        const user_id   = req.user.id;
+        const sequelize = require('../config/database');
+
+        const rows = await sequelize.query(
+            `SELECT
+                 v.id                                                                   AS vehicle_id,
+                 COALESCE(NULLIF(v.nickname, ''), CONCAT(v.marque, ' ', v.model))      AS vehicle_name,
+                 v.immatriculation                                                      AS vehicle_plate,
+                 s.id                                                                   AS sub_id,
+                 s.status                                                               AS sub_status,
+                 s.start_date                                                           AS sub_start,
+                 s.end_date                                                             AS sub_end,
+                 sp.id                                                                  AS plan_id,
+                 sp.label                                                               AS plan_name,
+                 sp.code                                                                AS plan_code,
+                 sp.price                                                               AS plan_price,
+                 sp.currency                                                            AS plan_currency,
+                 sp.billing_mode                                                        AS plan_billing_mode,
+                 sp.duration_months                                                     AS plan_duration_months,
+                 sp.features                                                            AS plan_features
+             FROM association_user_voitures auv
+                      JOIN voitures v ON v.id = auv.voiture_id
+                      LEFT JOIN subscriptions s
+                                ON  s.vehicle_id = v.id
+                                    AND s.user_id    = auv.user_id
+                                    AND s.status     = 'ACTIVE'
+                                    AND s.end_date   > NOW()
+                      LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
+             WHERE auv.user_id = :user_id
+             ORDER BY v.id ASC`,
+            {
+                replacements: { user_id },
+                type: sequelize.QueryTypes.SELECT,
+            }
+        );
+
+        const data = rows.map(r => ({
+            vehicle_id:    r.vehicle_id,
+            vehicle_name:  r.vehicle_name  ?? 'Unknown Vehicle',
+            vehicle_plate: r.vehicle_plate ?? '',
+            subscription:  r.sub_id ? {
+                id:         r.sub_id,
+                status:     r.sub_status,
+                start_date: r.sub_start,
+                end_date:   r.sub_end,
+                plan: {
+                    id:              r.plan_id,
+                    name:            r.plan_name,
+                    code:            r.plan_code,
+                    price:           r.plan_price,
+                    currency:        r.plan_currency,
+                    billing_mode:    r.plan_billing_mode,
+                    duration_months: r.plan_duration_months,
+                    features:        r.plan_features,
+                },
+            } : null,
+        }));
+
+        return res.status(200).json({ success: true, data });
+
+    } catch (error) {
+        console.error('❌ [PAYMENT CONTROLLER] getAllVehicleSubscriptions error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'An error occurred while fetching vehicle subscriptions',
+        });
+    }
+};
+
+/**
  * GET /api/payments/plans
  * Get all active subscription plans
  */
@@ -208,6 +332,7 @@ module.exports = {
     initiatePayment,
     getPaymentHistory,
     getVehicleSubscription,
+    getAllVehicleSubscriptions,
     getSubscriptionPlans,
-    initiatePaymentBatch
+    initiatePaymentBatch,
 };

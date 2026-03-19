@@ -11,7 +11,8 @@ const redisClient = require('./config/redis');
 const socketService = require('./services/socketService');
 const logger = require('./utils/logger');
 const { startGPSFetchCycle, stopGPSFetchCycle, isRunning } = require('./location');
-const TripDetectionCron = require('./jobs/tripDetectionCron');
+const TripDetectionCron      = require('./jobs/tripDetectionCron');
+const SubscriptionExpiryCron = require('./jobs/subscriptionExpiryCron');
 const GeocodingService = require('./services/geocodingService');
 
 // ✅ Security Check Job
@@ -31,8 +32,8 @@ const io = new Server(httpServer, {
     },
     pingTimeout: 60000,
     pingInterval: 25000,
-    transports: ['websocket', 'polling'], // ✅ Explicit transports
-    allowEIO3: true // ✅ Support older clients
+    transports: ['websocket', 'polling'],
+    allowEIO3: true
 });
 
 // ========== SERVICE INITIALIZATION ==========
@@ -44,7 +45,7 @@ async function initializeServices() {
     const errors = [];
 
     // 1. Redis
-    logger.info('🔄 [1/5] Initializing Redis...');
+    logger.info('🔄 [1/6] Initializing Redis...');
     try {
         await redisClient.connect();
         logger.info('✅ Redis: CONNECTED\n');
@@ -55,7 +56,7 @@ async function initializeServices() {
     }
 
     // 2. Geocoding Service
-    logger.info('🔄 [2/5] Initializing Geocoding Service...');
+    logger.info('🔄 [2/6] Initializing Geocoding Service...');
     try {
         GeocodingService.initialize();
         logger.info('✅ Geocoding Service: INITIALIZED\n');
@@ -65,7 +66,7 @@ async function initializeServices() {
     }
 
     // 3. Socket.IO
-    logger.info('🔄 [3/5] Initializing Socket.IO...');
+    logger.info('🔄 [3/6] Initializing Socket.IO...');
     try {
         socketService.initialize(io);
         logger.info('✅ Socket.IO: INITIALIZED\n');
@@ -75,7 +76,7 @@ async function initializeServices() {
     }
 
     // 4. Trip Detection Cron
-    logger.info('🔄 [4/5] Starting Trip Detection Cron...');
+    logger.info('🔄 [4/6] Starting Trip Detection Cron...');
     try {
         TripDetectionCron.start();
         logger.info('✅ Trip Detection Cron: STARTED\n');
@@ -84,8 +85,18 @@ async function initializeServices() {
         errors.push('Trip Detection');
     }
 
-    // 5. Security Movement Check
-    logger.info('🔄 [5/5] Security Movement Check: LOADED\n');
+    // 5. Subscription Expiry Cron
+    logger.info('🔄 [5/6] Starting Subscription Expiry Cron...');
+    try {
+        SubscriptionExpiryCron.start();
+        logger.info('✅ Subscription Expiry Cron: STARTED\n');
+    } catch (error) {
+        logger.error('❌ Subscription Expiry Cron: FAILED -', error.message, '\n');
+        errors.push('Expiry Cron');
+    }
+
+    // 6. Security Movement Check
+    logger.info('🔄 [6/6] Security Movement Check: LOADED\n');
 
     if (errors.length > 0) {
         logger.warn(`⚠️ Some services failed: ${errors.join(', ')}`);
@@ -209,8 +220,16 @@ async function gracefulShutdown(signal) {
         TripDetectionCron.stop();
         logger.info('✅ Trip Detection Cron stopped');
     } catch (error) {
-        logger.error('❌ Cron stop failed:', error.message);
-        errors.push('Cron');
+        logger.error('❌ Trip Detection Cron stop failed:', error.message);
+        errors.push('Trip Cron');
+    }
+
+    try {
+        SubscriptionExpiryCron.stop();
+        logger.info('✅ Subscription Expiry Cron stopped');
+    } catch (error) {
+        logger.error('❌ Subscription Expiry Cron stop failed:', error.message);
+        errors.push('Expiry Cron');
     }
 
     logger.info('\n╔════════════════════════════════════════╗');
@@ -248,7 +267,6 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // ========== VERIFY CRITICAL ENVIRONMENT VARIABLES ==========
-// ✅ Updated to allow empty passwords (common in local development)
 const requiredEnvVars = [
     'DB_HOST',
     'DB_USER',
@@ -257,7 +275,6 @@ const requiredEnvVars = [
     'GPS_LOGIN_PASSWORD_1'
 ];
 
-// Variables that can be empty (like passwords)
 const optionalButDefinedVars = [
     'DB_PASSWORD',
     'REDIS_PASSWORD'
@@ -265,23 +282,20 @@ const optionalButDefinedVars = [
 
 logger.info('\n🔍 Checking required environment variables...');
 
-// Check required variables (must exist and not be undefined)
-const missingVars = requiredEnvVars.filter(varName => process.env[varName] === undefined);
-
-// Check optional variables (must be defined, can be empty string)
-const undefinedOptionalVars = optionalButDefinedVars.filter(varName => process.env[varName] === undefined);
+const missingVars         = requiredEnvVars.filter(v => process.env[v] === undefined);
+const undefinedOptionalVars = optionalButDefinedVars.filter(v => process.env[v] === undefined);
 
 if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
     logger.error('❌ Missing required environment variables:');
 
     if (missingVars.length > 0) {
         logger.error('\n  Required (must have value):');
-        missingVars.forEach(varName => logger.error(`   - ${varName}`));
+        missingVars.forEach(v => logger.error(`   - ${v}`));
     }
 
     if (undefinedOptionalVars.length > 0) {
         logger.error('\n  Required (can be empty, but must be defined):');
-        undefinedOptionalVars.forEach(varName => logger.error(`   - ${varName}`));
+        undefinedOptionalVars.forEach(v => logger.error(`   - ${v}`));
     }
 
     logger.error('\n⚠️  Please check your .env file');
@@ -289,8 +303,7 @@ if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
 } else {
     logger.info('✅ All required environment variables are set');
 
-    // Show which passwords are empty (informational)
-    const emptyPasswords = optionalButDefinedVars.filter(varName => process.env[varName] === '');
+    const emptyPasswords = optionalButDefinedVars.filter(v => process.env[v] === '');
     if (emptyPasswords.length > 0) {
         logger.warn(`⚠️  Note: Empty passwords detected for: ${emptyPasswords.join(', ')}`);
     }
@@ -298,5 +311,4 @@ if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
     logger.info('');
 }
 
-// ========== START THE SERVER ==========
 startServer();

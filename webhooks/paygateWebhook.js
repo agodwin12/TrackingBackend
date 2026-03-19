@@ -3,29 +3,23 @@ const crypto           = require('crypto');
 const Payment          = require('../models/payment');
 const Subscription     = require('../models/subscription');
 const SubscriptionPlan = require('../models/subscriptionPlan');
+const socketService    = require('../services/socketService');
+const notificationController         = require('../controllers/notificationController');
+const { invalidateVehicleFeatureCache } = require('../services/hasFeature');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RENEWAL HELPER
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * Adds duration to a base date using the plan's billing_mode.
- * MONTH: calendar month (March 15 → April 15).
- * DAY:   plain day count (used for YEARLY = 365 days).
- */
 const _addDuration = (baseDate, plan) => {
     const result = new Date(baseDate);
-    if (plan.billing_mode === 'MONTH' && plan.duration_months) {
-        result.setMonth(result.getMonth() + plan.duration_months);
-    } else {
-        result.setDate(result.getDate() + (plan.duration_days || 30));
-    }
+    result.setMonth(result.getMonth() + (plan.duration_months || 1));
     return result;
 };
 
 const _calculateEndDate = (existingSub, plan) => {
     const now = new Date();
 
-    if (existingSub && existingSub.end_date) {
+    if (existingSub?.end_date) {
         const currentEnd = new Date(existingSub.end_date);
         const base = currentEnd > now ? currentEnd : now;
         return _addDuration(base, plan);
@@ -39,7 +33,6 @@ const _calculateEndDate = (existingSub, plan) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const handlePaygateWebhook = async (req, res) => {
     console.log('📩 [WEBHOOK] PayGate webhook received');
-    console.log('📋 [WEBHOOK] Headers:', req.headers);
 
     // ── 1. Signature verification ─────────────────────────────────────────────
     const receivedSig = req.headers['x-signature'];
@@ -54,17 +47,10 @@ const handlePaygateWebhook = async (req, res) => {
         ? req.body.toString('utf8')
         : JSON.stringify(req.body);
 
-    console.log('─'.repeat(45));
-    console.log('🔐 [WEBHOOK SIG] Secret    :', secret);
-    console.log('🔐 [WEBHOOK SIG] Raw body  :', rawBody);
-
     const computedSig = crypto
         .createHmac('sha1', secret)
         .update(rawBody)
         .digest('hex');
-
-    console.log('🔐 [WEBHOOK SIG] Computed  :', computedSig);
-    console.log('🔐 [WEBHOOK SIG] Received  :', receivedSig);
 
     const sigMatch =
         computedSig.length === receivedSig.length &&
@@ -72,9 +58,6 @@ const handlePaygateWebhook = async (req, res) => {
             Buffer.from(computedSig),
             Buffer.from(receivedSig),
         );
-
-    console.log('🔐 [WEBHOOK SIG] Match?    :', sigMatch);
-    console.log('─'.repeat(45));
 
     if (!sigMatch) {
         console.warn('⚠️  [WEBHOOK] Invalid signature — rejecting');
@@ -92,45 +75,27 @@ const handlePaygateWebhook = async (req, res) => {
 
     const { status, transaction_id, errorCode } = payload;
 
-    // ── DETAILED PAYLOAD LOG — helps diagnose batch lookup issues ─────────────
-    console.log('📦 [WEBHOOK] Full payload:', JSON.stringify(payload, null, 2));
-    console.log('📦 [WEBHOOK] status            :', status);
-    console.log('📦 [WEBHOOK] transaction_id     :', transaction_id);
-    console.log('📦 [WEBHOOK] external_reference :', external_reference);
-    console.log('📦 [WEBHOOK] errorCode          :', errorCode);
-    console.log('📦 [WEBHOOK] All payload keys   :', Object.keys(payload));
-
-
+    console.log('📦 [WEBHOOK] status        :', status);
+    console.log('📦 [WEBHOOK] transaction_id:', transaction_id);
+    console.log('📦 [WEBHOOK] errorCode     :', errorCode);
 
     // ── 3. Find matching payment records ──────────────────────────────────────
-    // Both single and batch payments are now stored with the same transaction_id
-    // (unique constraint on transaction_id was removed from the payments table).
-    // So one simple lookup by transaction_id covers all cases.
-
     if (!transaction_id) {
         console.warn('⚠️  [WEBHOOK] No transaction_id in payload — cannot process');
         return res.status(200).json({ received: true });
     }
 
     const payments = await Payment.findAll({
-        where: { transaction_id },
+        where:   { transaction_id },
         include: [{ model: SubscriptionPlan, as: 'plan' }],
     });
 
-    console.log(`🔍 [WEBHOOK] Lookup by transaction_id=${transaction_id} → ${payments.length} row(s)`);
-    if (payments.length > 0) {
-        console.log(`🔍 [WEBHOOK] Rows:`, payments.map(p => ({
-            id: p.id, ref: p.transaction_ref, status: p.status, vehicle_id: p.vehicle_id
-        })));
-    }
+    console.log(`🔍 [WEBHOOK] Found ${payments.length} row(s) for transaction_id=${transaction_id}`);
 
     if (!payments || payments.length === 0) {
-        console.warn(`⚠️  [WEBHOOK] No payments found (tried: ${lookupMethod})`);
-        // Return 200 so PayGate doesn't keep retrying
+        console.warn(`⚠️  [WEBHOOK] No payments found for transaction_id=${transaction_id}`);
         return res.status(200).json({ received: true });
     }
-
-    console.log(`✅ [WEBHOOK] Found ${payments.length} payment(s) via ${lookupMethod}`);
 
     // ── 4. Idempotency ────────────────────────────────────────────────────────
     const pendingPayments = payments.filter((p) => p.status === 'PENDING');
@@ -191,10 +156,33 @@ const handlePaygateWebhook = async (req, res) => {
                     paid_at:         now,
                 });
 
+                // Invalidate Redis cache — new subscription must be visible immediately
+                await invalidateVehicleFeatureCache(payment.vehicle_id);
+
                 console.log(
                     `✅ [WEBHOOK] Payment ${payment.id} → Sub ${subscription.id} ` +
                     `for vehicle ${payment.vehicle_id}`
                 );
+
+                // ── Socket notification ───────────────────────────────────────
+                socketService.emitPaymentUpdate(
+                    payment.user_id, 'SUCCESS', payment.id, payment.vehicle_id,
+                );
+
+                // ── Push notification ─────────────────────────────────────────
+                notificationController.sendToUser(payment.user_id, {
+                    title: '✅ Payment Successful',
+                    body:  `Your subscription for plan "${plan.label}" is now active.`,
+                    data: {
+                        type:       'payment_success',
+                        payment_id: String(payment.id),
+                        vehicle_id: String(payment.vehicle_id),
+                        plan_label: plan.label,
+                    },
+                }).catch(err =>
+                    console.error(`⚠️  [WEBHOOK] Push notification failed for payment ${payment.id}:`, err.message)
+                );
+
             } catch (err) {
                 console.error(`❌ [WEBHOOK] Error on payment ${payment.id}:`, err.message);
                 // Continue — don't let one vehicle failure block the rest
@@ -210,6 +198,22 @@ const handlePaygateWebhook = async (req, res) => {
 
         for (const payment of pendingPayments) {
             await payment.update({ status: 'FAILED' });
+
+            socketService.emitPaymentUpdate(
+                payment.user_id, 'FAILED', payment.id, payment.vehicle_id,
+            );
+
+            notificationController.sendToUser(payment.user_id, {
+                title: '❌ Payment Failed',
+                body:  'Your payment could not be processed. Please try again.',
+                data: {
+                    type:       'payment_failed',
+                    payment_id: String(payment.id),
+                    vehicle_id: String(payment.vehicle_id),
+                },
+            }).catch(err =>
+                console.error(`⚠️  [WEBHOOK] Push notification failed for payment ${payment.id}:`, err.message)
+            );
         }
 
         console.log(`🚫 [WEBHOOK] Marked ${pendingPayments.length} payment(s) as FAILED`);

@@ -1,83 +1,74 @@
 // services/socketService.js
+const logger = require('../utils/logger');
+
 class SocketService {
     constructor() {
-        this.io = null;
-        this.connectedClients = new Map(); // Track connected clients by vehicleId
-        console.log('🔌 SocketService instance created');
+        this.io              = null;
+        this.connectedClients = new Map();
+        logger.info('🔌 SocketService instance created');
     }
 
     /**
-     * Initialize Socket.IO server
-     * @param {Object} server - HTTP server instance
-     * @returns {Object} Socket.IO instance
+     * Initialize Socket.IO service with the already-configured io instance
+     * from server.js. We accept the instance rather than creating a new one
+     * so that the CORS / transport config defined in server.js is the single
+     * source of truth — no duplicate instantiation, no wildcard origin bypass.
+     *
+     * @param {import('socket.io').Server} io - The Socket.IO Server created in server.js
+     * @returns {import('socket.io').Server}
      */
-    initialize(server) {
+    initialize(io) {
         if (this.io) {
-            console.log('⚠️ Socket.IO already initialized');
+            logger.warn('⚠️ Socket.IO already initialized');
             return this.io;
         }
 
-        const socketIO = require('socket.io');
-
-        console.log('\n🔌 ========== INITIALIZING SOCKET.IO ==========');
-
-        this.io = socketIO(server, {
-            cors: {
-                origin: "*", // ⚠️ In production, specify your Flutter app's origin
-                methods: ["GET", "POST"],
-                credentials: true
-            },
-            pingTimeout: 60000,
-            pingInterval: 25000,
-            transports: ['websocket', 'polling']
-        });
+        // ✅ FIXED: accept the io instance that was created (and CORS-configured)
+        // in server.js instead of spawning a second one with origin: "*"
+        this.io = io;
 
         this.setupConnectionHandlers();
 
-        console.log('✅ Socket.IO initialized successfully');
-        console.log('==========================================\n');
+        logger.info('✅ Socket.IO service initialized');
 
         return this.io;
     }
 
-    /**
-     * Setup connection event handlers
-     */
+    // ==================== CONNECTION HANDLERS ====================
+
     setupConnectionHandlers() {
         this.io.on('connection', (socket) => {
-            console.log(`\n🔌 ========== NEW CONNECTION ==========`);
-            console.log(`👤 Client connected: ${socket.id}`);
-            console.log(`📊 Total connections: ${this.io.engine.clientsCount}`);
-            console.log(`========================================\n`);
+            logger.info(`🔌 Client connected: ${socket.id} | total: ${this.io.engine.clientsCount}`);
 
-            // ✅ Handle joining vehicle tracking room
             socket.on('joinVehicleTracking', (vehicleId) => {
+                // Basic input guard — vehicleId must be a usable value
+                if (vehicleId === undefined || vehicleId === null) {
+                    socket.emit('error', { message: 'vehicleId is required' });
+                    return;
+                }
+
                 const room = `vehicle_${vehicleId}`;
                 socket.join(room);
 
-                // Track this client
                 if (!this.connectedClients.has(vehicleId)) {
                     this.connectedClients.set(vehicleId, new Set());
                 }
                 this.connectedClients.get(vehicleId).add(socket.id);
 
-                console.log(`✅ Socket ${socket.id} joined room: ${room}`);
-                console.log(`👥 Total clients tracking vehicle ${vehicleId}: ${this.connectedClients.get(vehicleId).size}`);
+                logger.info(`✅ Socket ${socket.id} joined room: ${room} | clients: ${this.connectedClients.get(vehicleId).size}`);
 
                 socket.emit('joinedRoom', {
-                    success: true,
-                    room: room,
+                    success:   true,
+                    room:      room,
                     vehicleId: vehicleId,
-                    message: `Joined vehicle ${vehicleId} tracking`
+                    message:   `Joined vehicle ${vehicleId} tracking`
                 });
             });
 
-            // ✅ Handle leaving vehicle tracking room
             socket.on('leaveVehicleTracking', (vehicleId) => {
                 const room = `vehicle_${vehicleId}`;
                 socket.leave(room);
 
-                // Remove from tracking
                 if (this.connectedClients.has(vehicleId)) {
                     this.connectedClients.get(vehicleId).delete(socket.id);
                     if (this.connectedClients.get(vehicleId).size === 0) {
@@ -85,229 +76,219 @@ class SocketService {
                     }
                 }
 
-                console.log(`👋 Socket ${socket.id} left room: ${room}`);
-                console.log(`👥 Remaining clients tracking vehicle ${vehicleId}: ${this.connectedClients.get(vehicleId)?.size || 0}`);
+                logger.info(`👋 Socket ${socket.id} left room: ${room} | remaining: ${this.connectedClients.get(vehicleId)?.size || 0}`);
             });
 
-            // ✅ Handle disconnection
-            socket.on('disconnect', (reason) => {
-                console.log(`\n❌ ========== DISCONNECTION ==========`);
-                console.log(`👤 Client disconnected: ${socket.id}`);
-                console.log(`📝 Reason: ${reason}`);
+            // ── USER ROOM — for payment updates and user-level notifications ──────
+            // Flutter emits joinUserRoom with the logged-in user's ID right after
+            // connecting. This lets the backend push payment_update events directly
+            // to the user without going through a vehicle room.
+            socket.on('joinUserRoom', (userId) => {
+                if (userId === undefined || userId === null) {
+                    socket.emit('error', { message: 'userId is required' });
+                    return;
+                }
 
-                // Clean up from all vehicle tracking
+                const room = `user_${userId}`;
+                socket.join(room);
+
+                logger.info(`✅ Socket ${socket.id} joined user room: ${room}`);
+
+                socket.emit('joinedUserRoom', {
+                    success: true,
+                    room:    room,
+                    userId:  userId,
+                });
+            });
+            // ─────────────────────────────────────────────────────────────────────
+
+            socket.on('disconnect', (reason) => {
+                logger.info(`❌ Client disconnected: ${socket.id} | reason: ${reason}`);
+
+                // Clean up from every vehicle room this socket was in
                 this.connectedClients.forEach((clients, vehicleId) => {
                     if (clients.has(socket.id)) {
                         clients.delete(socket.id);
                         if (clients.size === 0) {
                             this.connectedClients.delete(vehicleId);
                         }
-                        console.log(`🧹 Cleaned up socket ${socket.id} from vehicle ${vehicleId}`);
+                        logger.info(`🧹 Removed socket ${socket.id} from vehicle ${vehicleId}`);
                     }
                 });
 
-                console.log(`📊 Total connections: ${this.io.engine.clientsCount}`);
-                console.log(`========================================\n`);
+                logger.info(`📊 Total connections after disconnect: ${this.io.engine.clientsCount}`);
             });
         });
     }
 
+    // ==================== EMIT HELPERS ====================
+
     /**
-     * ✅ Emit real-time location update to all clients tracking a vehicle
-     * @param {Number} vehicleId
-     * @param {Object} locationData
-     * @returns {Boolean}
+     * Emit real-time location update to all clients tracking a vehicle.
+     * Skips emission silently when nobody is watching (saves bandwidth).
      */
     emitLocationUpdate(vehicleId, locationData) {
         if (!this.io) {
-            console.log('⚠️ Socket.IO not initialized, skipping location emission');
+            logger.warn('⚠️ Socket.IO not initialized — skipping location emission');
             return false;
         }
 
-        const room = `vehicle_${vehicleId}`;
         const clientCount = this.connectedClients.get(vehicleId)?.size || 0;
 
-        // Only emit if someone is watching
         if (clientCount === 0) {
-            console.log(`⏭️ No clients tracking vehicle ${vehicleId}, skipping location emission`);
-            return false;
+            return false; // nobody watching, no need to emit
         }
 
         const payload = {
-            vehicleId: vehicleId,
-            latitude: locationData.latitude,
-            longitude: locationData.longitude,
-            speed: locationData.speed || 0,
+            vehicleId:     vehicleId,
+            latitude:      locationData.latitude,
+            longitude:     locationData.longitude,
+            speed:         locationData.speed         || 0,
             engine_status: locationData.engine_status || 'UNKNOWN',
-            car_model: locationData.car_model || null,
-            timestamp: new Date().toISOString()
+            car_model:     locationData.car_model     || null,
+            timestamp:     new Date().toISOString()
         };
 
-        console.log(`\n📍 ========== EMITTING LOCATION UPDATE ==========`);
-        console.log(`🚗 Vehicle ID: ${vehicleId}`);
-        console.log(`📍 Room: ${room}`);
-        console.log(`👥 Clients: ${clientCount}`);
-        console.log(`📊 Lat: ${payload.latitude}, Lng: ${payload.longitude}`);
-        console.log(`🏎️ Speed: ${payload.speed} km/h`);
-        console.log(`🔧 Engine: ${payload.engine_status}`);
+        this.io.to(`vehicle_${vehicleId}`).emit('location_update', payload);
 
-        this.io.to(room).emit('location_update', payload);
-
-        console.log(`✅ Location update emitted successfully`);
-        console.log(`==========================================\n`);
+        logger.debug(
+            `📍 location_update → vehicle ${vehicleId} | ` +
+            `[${payload.latitude}, ${payload.longitude}] | ` +
+            `${payload.speed} km/h | ${payload.engine_status} | ` +
+            `${clientCount} client(s)`
+        );
 
         return true;
     }
 
     /**
-     * Emit GPS update (legacy method - kept for backward compatibility)
-     * @param {Number} vehicleId
-     * @param {Object} gpsData
-     * @returns {Boolean}
+     * Emit GPS update (legacy — kept for backward compatibility).
      */
     emitGPSUpdate(vehicleId, gpsData) {
         if (!this.io) {
-            console.log('⚠️ Socket.IO not initialized, skipping GPS emission');
+            logger.warn('⚠️ Socket.IO not initialized — skipping GPS emission');
             return false;
         }
 
-        const room = `vehicle_${vehicleId}`;
-
-        console.log(`\n📡 ========== EMITTING GPS UPDATE ==========`);
-        console.log(`🚗 Vehicle ID: ${vehicleId}`);
-        console.log(`📍 Room: ${room}`);
-        console.log(`📊 Data:`, gpsData);
-
-        this.io.to(room).emit('gpsUpdate', {
+        this.io.to(`vehicle_${vehicleId}`).emit('gpsUpdate', {
             vehicleId,
-            latitude: gpsData.latitude,
+            latitude:  gpsData.latitude,
             longitude: gpsData.longitude,
-            speed: gpsData.speed,
+            speed:     gpsData.speed,
             car_model: gpsData.car_model,
             timestamp: new Date().toISOString()
         });
 
-        console.log(`✅ GPS update emitted to room: ${room}`);
-        console.log(`========================================\n`);
-
+        logger.debug(`📡 gpsUpdate → vehicle ${vehicleId}`);
         return true;
     }
 
     /**
-     * Emit dashboard update
-     * @param {Number} vehicleId
-     * @param {Object} dashboardData
-     * @returns {Boolean}
+     * Emit dashboard update.
      */
     emitDashboardUpdate(vehicleId, dashboardData) {
         if (!this.io) {
-            console.log('⚠️ Socket.IO not initialized, skipping dashboard emission');
+            logger.warn('⚠️ Socket.IO not initialized — skipping dashboard emission');
             return false;
         }
 
-        const room = `vehicle_${vehicleId}`;
-
-        console.log(`📊 Emitting dashboard update to room: ${room}`);
-
-        this.io.to(room).emit('dashboardUpdate', {
+        this.io.to(`vehicle_${vehicleId}`).emit('dashboardUpdate', {
             vehicleId,
-            speed: dashboardData.speed,
-            gpsStatus: dashboardData.gpsStatus,
+            speed:         dashboardData.speed,
+            gpsStatus:     dashboardData.gpsStatus,
             vehicleStatus: dashboardData.vehicleStatus,
-            timestamp: new Date().toISOString()
+            timestamp:     new Date().toISOString()
         });
 
+        logger.debug(`📊 dashboardUpdate → vehicle ${vehicleId}`);
         return true;
     }
 
     /**
-     * ✅ Emit event to specific vehicle room (used for alerts, notifications, etc.)
-     * @param {Number} vehicleId
-     * @param {String} eventName
-     * @param {Object} data
-     * @returns {Boolean}
+     * Emit a named event to a specific vehicle room (alerts, notifications, etc.).
      */
     emitToVehicle(vehicleId, eventName, data) {
         if (!this.io) {
-            console.log('⚠️ Socket.IO not initialized, skipping emission');
+            logger.warn('⚠️ Socket.IO not initialized — skipping emission');
             return false;
         }
 
-        const room = `vehicle_${vehicleId}`;
         const clientCount = this.connectedClients.get(vehicleId)?.size || 0;
 
-        console.log(`\n🚨 ========== EMITTING EVENT ==========`);
-        console.log(`🚗 Vehicle ID: ${vehicleId}`);
-        console.log(`📍 Room: ${room}`);
-        console.log(`📢 Event: ${eventName}`);
-        console.log(`👥 Clients: ${clientCount}`);
-        console.log(`📊 Data:`, JSON.stringify(data, null, 2));
+        this.io.to(`vehicle_${vehicleId}`).emit(eventName, data);
 
-        this.io.to(room).emit(eventName, data);
-
-        console.log(`✅ Event '${eventName}' emitted to room: ${room}`);
-        console.log(`==========================================\n`);
-
+        logger.info(`🚨 '${eventName}' → vehicle ${vehicleId} | ${clientCount} client(s)`);
         return true;
     }
 
     /**
-     * Get Socket.IO instance
-     * @returns {Object}
+     * Emit payment update to a specific user room.
+     * Called by paygateWebhook after the webhook confirms SUCCESS or FAILED.
+     * Flutter's PaymentPendingScreen listens for 'payment_update' and reacts.
+     *
+     * @param {number} userId
+     * @param {'SUCCESS'|'FAILED'} status
+     * @param {number} paymentId
+     * @param {number} vehicleId
      */
+    emitPaymentUpdate(userId, status, paymentId, vehicleId) {
+        if (!this.io) {
+            logger.warn('⚠️ Socket.IO not initialized — skipping payment emission');
+            return false;
+        }
+
+        const payload = {
+            status,
+            payment_id: paymentId,
+            vehicle_id: vehicleId,
+            timestamp:  new Date().toISOString(),
+        };
+
+        this.io.to(`user_${userId}`).emit('payment_update', payload);
+
+        logger.info(
+            `💳 payment_update → user_${userId} | ` +
+            `status=${status} | payment=${paymentId} | vehicle=${vehicleId}`
+        );
+
+        return true;
+    }
+
+    // ==================== INTROSPECTION ====================
+
     getIO() {
         if (!this.io) {
-            throw new Error('Socket.IO not initialized. Call initialize(server) first.');
+            throw new Error('Socket.IO not initialized. Call initialize(io) first.');
         }
         return this.io;
     }
 
-    /**
-     * Check if Socket.IO is initialized
-     * @returns {Boolean}
-     */
     isInitialized() {
         return this.io !== null;
     }
 
-    /**
-     * Get number of clients tracking a specific vehicle
-     * @param {Number} vehicleId
-     * @returns {Number}
-     */
     getClientCount(vehicleId) {
         return this.connectedClients.get(vehicleId)?.size || 0;
     }
 
-    /**
-     * Check if anyone is tracking a specific vehicle
-     * @param {Number} vehicleId
-     * @returns {Boolean}
-     */
     isVehicleBeingTracked(vehicleId) {
-        return this.connectedClients.has(vehicleId) && this.connectedClients.get(vehicleId).size > 0;
+        return this.connectedClients.has(vehicleId) &&
+            this.connectedClients.get(vehicleId).size > 0;
     }
 
-    /**
-     * Get all tracked vehicles
-     * @returns {Array<Number>}
-     */
     getTrackedVehicles() {
         return Array.from(this.connectedClients.keys());
     }
 
-
     getStats() {
         return {
             totalConnections: this.io ? this.io.engine.clientsCount : 0,
-            trackedVehicles: this.connectedClients.size,
-            vehicleDetails: Array.from(this.connectedClients.entries()).map(([vehicleId, clients]) => ({
-                vehicleId,
-                clientCount: clients.size
-            }))
+            trackedVehicles:  this.connectedClients.size,
+            vehicleDetails:   Array.from(this.connectedClients.entries()).map(
+                ([vehicleId, clients]) => ({ vehicleId, clientCount: clients.size })
+            )
         };
     }
 }
 
-// Export singleton instance
 module.exports = new SocketService();

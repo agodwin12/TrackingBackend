@@ -1,22 +1,40 @@
+// routes/tripRoutes.js
 const express = require("express");
 const router = express.Router();
 const tripController = require("../controllers/tripController");
 const TripDetectionCron = require("../jobs/tripDetectionCron");
+const authMiddleware = require("../middleware/authMiddleware");
+const { requireFeature, FEATURES } = require("../middleware/subscriptionMiddleware");
 
 // ========================================
 // SPECIFIC ROUTES FIRST (before parameters)
 // ========================================
 
-// Get all trips
-router.get("/trips", tripController.getAllTrips);
+// All trips — vehicle_id comes from query string (?vehicleId=X), gated per-request
+router.get(
+    "/trips",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getAllTrips
+);
 
-// Get trips for a specific vehicle
-router.get("/trips/vehicle/:vehicleId", tripController.getVehicleTrips);
+// Trips for a specific vehicle
+router.get(
+    "/trips/vehicle/:vehicleId",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getVehicleTrips
+);
 
-// Get trip statistics for a specific vehicle
-router.get("/trips/vehicle/:vehicleId/stats", tripController.getVehicleTripStats);
+// Trip stats for a specific vehicle
+router.get(
+    "/trips/vehicle/:vehicleId/stats",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getVehicleTripStats
+);
 
-// Manual trip detection trigger
+// Manual trip detection trigger — internal/admin use, no feature gate
 router.post("/trips/detect", async (req, res) => {
     try {
         const result = await TripDetectionCron.runManually();
@@ -34,16 +52,32 @@ router.post("/trips/detect", async (req, res) => {
 // PARAMETER ROUTES LAST (after specific routes)
 // ========================================
 
-// ✅ FIXED: Changed from /details to /details-with-route
-router.get("/trips/:tripId/details-with-route", tripController.getTripDetailsWithRoute);
+router.get(
+    "/trips/:tripId/details-with-route",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getTripDetailsWithRoute
+);
 
-// Get basic trip details
-router.get("/trips/:tripId", tripController.getTripDetails);
+router.get(
+    "/trips/:tripId",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getTripDetails
+);
 
-// Get trip route waypoints only
-router.get("/trips/:tripId/route", tripController.getTripRoute);
+router.get(
+    "/trips/:tripId/route",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.getTripRoute
+);
 
-// Delete a trip
-router.delete("/trips/:tripId", tripController.deleteTrip);
+router.delete(
+    "/trips/:tripId",
+    authMiddleware,
+    requireFeature(FEATURES.TRIP_HISTORY),
+    tripController.deleteTrip
+);
 
 module.exports = router;

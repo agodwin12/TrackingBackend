@@ -21,12 +21,12 @@ const GPS_MAP_TYPE = process.env.GPS_MAP_TYPE || "WGS84";
 // ==============================
 const GPS_ACCOUNTS = {
     tracking: {
-        loginName: process.env.GPS_LOGIN_NAME_1 || "Proxym_tracking",
-        loginPassword: process.env.GPS_LOGIN_PASSWORD_1 || "proxym123",
+        loginName: process.env.GPS_LOGIN_NAME_1 ,
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_1 ,
     },
     mobility: {
-        loginName: process.env.GPS_LOGIN_NAME_2 || "PROXYM",
-        loginPassword: process.env.GPS_LOGIN_PASSWORD_2 || "Proxym2024.",
+        loginName: process.env.GPS_LOGIN_NAME_2,
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_2 ,
     },
 };
 

@@ -1,163 +1,64 @@
 // controllers/pinController.js
-const User = require('../models/userModel');
+const User   = require('../models/userModel');
+const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const logger = require('../utils/logger');
+
+const BCRYPT_ROUNDS = 10;
+
+// PIN must be exactly 4 digits
+const isValidPin = (pin) => /^\d{4}$/.test(pin);
+
+// SHA-256 hash — used only for legacy comparison during lazy migration
+const sha256 = (pin) => crypto.createHash('sha256').update(pin).digest('hex');
+
+// SHA-256 hashes are always 64 lowercase hex chars — bcrypt hashes start with '$2'
+const isLegacyHash = (hash) => /^[a-f0-9]{64}$/.test(hash);
 
 /**
- * Hash PIN using SHA-256
+ * Verify a PIN against the stored hash.
+ * Option B lazy migration: if the stored hash is SHA-256, verify with
+ * SHA-256 — on match, immediately re-hash with bcrypt and persist.
+ * Returns { match: boolean, migrated: boolean }
  */
-const hashPin = (pin) => {
-    return crypto.createHash('sha256').update(pin).digest('hex');
+const verifyAndMigratePin = async (user, pin) => {
+    const stored = user.pin_hash;
+
+    if (isLegacyHash(stored)) {
+        // Legacy SHA-256 path
+        if (sha256(pin) !== stored) {
+            return { match: false, migrated: false };
+        }
+        // Correct — upgrade to bcrypt silently
+        user.pin_hash = await bcrypt.hash(pin, BCRYPT_ROUNDS);
+        await user.save();
+        logger.info(`🔐 PIN migrated from SHA-256 to bcrypt for user ${user.id}`);
+        return { match: true, migrated: true };
+    }
+
+    // Normal bcrypt path
+    const match = await bcrypt.compare(pin, stored);
+    return { match, migrated: false };
 };
 
-/**
- * Validate PIN format (must be exactly 4 digits)
- */
-const isValidPin = (pin) => {
-    return /^\d{4}$/.test(pin);
-};
+// =====================================================
+// IDOR FIX — enforce ownership on all PIN endpoints
+// userId is taken from the verified JWT (req.user.id),
+// never from the request body or params.
+// =====================================================
 
-/**
- * =====================================================
- * CREATE OR UPDATE PIN
- * POST /api/pin/set
- * Body: { userId, pin }
- * =====================================================
- */
+// POST /api/pin/set
 exports.setPin = async (req, res) => {
     try {
-        const { userId, pin } = req.body;
+        const userId = req.user.id; // FIXED: from JWT, not req.body
+        const { pin } = req.body;
 
-        // Validate inputs
-        if (!userId || !pin) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID and PIN are required'
-            });
+        if (!pin) {
+            return res.status(400).json({ success: false, message: 'PIN is required' });
         }
 
-        // Validate PIN format
         if (!isValidPin(pin)) {
-            return res.status(400).json({
-                success: false,
-                message: 'PIN must be exactly 4 digits'
-            });
-        }
-
-        // Find user
-        const user = await User.findByPk(userId);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
-        }
-
-        // Hash and save PIN
-        const pinHash = hashPin(pin);
-        user.pin_hash = pinHash;
-        await user.save();
-
-        console.log(`✅ PIN set for user ${userId}`);
-
-        return res.status(200).json({
-            success: true,
-            message: 'PIN created successfully'
-        });
-
-    } catch (error) {
-        console.error('❌ Error setting PIN:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error setting PIN',
-            error: error.message
-        });
-    }
-};
-
-/**
- * =====================================================
- * VERIFY PIN
- * POST /api/pin/verify
- * Body: { userId, pin }
- * =====================================================
- */
-exports.verifyPin = async (req, res) => {
-    try {
-        const { userId, pin } = req.body;
-
-        // Validate inputs
-        if (!userId || !pin) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID and PIN are required'
-            });
-        }
-
-        // Validate PIN format
-        if (!isValidPin(pin)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid PIN format'
-            });
-        }
-
-        // Find user
-        const user = await User.findByPk(userId);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
-        }
-
-        // Check if PIN is set
-        if (!user.pin_hash) {
-            return res.status(404).json({
-                success: false,
-                message: 'No PIN set for this user'
-            });
-        }
-
-        // Verify PIN
-        const pinHash = hashPin(pin);
-        const isCorrect = pinHash === user.pin_hash;
-
-        if (isCorrect) {
-            console.log(`✅ PIN verified for user ${userId}`);
-            return res.status(200).json({
-                success: true,
-                message: 'PIN is correct'
-            });
-        } else {
-            console.log(`❌ Wrong PIN for user ${userId}`);
-            return res.status(401).json({
-                success: false,
-                message: 'Incorrect PIN'
-            });
-        }
-
-    } catch (error) {
-        console.error('❌ Error verifying PIN:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error verifying PIN',
-            error: error.message
-        });
-    }
-};
-
-/**
- * =====================================================
- * CHECK IF PIN EXISTS
- * GET /api/pin/exists/:userId
- * =====================================================
- */
-exports.checkPinExists = async (req, res) => {
-    try {
-        const { userId } = req.params;
-
-        if (!userId) {
-            return res.status(400).json({ success: false, message: 'User ID is required' });
+            return res.status(400).json({ success: false, message: 'PIN must be exactly 4 digits' });
         }
 
         const user = await User.findByPk(userId);
@@ -165,140 +66,144 @@ exports.checkPinExists = async (req, res) => {
             return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        const raw = user.pin_hash; // can be null / '' / 'null' / '   '
-        const normalized = (raw ?? '').toString().trim().toLowerCase();
+        // Hash with bcrypt
+        user.pin_hash = await bcrypt.hash(pin, BCRYPT_ROUNDS);
+        await user.save();
 
-        const hasPinSet =
+        logger.info(`✅ PIN set for user ${userId}`);
+        return res.status(200).json({ success: true, message: 'PIN created successfully' });
+
+    } catch (error) {
+        logger.error('❌ Error setting PIN:', error.message);
+        return res.status(500).json({ success: false, message: 'Error setting PIN' });
+    }
+};
+
+// POST /api/pin/verify
+exports.verifyPin = async (req, res) => {
+    try {
+        const userId = req.user.id; // FIXED: from JWT, not req.body
+        const { pin } = req.body;
+
+        if (!pin) {
+            return res.status(400).json({ success: false, message: 'PIN is required' });
+        }
+
+        if (!isValidPin(pin)) {
+            return res.status(400).json({ success: false, message: 'Invalid PIN format' });
+        }
+
+        const user = await User.findByPk(userId);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+
+        if (!user.pin_hash) {
+            return res.status(404).json({ success: false, message: 'No PIN set for this user' });
+        }
+
+        const { match } = await verifyAndMigratePin(user, pin);
+
+        if (match) {
+            logger.info(`✅ PIN verified for user ${userId}`);
+            return res.status(200).json({ success: true, message: 'PIN is correct' });
+        }
+
+        logger.warn(`❌ Wrong PIN attempt for user ${userId}`);
+        return res.status(401).json({ success: false, message: 'Incorrect PIN' });
+
+    } catch (error) {
+        logger.error('❌ Error verifying PIN:', error.message);
+        return res.status(500).json({ success: false, message: 'Error verifying PIN' });
+    }
+};
+
+// GET /api/pin/exists
+exports.checkPinExists = async (req, res) => {
+    try {
+        const userId = req.user.id; // FIXED: from JWT, not req.params
+
+        const user = await User.findByPk(userId);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+
+        const raw        = user.pin_hash;
+        const normalized = (raw ?? '').toString().trim().toLowerCase();
+        const hasPinSet  =
             normalized.length > 0 &&
             normalized !== 'null' &&
             normalized !== 'undefined';
 
-        return res.status(200).json({
-            success: true,
-            userId: user.id,
-            pinHashPreview: raw ? raw.substring(0, 8) + '...' : null, // debug
-            hasPinSet,
-        });
+        // FIXED: removed pinHashPreview debug field — leaks internal hash format
+        return res.status(200).json({ success: true, hasPinSet });
+
     } catch (error) {
-        console.error('❌ Error checking PIN existence:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error checking PIN',
-            error: error.message,
-        });
+        logger.error('❌ Error checking PIN existence:', error.message);
+        return res.status(500).json({ success: false, message: 'Error checking PIN' });
     }
 };
-/**
- * =====================================================
- * DELETE PIN
- * DELETE /api/pin/delete/:userId
- * (Called on logout)
- * =====================================================
- */
+
+// DELETE /api/pin/delete
 exports.deletePin = async (req, res) => {
     try {
-        const { userId } = req.params;
+        const userId = req.user.id; // FIXED: from JWT, not req.params
 
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID is required'
-            });
-        }
-
-        // Find user
         const user = await User.findByPk(userId);
         if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        // Delete PIN
         user.pin_hash = null;
         await user.save();
 
-        console.log(`✅ PIN deleted for user ${userId}`);
-
-        return res.status(200).json({
-            success: true,
-            message: 'PIN deleted successfully'
-        });
+        logger.info(`✅ PIN deleted for user ${userId}`);
+        return res.status(200).json({ success: true, message: 'PIN deleted successfully' });
 
     } catch (error) {
-        console.error('❌ Error deleting PIN:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error deleting PIN',
-            error: error.message
-        });
+        logger.error('❌ Error deleting PIN:', error.message);
+        return res.status(500).json({ success: false, message: 'Error deleting PIN' });
     }
 };
 
-/**
- * =====================================================
- * CHANGE PIN
- * POST /api/pin/change
- * Body: { userId, oldPin, newPin }
- * =====================================================
- */
+// POST /api/pin/change
 exports.changePin = async (req, res) => {
     try {
-        const { userId, oldPin, newPin } = req.body;
+        const userId           = req.user.id; // FIXED: from JWT, not req.body
+        const { oldPin, newPin } = req.body;
 
-        // Validate inputs
-        if (!userId || !oldPin || !newPin) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID, old PIN, and new PIN are required'
-            });
+        if (!oldPin || !newPin) {
+            return res.status(400).json({ success: false, message: 'Old PIN and new PIN are required' });
         }
 
-        // Validate PIN formats
         if (!isValidPin(oldPin) || !isValidPin(newPin)) {
-            return res.status(400).json({
-                success: false,
-                message: 'PINs must be exactly 4 digits'
-            });
+            return res.status(400).json({ success: false, message: 'PINs must be exactly 4 digits' });
         }
 
-        // Find user
+        if (oldPin === newPin) {
+            return res.status(400).json({ success: false, message: 'New PIN must differ from old PIN' });
+        }
+
         const user = await User.findByPk(userId);
         if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        // Verify old PIN
-        const oldPinHash = hashPin(oldPin);
-        if (oldPinHash !== user.pin_hash) {
-            return res.status(401).json({
-                success: false,
-                message: 'Old PIN is incorrect'
-            });
+        // Verify old PIN (handles legacy SHA-256 migration too)
+        const { match } = await verifyAndMigratePin(user, oldPin);
+        if (!match) {
+            return res.status(401).json({ success: false, message: 'Old PIN is incorrect' });
         }
 
-        // Set new PIN
-        const newPinHash = hashPin(newPin);
-        user.pin_hash = newPinHash;
+        // Hash new PIN with bcrypt
+        user.pin_hash = await bcrypt.hash(newPin, BCRYPT_ROUNDS);
         await user.save();
 
-        console.log(`✅ PIN changed for user ${userId}`);
-
-        return res.status(200).json({
-            success: true,
-            message: 'PIN changed successfully'
-        });
+        logger.info(`✅ PIN changed for user ${userId}`);
+        return res.status(200).json({ success: true, message: 'PIN changed successfully' });
 
     } catch (error) {
-        console.error('❌ Error changing PIN:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error changing PIN',
-            error: error.message
-        });
+        logger.error('❌ Error changing PIN:', error.message);
+        return res.status(500).json({ success: false, message: 'Error changing PIN' });
     }
 };

@@ -1,13 +1,27 @@
+// routes/vehicleRoutes.js
 const express = require("express");
 const router = express.Router();
 const vehicleController = require("../controllers/vehicleController");
+const authMiddleware = require("../middleware/authMiddleware");
+const { requireFeature, FEATURES } = require("../middleware/subscriptionMiddleware");
 
-router.get("/vehicle/:userId", vehicleController.getVehicleDetails);
+// Base vehicle details — no feature gate, all subscribers can see their vehicle
+router.get("/vehicle/:userId", authMiddleware, vehicleController.getVehicleDetails);
 
-// ✅ CHANGE THIS LINE - add "vehicle/" prefix to match the pattern above
-router.get("/vehicle/:vehicleId/engine-status", vehicleController.getEngineStatus);
+// Engine status — requires engine control feature
+router.get(
+    "/vehicle/:vehicleId/engine-status",
+    authMiddleware,
+    requireFeature(FEATURES.ENGINE_CONTROL),
+    vehicleController.getEngineStatus
+);
 
-
-router.post("/vehicle/:vehicleId/force-gps-update", vehicleController.forceGPSUpdate);
+// Force GPS update — requires live tracking feature
+router.post(
+    "/vehicle/:vehicleId/force-gps-update",
+    authMiddleware,
+    requireFeature(FEATURES.LIVE_TRACKING),
+    vehicleController.forceGPSUpdate
+);
 
 module.exports = router;

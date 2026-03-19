@@ -31,6 +31,11 @@ const paygate = require('./routes/payGate.routes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const { handlePaygateWebhook } = require('./webhooks/paygateWebhook');
 
+// ⚠️  DEV ONLY — not imported in production
+if (process.env.NODE_ENV !== 'production') {
+    var devRoutes = require('./routes/devRoutes');
+}
+
 // ========== EXPRESS APP SETUP ==========
 const app = express();
 
@@ -154,6 +159,12 @@ app.get('/health', (req, res) => {
         environment: process.env.NODE_ENV || 'development'
     });
 });
+
+// ⚠️  DEV ONLY — registered first so it is never intercepted by auth middleware
+// on other /api routes
+if (process.env.NODE_ENV !== 'production') {
+    app.use('/api/dev', devRoutes);
+}
 
 // ========== API ROUTES ==========
 app.use('/api/auth', authRoutes);

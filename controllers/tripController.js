@@ -1,4 +1,4 @@
-// controllers/tripController.js - CLEAN LARAVEL-STYLE (WORKING)
+// controllers/tripController.js
 const { Op } = require("sequelize");
 const Trip = require("../models/trip");
 const Location = require("../models/location");
@@ -11,55 +11,74 @@ const axios = require("axios");
 const TRIP_CACHE_TTL = 300;
 const EMPTY_RESULT_TTL = 60;
 
-// Limits (matching Laravel)
+// Limits
 const MAX_WAYPOINTS_FOR_MAP = 1500;
 const MAX_WAYPOINTS_FOR_FOCUS = 20000;
 const MAX_DB_ROWS = 20000;
 const MAX_DB_ROWS_FOCUS = 120000;
 const STATS_TRIP_LIMIT = 1000;
 
-// ==================== ADDRESS HANDLING ====================
+// ==================== DATE PARSING ====================
 
 /**
- * Smart address formatter with city fallback
- * Priority: Street > City > Coordinates
+ * Parse a date-only string (e.g. "2026-03-12") as the START of that day
+ * in local time (WAT = UTC+1), returning a plain JS Date that Sequelize
+ * will compare correctly against sys_time values stored as local WAT timestamps.
+ *
+ * new Date("2026-03-12") parses as UTC midnight → wrong for WAT-stored data.
+ * This helper instead builds "2026-03-12T00:00:00" without any timezone
+ * suffix, so the JS engine treats it as local time — matching the DB values.
  */
+function parseLocalDayStart(dateStr) {
+    if (!dateStr) return null;
+    // Accept "yyyy-MM-dd" or already a full ISO string
+    const datePart = dateStr.split("T")[0]; // strip time if present
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
+    const d = new Date(`${datePart}T00:00:00`);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * Parse a date-only string as the END of that day in local time (23:59:59).
+ */
+function parseLocalDayEnd(dateStr) {
+    if (!dateStr) return null;
+    const datePart = dateStr.split("T")[0];
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
+    const d = new Date(`${datePart}T23:59:59`);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+// ==================== ADDRESS HANDLING ====================
+
 function formatAddress(address, addressStatus, latitude, longitude) {
-    // If we have a good geocoded address
-    if (addressStatus === 'geocoded' && address &&
-        address !== 'Unknown location' &&
-        address !== 'Geocoding...' &&
-        !address.includes('°')) {
+    if (
+        addressStatus === "geocoded" &&
+        address &&
+        address !== "Unknown location" &&
+        address !== "Geocoding..." &&
+        !address.includes("°")
+    ) {
         return address;
     }
 
-    // If geocoding is pending
-    if (addressStatus === 'pending') {
-        return 'Geocoding...';
+    if (addressStatus === "pending") {
+        return "Geocoding...";
     }
 
-    // Fallback to coordinates
     if (latitude && longitude) {
         return `${parseFloat(latitude).toFixed(6)}°, ${parseFloat(longitude).toFixed(6)}°`;
     }
 
-    return 'Unknown location';
+    return "Unknown location";
 }
 
-/**
- * Extract city name from full address
- * Examples:
- * "Avenue de la Liberation, Douala, Cameroon" => "Douala"
- * "123 Main St, Yaounde" => "Yaounde"
- */
 function extractCityFromAddress(fullAddress) {
-    if (!fullAddress || fullAddress.includes('°')) return null;
+    if (!fullAddress || fullAddress.includes("°")) return null;
 
-    const parts = fullAddress.split(',').map(p => p.trim());
+    const parts = fullAddress.split(",").map((p) => p.trim());
 
-    // Usually city is second-to-last or last part
     if (parts.length >= 2) {
-        // Try second-to-last (usually city before country)
         const cityCandidate = parts[parts.length - 2];
         if (cityCandidate && cityCandidate.length > 2 && !cityCandidate.match(/^\d/)) {
             return cityCandidate;
@@ -67,7 +86,6 @@ function extractCityFromAddress(fullAddress) {
     }
 
     if (parts.length >= 1) {
-        // Fallback to last part
         const lastPart = parts[parts.length - 1];
         if (lastPart && lastPart.length > 2 && !lastPart.match(/^\d/)) {
             return lastPart;
@@ -78,49 +96,73 @@ function extractCityFromAddress(fullAddress) {
 }
 
 // ==================== CACHE FUNCTIONS ====================
+
 async function getCachedData(key) {
     try {
-        if (!redisClient.isConnected) return null;
+        if (!redisClient.isConnected) {
+            logger.warn(`[TRIP CACHE] Redis not connected, skipping GET for key=${key}`);
+            return null;
+        }
+
         const cached = await redisClient.get(key);
         if (cached) {
-            logger.debug(`✅ Cache HIT: ${key}`);
+            logger.debug(`[TRIP CACHE] HIT key=${key}`);
             return JSON.parse(cached);
         }
+
+        logger.debug(`[TRIP CACHE] MISS key=${key}`);
         return null;
     } catch (error) {
-        logger.error(`🔥 Redis GET error: ${error.message}`);
+        logger.error(`[TRIP CACHE] GET error key=${key} message=${error.message}`, {
+            stack: error.stack
+        });
         return null;
     }
 }
 
 async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
     try {
-        if (!redisClient.isConnected) return;
+        if (!redisClient.isConnected) {
+            logger.warn(`[TRIP CACHE] Redis not connected, skipping SET for key=${key}`);
+            return;
+        }
+
         await redisClient.setEx(key, ttl, JSON.stringify(data));
-        logger.debug(`✅ Cached: ${key}`);
+        logger.debug(`[TRIP CACHE] SET key=${key} ttl=${ttl}`);
     } catch (error) {
-        logger.error(`🔥 Redis SET error: ${error.message}`);
+        logger.error(`[TRIP CACHE] SET error key=${key} message=${error.message}`, {
+            stack: error.stack
+        });
     }
 }
 
 async function deleteCachedData(pattern) {
     try {
-        if (!redisClient.isConnected) return;
-        if (pattern.includes('*')) {
+        if (!redisClient.isConnected) {
+            logger.warn(`[TRIP CACHE] Redis not connected, skipping DELETE for pattern=${pattern}`);
+            return;
+        }
+
+        if (pattern.includes("*")) {
             const keys = await redisClient.keys(pattern);
+            logger.info(`[TRIP CACHE] DELETE pattern=${pattern} matchedKeys=${keys.length}`);
+
             if (keys.length > 0) {
                 await redisClient.del(...keys);
-                logger.info(`✅ Deleted ${keys.length} cached keys`);
             }
         } else {
             await redisClient.del(pattern);
+            logger.info(`[TRIP CACHE] DELETE key=${pattern}`);
         }
     } catch (error) {
-        logger.error(`🔥 Redis DELETE error: ${error.message}`);
+        logger.error(`[TRIP CACHE] DELETE error pattern=${pattern} message=${error.message}`, {
+            stack: error.stack
+        });
     }
 }
 
 // ==================== UTILITY FUNCTIONS ====================
+
 function formatDuration(minutes) {
     if (!minutes || minutes < 0) return "0 min";
     if (minutes < 60) return `${Math.round(minutes)} min`;
@@ -137,271 +179,294 @@ function formatDuration(minutes) {
     return `${hours}h ${mins}m`;
 }
 
-// ==================== LARAVEL-STYLE GPS TRACK BUILDING ====================
+function safeDate(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? null : d;
+}
 
-/**
- * ✅ CLEAN LARAVEL APPROACH: Simple, works perfectly
- * - Fetches raw GPS from locations table
- * - Only removes consecutive duplicates
- * - Simple step-based sampling
- * - NO aggressive filtering
- */
+function reqMeta(req) {
+    return {
+        method: req.method,
+        originalUrl: req.originalUrl,
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+        query: req.query,
+        params: req.params
+    };
+}
+
+// ==================== GPS TRACK BUILDING ====================
+
 async function fetchWaypointsFromLocations(trip, maxPoints = MAX_WAYPOINTS_FOR_MAP, maxDbRows = MAX_DB_ROWS) {
     try {
-        const mac = trip.mac_id_gps || trip.vehicle?.mac_id_gps;
-        if (!mac) {
-            logger.warn(`⚠️ Trip ${trip.id} has no mac_id_gps`);
-            return [];
-        }
+        logger.info(
+            `[TRIP WAYPOINTS] Start fetch tripId=${trip.id} vehicleId=${trip.vehicle_id || "n/a"} maxPoints=${maxPoints} maxDbRows=${maxDbRows}`
+        );
 
-        // ±2 minute buffer (Laravel style)
-        const startTime = new Date(trip.start_time);
-        const endTime = trip.end_time ? new Date(trip.end_time) : new Date(startTime.getTime() + 3 * 60 * 60 * 1000);
+        // Query trip_waypoints directly — this table is always populated by the
+        // detection service and is not affected by location cleanup or trip_id
+        // linking issues on the raw locations table.
+        const TripWaypoint = require("../models/tripWaypoint");
 
-        const startQuery = new Date(startTime.getTime() - 2 * 60 * 1000);
-        const endQuery = new Date(endTime.getTime() + 2 * 60 * 1000);
-
-        logger.debug(`📍 Fetching locations for trip ${trip.id}`);
-
-        // Fetch raw locations (Laravel equivalent)
-        const locations = await Location.findAll({
-            where: {
-                mac_id_gps: mac,
-                sys_time: {
-                    [Op.between]: [startQuery, endQuery]
-                },
-                latitude: {
-                    [Op.ne]: null,
-                    [Op.ne]: 0
-                },
-                longitude: {
-                    [Op.ne]: null,
-                    [Op.ne]: 0
-                }
-            },
-            attributes: ['latitude', 'longitude', 'sys_time', 'speed'],
-            order: [['sys_time', 'ASC']],
+        const rows = await TripWaypoint.findAll({
+            where: { trip_id: trip.id },
+            attributes: ["latitude", "longitude", "speed", "recorded_at", "sequence_order"],
+            order: [["sequence_order", "ASC"]],
             limit: maxDbRows,
             raw: true
         });
 
-        logger.info(`📍 Found ${locations.length} raw GPS points for trip ${trip.id}`);
+        logger.info(`[TRIP WAYPOINTS] Raw DB result tripId=${trip.id} waypointCount=${rows.length}`);
 
-        if (locations.length === 0) {
+        if (rows.length === 0) {
+            logger.warn(`[TRIP WAYPOINTS] No waypoints found in trip_waypoints for tripId=${trip.id}`);
             return [];
         }
 
-        // ✅ SIMPLE DEDUPLICATION (Laravel style - only consecutive duplicates)
+        // Filter out any invalid coordinates
         const points = [];
-        let prevKey = null;
+        let invalidCoordCount = 0;
 
-        for (const loc of locations) {
-            const lat = parseFloat(loc.latitude);
-            const lng = parseFloat(loc.longitude);
+        for (const row of rows) {
+            const lat = parseFloat(row.latitude);
+            const lng = parseFloat(row.longitude);
 
-            // Validate coordinates
             if (!lat || !lng || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+                invalidCoordCount++;
                 continue;
             }
-
-            // Create key with 6 decimal precision
-            const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
-
-            // Skip only if EXACTLY the same as previous point
-            if (key === prevKey) continue;
-            prevKey = key;
 
             points.push({
                 latitude: lat,
                 longitude: lng,
-                speed: parseFloat(loc.speed || 0),
-                recorded_at: loc.sys_time
+                speed: parseFloat(row.speed || 0),
+                recorded_at: row.recorded_at,
+                sequence_order: row.sequence_order
             });
         }
 
-        logger.info(`📍 After deduplication: ${locations.length} → ${points.length} points`);
+        if (invalidCoordCount > 0) {
+            logger.warn(`[TRIP WAYPOINTS] Skipped ${invalidCoordCount} invalid coordinates for tripId=${trip.id}`);
+        }
 
-        // ✅ SIMPLE SAMPLING (Laravel style - step-based)
+        // Downsample if over the maxPoints cap
         let finalPoints = points;
+        let samplingStep = 1;
 
         if (points.length > maxPoints) {
-            const step = Math.ceil(points.length / maxPoints);
+            samplingStep = Math.ceil(points.length / maxPoints);
             const reduced = [];
 
-            // Sample with step
-            for (let i = 0; i < points.length; i += step) {
+            for (let i = 0; i < points.length; i += samplingStep) {
                 reduced.push(points[i]);
             }
 
-            // Always include last point
+            // Always include the last point
             const lastPoint = points[points.length - 1];
             if (reduced.length === 0 || reduced[reduced.length - 1] !== lastPoint) {
                 reduced.push(lastPoint);
             }
 
             finalPoints = reduced;
-            logger.info(`📊 Sampled: ${points.length} → ${finalPoints.length} points (step=${step})`);
         }
 
-        // Add sequence order
+        logger.info(
+            `[TRIP WAYPOINTS] Final tripId=${trip.id} returned=${finalPoints.length} sampled=${points.length > maxPoints} step=${samplingStep}`
+        );
+
         return finalPoints.map((point, index) => ({
             ...point,
             sequence_order: index + 1
         }));
 
     } catch (error) {
-        logger.error(`🔥 Error fetching waypoints for trip ${trip.id}:`, error);
+        logger.error(`[TRIP WAYPOINTS] Error fetching waypoints for tripId=${trip?.id || "unknown"} message=${error.message}`, {
+            tripId: trip?.id,
+            vehicleId: trip?.vehicle_id,
+            stack: error.stack
+        });
         return [];
     }
 }
 
 // ==================== OSRM ROAD SNAPPING ====================
 
-/**
- * ✅ Snap GPS waypoints to actual roads using OSRM (FREE!)
- * - Uses public OSRM server (or you can self-host)
- * - Returns road-following coordinates
- */
 async function snapToRoadsOSRM(waypoints) {
     try {
         if (!waypoints || waypoints.length < 2) {
-            logger.warn('⚠️ Need at least 2 waypoints for road snapping');
+            logger.warn(`[TRIP OSRM] Need at least 2 waypoints, got ${waypoints?.length || 0}`);
             return waypoints;
         }
 
-        // OSRM has a limit of ~100 coordinates per request
-        // If more points, we need to batch them
         const BATCH_SIZE = 100;
         let allSnappedPoints = [];
 
         for (let i = 0; i < waypoints.length; i += BATCH_SIZE - 1) {
             const batch = waypoints.slice(i, Math.min(i + BATCH_SIZE, waypoints.length));
-
-            // Build coordinates string: "lng,lat;lng,lat;..."
-            const coordinates = batch
-                .map(wp => `${wp.longitude},${wp.latitude}`)
-                .join(';');
-
-            // Call OSRM Match API (matches GPS trace to road network)
+            const coordinates = batch.map((wp) => `${wp.longitude},${wp.latitude}`).join(";");
             const url = `https://router.project-osrm.org/match/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`;
 
-            logger.debug(`🗺️ OSRM request: ${batch.length} points`);
+            logger.debug(`[TRIP OSRM] Request batchIndex=${Math.floor(i / BATCH_SIZE) + 1} batchSize=${batch.length}`);
 
             const response = await axios.get(url, { timeout: 10000 });
 
-            if (response.data.code !== 'Ok' || !response.data.matchings || response.data.matchings.length === 0) {
-                logger.warn('⚠️ OSRM matching failed, using GPS waypoints');
+            if (
+                response.data.code !== "Ok" ||
+                !response.data.matchings ||
+                response.data.matchings.length === 0
+            ) {
+                logger.warn(`[TRIP OSRM] Matching failed for batch, using original GPS points`, {
+                    code: response.data.code
+                });
                 allSnappedPoints.push(...batch);
                 continue;
             }
 
-            // Extract snapped coordinates from geometry
             const geometry = response.data.matchings[0].geometry;
-            const snappedCoords = geometry.coordinates; // [lng, lat] pairs
+            const snappedCoords = geometry.coordinates;
 
             const snappedWaypoints = snappedCoords.map((coord, index) => ({
                 latitude: coord[1],
                 longitude: coord[0],
-                speed: 0, // OSRM doesn't return speed
+                speed: 0,
                 recorded_at: new Date(),
                 sequence_order: allSnappedPoints.length + index + 1
             }));
 
             allSnappedPoints.push(...snappedWaypoints);
 
-            logger.info(`✅ OSRM batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} → ${snappedWaypoints.length} road points`);
+            logger.info(
+                `[TRIP OSRM] Batch success batchIndex=${Math.floor(i / BATCH_SIZE) + 1} input=${batch.length} output=${snappedWaypoints.length}`
+            );
         }
 
-        logger.info(`✅ Total OSRM snapping: ${waypoints.length} → ${allSnappedPoints.length} road points`);
+        logger.info(`[TRIP OSRM] Total snapping input=${waypoints.length} output=${allSnappedPoints.length}`);
         return allSnappedPoints;
-
     } catch (error) {
-        logger.error('🔥 OSRM road snapping error:', error.message);
-        // Return original waypoints on error
+        logger.error(`[TRIP OSRM] Error message=${error.message}`, {
+            stack: error.stack
+        });
         return waypoints;
     }
 }
 
 // ==================== API ENDPOINTS ====================
 
-/**
- * Get trips for a specific vehicle
- * GET /api/trips/vehicle/:vehicleId
- */
 exports.getVehicleTrips = async (req, res) => {
     try {
         const { vehicleId } = req.params;
         const { startDate, endDate, page = 1, limit = 50 } = req.query;
 
-        logger.info(`ℹ️ Fetching trips for vehicle: ${vehicleId}`);
+        logger.info(`[GET VEHICLE TRIPS] Incoming request`, reqMeta(req));
 
         if (!vehicleId || isNaN(vehicleId)) {
+            logger.warn(`[GET VEHICLE TRIPS] Invalid vehicle ID: ${vehicleId}`);
             return res.status(400).json({
                 success: false,
                 message: "Invalid vehicle ID"
             });
         }
 
-        const cacheKey = `trips:vehicle:${vehicleId}:page:${page}:limit:${limit}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
+        const cacheKey = `trips:vehicle:${vehicleId}:page:${page}:limit:${limit}:start:${startDate || "none"}:end:${endDate || "none"}`;
 
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
-            logger.info(`✅ Returning cached trips for vehicle ${vehicleId}`);
+            logger.info(`[GET VEHICLE TRIPS] Returning cached response vehicleId=${vehicleId}`);
             return res.json(cachedData);
         }
 
         const vehicle = await Voiture.findByPk(vehicleId, {
-            attributes: ['id']
+            attributes: ["id", "immatriculation", "mac_id_gps"]
         });
 
         if (!vehicle) {
-            logger.warn(`⚠️ Vehicle not found: ${vehicleId}`);
+            logger.warn(`[GET VEHICLE TRIPS] Vehicle not found vehicleId=${vehicleId}`);
             return res.status(404).json({
                 success: false,
                 message: "Vehicle not found"
             });
         }
 
+        logger.info(`[GET VEHICLE TRIPS] Vehicle found`, {
+            id: vehicle.id,
+            immatriculation: vehicle.immatriculation,
+            mac_id_gps: vehicle.mac_id_gps
+        });
+
         const whereClause = {
             vehicle_id: vehicleId,
-            status: 'completed'
+            status: "completed"
         };
 
         if (startDate || endDate) {
             whereClause.start_time = {};
+
             if (startDate) {
-                whereClause.start_time[Op.gte] = new Date(startDate);
+                const parsedStart = parseLocalDayStart(startDate);
+                logger.info(`[GET VEHICLE TRIPS] Parsed startDate raw=${startDate} parsed=${parsedStart?.toLocaleString() || "invalid"}`);
+                if (!parsedStart) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid startDate — expected yyyy-MM-dd"
+                    });
+                }
+                whereClause.start_time[Op.gte] = parsedStart;
             }
+
             if (endDate) {
-                const endDatePlusOne = new Date(endDate);
-                endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-                whereClause.start_time[Op.lt] = endDatePlusOne;
+                const parsedEnd = parseLocalDayEnd(endDate);
+                logger.info(`[GET VEHICLE TRIPS] Parsed endDate raw=${endDate} parsed=${parsedEnd?.toLocaleString() || "invalid"}`);
+                if (!parsedEnd) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid endDate — expected yyyy-MM-dd"
+                    });
+                }
+                whereClause.start_time[Op.lte] = parsedEnd;
+                logger.info(`[GET VEHICLE TRIPS] endDate inclusive upper bound=${parsedEnd.toLocaleString()}`);
             }
         }
 
+        logger.info(`[GET VEHICLE TRIPS] Final whereClause`, whereClause);
+
         const offset = (page - 1) * limit;
+
         const result = await Trip.findAndCountAll({
             where: whereClause,
             include: [{
                 model: Voiture,
-                as: 'vehicle',
-                attributes: ['immatriculation', 'marque', 'model', 'couleur']
+                as: "vehicle",
+                attributes: ["immatriculation", "marque", "model", "couleur"]
             }],
-            order: [['start_time', 'DESC']],
+            order: [["start_time", "DESC"]],
             limit: parseInt(limit),
             offset: parseInt(offset)
         });
 
-        logger.info(`✅ Fetched ${result.rows.length} trips for vehicle ${vehicleId}`);
+        logger.info(
+            `[GET VEHICLE TRIPS] Query result vehicleId=${vehicleId} count=${result.count} returnedRows=${result.rows.length} page=${page} limit=${limit} offset=${offset}`
+        );
 
-        const trips = result.rows.map(t => ({
+        if (result.rows.length > 0) {
+            logger.info(`[GET VEHICLE TRIPS] Returned trip boundary IDs`, {
+                firstTripId: result.rows[0].id,
+                firstTripStart: result.rows[0].start_time,
+                lastTripId: result.rows[result.rows.length - 1].id,
+                lastTripStart: result.rows[result.rows.length - 1].start_time
+            });
+        } else {
+            logger.warn(`[GET VEHICLE TRIPS] No trips found for vehicleId=${vehicleId} with requested filters`);
+        }
+
+        const trips = result.rows.map((t) => ({
             id: t.id,
             vehicleId: t.vehicle_id,
             vehicleInfo: {
-                immatriculation: t.vehicle.immatriculation,
-                marque: t.vehicle.marque,
-                model: t.vehicle.model,
-                couleur: t.vehicle.couleur
+                immatriculation: t.vehicle?.immatriculation,
+                marque: t.vehicle?.marque,
+                model: t.vehicle?.model,
+                couleur: t.vehicle?.couleur
             },
             startTime: t.start_time,
             endTime: t.end_time,
@@ -435,6 +500,7 @@ exports.getVehicleTrips = async (req, res) => {
         }));
 
         const totalPages = Math.ceil(result.count / limit);
+
         const responseData = {
             success: true,
             data: {
@@ -451,29 +517,29 @@ exports.getVehicleTrips = async (req, res) => {
         };
 
         await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getVehicleTrips:", error);
-        res.status(500).json({
+        logger.error(`[GET VEHICLE TRIPS] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch vehicle trips",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
 
-/**
- * Get trip details by ID
- * GET /api/trips/:tripId
- */
 exports.getTripDetails = async (req, res) => {
     try {
         const { tripId } = req.params;
 
-        logger.info(`ℹ️ Fetching trip details: ${tripId}`);
+        logger.info(`[GET TRIP DETAILS] Incoming request`, reqMeta(req));
 
         if (!tripId || isNaN(tripId)) {
+            logger.warn(`[GET TRIP DETAILS] Invalid trip ID: ${tripId}`);
             return res.status(400).json({
                 success: false,
                 message: "Invalid trip ID"
@@ -481,28 +547,37 @@ exports.getTripDetails = async (req, res) => {
         }
 
         const cacheKey = `trip:details:${tripId}`;
-
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
-            logger.info(`✅ Returning cached trip details for ${tripId}`);
+            logger.info(`[GET TRIP DETAILS] Returning cached response tripId=${tripId}`);
             return res.json(cachedData);
         }
 
         const trip = await Trip.findByPk(tripId, {
             include: [{
                 model: Voiture,
-                as: 'vehicle',
-                attributes: ['id', 'immatriculation', 'marque', 'model', 'couleur', 'photo', 'mac_id_gps']
+                as: "vehicle",
+                attributes: ["id", "immatriculation", "marque", "model", "couleur", "photo", "mac_id_gps"]
             }]
         });
 
         if (!trip) {
-            logger.warn(`⚠️ Trip not found: ${tripId}`);
+            logger.warn(`[GET TRIP DETAILS] Trip not found tripId=${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
             });
         }
+
+        logger.info(`[GET TRIP DETAILS] Trip found`, {
+            tripId: trip.id,
+            vehicleId: trip.vehicle_id,
+            start_time: trip.start_time,
+            end_time: trip.end_time,
+            status: trip.status,
+            mac_id_gps_trip: trip.mac_id_gps,
+            mac_id_gps_vehicle: trip.vehicle?.mac_id_gps
+        });
 
         const responseData = {
             success: true,
@@ -543,30 +618,30 @@ exports.getTripDetails = async (req, res) => {
         };
 
         await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getTripDetails:", error);
-        res.status(500).json({
+        logger.error(`[GET TRIP DETAILS] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch trip details",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
 
-/**
- * ✅ FIXED: Get trip route (clean Laravel style + OSRM)
- * GET /api/trips/:tripId/route
- */
 exports.getTripRoute = async (req, res) => {
     try {
         const { tripId } = req.params;
         const { maxPoints } = req.query;
 
-        logger.info(`ℹ️ Fetching trip route: ${tripId}`);
+        logger.info(`[GET TRIP ROUTE] Incoming request`, reqMeta(req));
 
         if (!tripId || isNaN(tripId)) {
+            logger.warn(`[GET TRIP ROUTE] Invalid trip ID: ${tripId}`);
             return res.status(400).json({
                 success: false,
                 message: "Invalid trip ID"
@@ -578,38 +653,48 @@ exports.getTripRoute = async (req, res) => {
 
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
-            logger.info(`✅ Returning cached route for trip ${tripId}`);
+            logger.info(`[GET TRIP ROUTE] Returning cached response tripId=${tripId}`);
             return res.json(cachedData);
         }
 
         const trip = await Trip.findByPk(tripId, {
-            attributes: ['id', 'start_time', 'end_time', 'mac_id_gps', 'total_distance_km', 'waypoint_count'],
+            attributes: ["id", "vehicle_id", "start_time", "end_time", "mac_id_gps", "total_distance_km", "waypoint_count"],
             include: [{
                 model: Voiture,
-                as: 'vehicle',
-                attributes: ['mac_id_gps']
+                as: "vehicle",
+                attributes: ["mac_id_gps"]
             }]
         });
 
         if (!trip) {
-            logger.warn(`⚠️ Trip not found: ${tripId}`);
+            logger.warn(`[GET TRIP ROUTE] Trip not found tripId=${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
             });
         }
 
-        // ✅ Fetch waypoints (clean Laravel style)
+        logger.info(`[GET TRIP ROUTE] Trip found`, {
+            tripId: trip.id,
+            vehicleId: trip.vehicle_id,
+            start_time: trip.start_time,
+            end_time: trip.end_time,
+            mac_id_gps_trip: trip.mac_id_gps,
+            mac_id_gps_vehicle: trip.vehicle?.mac_id_gps,
+            requestedMaxPoints: limit
+        });
+
         const waypoints = await fetchWaypointsFromLocations(trip, limit, MAX_DB_ROWS);
 
         if (waypoints.length === 0) {
+            logger.warn(`[GET TRIP ROUTE] No route data found tripId=${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "No route data found"
             });
         }
 
-        logger.info(`📍 Returning ${waypoints.length} clean GPS waypoints`);
+        logger.info(`[GET TRIP ROUTE] Returning route tripId=${tripId} waypointCount=${waypoints.length}`);
 
         const responseData = {
             success: true,
@@ -618,7 +703,7 @@ exports.getTripRoute = async (req, res) => {
                 waypointCount: waypoints.length,
                 sampledCount: waypoints.length,
                 isSampled: waypoints.length < MAX_WAYPOINTS_FOR_MAP,
-                route: waypoints.map(w => ({
+                route: waypoints.map((w) => ({
                     latitude: parseFloat(w.latitude),
                     longitude: parseFloat(w.longitude),
                     speed: parseFloat(w.speed),
@@ -639,30 +724,30 @@ exports.getTripRoute = async (req, res) => {
         };
 
         await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getTripRoute:", error);
-        res.status(500).json({
+        logger.error(`[GET TRIP ROUTE] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch trip route",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
 
-/**
- * ✅ FIXED: Get trip details with route (clean + OSRM snapping)
- * GET /api/trips/:tripId/details-with-route?snapToRoads=true
- */
 exports.getTripDetailsWithRoute = async (req, res) => {
     try {
         const { tripId } = req.params;
         const { maxPoints, snapToRoads } = req.query;
 
-        logger.info(`ℹ️ Fetching trip details with route: ${tripId}`);
+        logger.info(`[GET TRIP DETAILS WITH ROUTE] Incoming request`, reqMeta(req));
 
         if (!tripId || isNaN(tripId)) {
+            logger.warn(`[GET TRIP DETAILS WITH ROUTE] Invalid trip ID: ${tripId}`);
             return res.status(400).json({
                 success: false,
                 message: "Invalid trip ID"
@@ -670,43 +755,50 @@ exports.getTripDetailsWithRoute = async (req, res) => {
         }
 
         const limit = maxPoints ? parseInt(maxPoints) : MAX_WAYPOINTS_FOR_MAP;
-        const shouldSnapToRoads = snapToRoads === 'true' || snapToRoads === '1';
-
+        const shouldSnapToRoads = snapToRoads === "true" || snapToRoads === "1";
         const cacheKey = `trip:details-route:clean:${tripId}:limit:${limit}:snap:${shouldSnapToRoads}`;
 
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
-            logger.info(`✅ Returning cached trip details with route for ${tripId}`);
+            logger.info(`[GET TRIP DETAILS WITH ROUTE] Returning cached response tripId=${tripId}`);
             return res.json(cachedData);
         }
 
         const trip = await Trip.findByPk(tripId, {
             include: [{
                 model: Voiture,
-                as: 'vehicle',
-                attributes: ['id', 'immatriculation', 'marque', 'model', 'couleur', 'photo', 'mac_id_gps']
+                as: "vehicle",
+                attributes: ["id", "immatriculation", "marque", "model", "couleur", "photo", "mac_id_gps"]
             }]
         });
 
         if (!trip) {
-            logger.warn(`⚠️ Trip not found: ${tripId}`);
+            logger.warn(`[GET TRIP DETAILS WITH ROUTE] Trip not found tripId=${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
             });
         }
 
-        // ✅ Fetch clean GPS waypoints (Laravel style)
+        logger.info(`[GET TRIP DETAILS WITH ROUTE] Trip found`, {
+            tripId: trip.id,
+            vehicleId: trip.vehicle_id,
+            start_time: trip.start_time,
+            end_time: trip.end_time,
+            total_distance_km: trip.total_distance_km,
+            waypoint_count: trip.waypoint_count,
+            shouldSnapToRoads,
+            limit
+        });
+
         let waypoints = await fetchWaypointsFromLocations(trip, limit, MAX_DB_ROWS);
+        logger.info(`[GET TRIP DETAILS WITH ROUTE] Clean GPS waypoints fetched tripId=${tripId} count=${waypoints.length}`);
 
-        logger.info(`📍 Fetched ${waypoints.length} clean GPS waypoints`);
-
-        // 🗺️ OSRM Road Snapping (if requested)
         let finalRoute = waypoints;
         let snappingApplied = false;
 
         if (shouldSnapToRoads && waypoints.length >= 2) {
-            logger.info(`🗺️ Snapping route to roads with OSRM...`);
+            logger.info(`[GET TRIP DETAILS WITH ROUTE] Starting OSRM snapping tripId=${tripId}`);
 
             try {
                 const snappedRoute = await snapToRoadsOSRM(waypoints);
@@ -714,16 +806,16 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                 if (snappedRoute && snappedRoute.length > waypoints.length * 0.3) {
                     finalRoute = snappedRoute;
                     snappingApplied = true;
-                    logger.info(`✅ OSRM snapping: ${waypoints.length} → ${snappedRoute.length} road points`);
+                    logger.info(`[GET TRIP DETAILS WITH ROUTE] OSRM applied tripId=${tripId} input=${waypoints.length} output=${snappedRoute.length}`);
                 } else {
-                    logger.warn('⚠️ OSRM returned insufficient points, using GPS waypoints');
+                    logger.warn(`[GET TRIP DETAILS WITH ROUTE] OSRM insufficient result tripId=${tripId}`);
                 }
             } catch (error) {
-                logger.error('🔥 OSRM snapping failed:', error.message);
+                logger.error(`[GET TRIP DETAILS WITH ROUTE] OSRM failed tripId=${tripId} message=${error.message}`, {
+                    stack: error.stack
+                });
             }
         }
-
-        logger.info(`📊 Returning ${finalRoute.length} waypoints (snapped: ${snappingApplied})`);
 
         const responseData = {
             success: true,
@@ -762,7 +854,7 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     waypointCount: trip.waypoint_count,
                     createdAt: trip.created_at
                 },
-                waypoints: finalRoute.map(w => ({
+                waypoints: finalRoute.map((w) => ({
                     latitude: parseFloat(w.latitude),
                     longitude: parseFloat(w.longitude),
                     speed: parseFloat(w.speed || 0),
@@ -778,32 +870,174 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                         ? (finalRoute.length / waypoints.length).toFixed(2)
                         : 1,
                     tripDistanceKm: parseFloat(trip.total_distance_km),
-                    source: snappingApplied ? 'osrm_roads' : 'clean_gps'
+                    source: snappingApplied ? "osrm_roads" : "clean_gps"
                 }
             }
         };
 
-        await setCachedData(cacheKey, responseData);
-        res.json(responseData);
+        logger.info(`[GET TRIP DETAILS WITH ROUTE] Response ready tripId=${tripId} totalWaypoints=${waypoints.length} returnedWaypoints=${finalRoute.length} snapped=${snappingApplied}`);
 
+        await setCachedData(cacheKey, responseData);
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getTripDetailsWithRoute:", error);
-        res.status(500).json({
+        logger.error(`[GET TRIP DETAILS WITH ROUTE] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch trip details with route",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
 
-// ==================== REMAINING ENDPOINTS (unchanged) ====================
+exports.getTripFull = async (req, res) => {
+    try {
+        const { tripId } = req.params;
+
+        logger.info(`[GET FULL TRIP] Incoming request`, reqMeta(req));
+
+        if (!tripId || isNaN(tripId)) {
+            logger.warn(`[GET FULL TRIP] Invalid trip ID: ${tripId}`);
+            return res.status(400).json({
+                success: false,
+                message: "Invalid trip ID"
+            });
+        }
+
+        const cacheKey = `trip:full:clean:${tripId}`;
+        const cachedData = await getCachedData(cacheKey);
+        if (cachedData) {
+            logger.info(`[GET FULL TRIP] Returning cached response tripId=${tripId}`);
+            return res.json(cachedData);
+        }
+
+        const trip = await Trip.findByPk(tripId, {
+            include: [{
+                model: Voiture,
+                as: "vehicle",
+                attributes: ["id", "immatriculation", "marque", "model", "couleur", "photo", "mac_id_gps"]
+            }]
+        });
+
+        if (!trip) {
+            logger.warn(`[GET FULL TRIP] Trip not found tripId=${tripId}`);
+            return res.status(404).json({
+                success: false,
+                message: "Trip not found"
+            });
+        }
+
+        logger.info(`[GET FULL TRIP] Trip found`, {
+            tripId: trip.id,
+            vehicleId: trip.vehicle_id,
+            tripStatus: trip.status,
+            start_time: trip.start_time,
+            end_time: trip.end_time,
+            duration_minutes: trip.duration_minutes,
+            trip_mac_id_gps: trip.mac_id_gps,
+            vehicle_mac_id_gps: trip.vehicle?.mac_id_gps,
+            total_distance_km: trip.total_distance_km,
+            waypoint_count_db: trip.waypoint_count
+        });
+
+        const waypoints = await fetchWaypointsFromLocations(
+            trip,
+            MAX_WAYPOINTS_FOR_FOCUS,
+            MAX_DB_ROWS_FOCUS
+        );
+
+        logger.info(`[GET FULL TRIP] Waypoints result tripId=${tripId} count=${waypoints.length}`);
+
+        if (waypoints.length === 0) {
+            logger.warn(`[GET FULL TRIP] No waypoints found for full trip tripId=${tripId}`, {
+                tripId: trip.id,
+                vehicleId: trip.vehicle_id,
+                tripStart: trip.start_time,
+                tripEnd: trip.end_time,
+                tripMac: trip.mac_id_gps,
+                vehicleMac: trip.vehicle?.mac_id_gps
+            });
+        } else {
+            logger.info(`[GET FULL TRIP] Waypoint boundaries tripId=${tripId}`, {
+                firstWaypoint: waypoints[0],
+                lastWaypoint: waypoints[waypoints.length - 1]
+            });
+        }
+
+        const responseData = {
+            success: true,
+            data: {
+                trip: {
+                    id: trip.id,
+                    vehicleId: trip.vehicle_id,
+                    vehicleInfo: trip.vehicle,
+                    startTime: trip.start_time,
+                    endTime: trip.end_time,
+                    durationMinutes: trip.duration_minutes,
+                    durationFormatted: formatDuration(trip.duration_minutes),
+                    startLocation: {
+                        latitude: parseFloat(trip.start_latitude),
+                        longitude: parseFloat(trip.start_longitude),
+                        address: formatAddress(
+                            trip.start_address,
+                            trip.start_address_status,
+                            trip.start_latitude,
+                            trip.start_longitude
+                        )
+                    },
+                    endLocation: {
+                        latitude: parseFloat(trip.end_latitude),
+                        longitude: parseFloat(trip.end_longitude),
+                        address: formatAddress(
+                            trip.end_address,
+                            trip.end_address_status,
+                            trip.end_latitude,
+                            trip.end_longitude
+                        )
+                    },
+                    totalDistanceKm: parseFloat(trip.total_distance_km),
+                    avgSpeedKmh: parseFloat(trip.avg_speed_kmh),
+                    maxSpeedKmh: parseFloat(trip.max_speed_kmh),
+                    waypointCount: trip.waypoint_count,
+                    createdAt: trip.created_at
+                },
+                waypoints: waypoints.map((w) => ({
+                    latitude: parseFloat(w.latitude),
+                    longitude: parseFloat(w.longitude),
+                    speed: parseFloat(w.speed || 0),
+                    timestamp: w.recorded_at,
+                    order: w.sequence_order
+                }))
+            }
+        };
+
+        logger.info(`[GET FULL TRIP] Response ready tripId=${tripId} success=true`);
+
+        await setCachedData(cacheKey, responseData);
+        return res.json(responseData);
+    } catch (error) {
+        logger.error(`[GET FULL TRIP] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch full trip",
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
+        });
+    }
+};
 
 exports.getVehicleTripStats = async (req, res) => {
     try {
         const { vehicleId } = req.params;
         const { startDate, endDate } = req.query;
 
-        logger.info(`ℹ️ Fetching trip stats for vehicle: ${vehicleId}`);
+        logger.info(`[GET VEHICLE TRIP STATS] Incoming request`, reqMeta(req));
 
         if (!vehicleId || isNaN(vehicleId)) {
             return res.status(400).json({
@@ -812,15 +1046,13 @@ exports.getVehicleTripStats = async (req, res) => {
             });
         }
 
-        const cacheKey = `trip:stats:${vehicleId}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
-
+        const cacheKey = `trip:stats:${vehicleId}:start:${startDate || "none"}:end:${endDate || "none"}`;
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             return res.json(cachedData);
         }
 
-        const vehicle = await Voiture.findByPk(vehicleId, { attributes: ['id'] });
-
+        const vehicle = await Voiture.findByPk(vehicleId, { attributes: ["id"] });
         if (!vehicle) {
             return res.status(404).json({
                 success: false,
@@ -830,31 +1062,43 @@ exports.getVehicleTripStats = async (req, res) => {
 
         const whereClause = {
             vehicle_id: vehicleId,
-            status: 'completed'
+            status: "completed"
         };
 
         if (startDate || endDate) {
             whereClause.start_time = {};
-            if (startDate) whereClause.start_time[Op.gte] = new Date(startDate);
+            if (startDate) {
+                const parsedStart = parseLocalDayStart(startDate);
+                if (!parsedStart) {
+                    return res.status(400).json({ success: false, message: "Invalid startDate — expected yyyy-MM-dd" });
+                }
+                whereClause.start_time[Op.gte] = parsedStart;
+            }
             if (endDate) {
-                const d = new Date(endDate);
-                d.setDate(d.getDate() + 1);
-                whereClause.start_time[Op.lt] = d;
+                const parsedEnd = parseLocalDayEnd(endDate);
+                if (!parsedEnd) {
+                    return res.status(400).json({ success: false, message: "Invalid endDate — expected yyyy-MM-dd" });
+                }
+                whereClause.start_time[Op.lte] = parsedEnd;
             }
         }
+
+        logger.info(`[GET VEHICLE TRIP STATS] whereClause`, whereClause);
 
         const trips = await Trip.findAll({
             where: whereClause,
             attributes: [
-                'total_distance_km',
-                'duration_minutes',
-                'avg_speed_kmh',
-                'max_speed_kmh'
+                "total_distance_km",
+                "duration_minutes",
+                "avg_speed_kmh",
+                "max_speed_kmh"
             ],
             limit: STATS_TRIP_LIMIT,
-            order: [['start_time', 'DESC']],
+            order: [["start_time", "DESC"]],
             raw: true
         });
+
+        logger.info(`[GET VEHICLE TRIP STATS] tripsFound=${trips.length}`);
 
         if (!trips.length) {
             const responseData = {
@@ -876,7 +1120,7 @@ exports.getVehicleTripStats = async (req, res) => {
         const totalDistanceKm = trips.reduce((sum, t) => sum + parseFloat(t.total_distance_km || 0), 0);
         const totalDurationMinutes = trips.reduce((sum, t) => sum + parseInt(t.duration_minutes || 0), 0);
         const avgSpeed = trips.reduce((sum, t) => sum + parseFloat(t.avg_speed_kmh || 0), 0) / totalTrips;
-        const maxSpeed = Math.max(...trips.map(t => parseFloat(t.max_speed_kmh || 0)));
+        const maxSpeed = Math.max(...trips.map((t) => parseFloat(t.max_speed_kmh || 0)));
 
         const responseData = {
             success: true,
@@ -894,14 +1138,17 @@ exports.getVehicleTripStats = async (req, res) => {
         };
 
         await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getVehicleTripStats:", error);
-        res.status(500).json({
+        logger.error(`[GET VEHICLE TRIP STATS] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch trip statistics",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
@@ -910,48 +1157,64 @@ exports.getAllTrips = async (req, res) => {
     try {
         const { startDate, endDate, page = 1, limit = 50 } = req.query;
 
-        const cacheKey = `trips:all:page:${page}:limit:${limit}:start:${startDate || 'none'}:end:${endDate || 'none'}`;
+        logger.info(`[GET ALL TRIPS] Incoming request`, reqMeta(req));
 
+        const cacheKey = `trips:all:page:${page}:limit:${limit}:start:${startDate || "none"}:end:${endDate || "none"}`;
         const cachedData = await getCachedData(cacheKey);
         if (cachedData) {
             return res.json(cachedData);
         }
 
-        const whereClause = { status: 'completed' };
+        const whereClause = { status: "completed" };
 
         if (startDate || endDate) {
             whereClause.start_time = {};
-            if (startDate) whereClause.start_time[Op.gte] = new Date(startDate);
+            if (startDate) {
+                const parsedStart = parseLocalDayStart(startDate);
+                if (!parsedStart) {
+                    return res.status(400).json({ success: false, message: "Invalid startDate — expected yyyy-MM-dd" });
+                }
+                whereClause.start_time[Op.gte] = parsedStart;
+            }
             if (endDate) {
-                const d = new Date(endDate);
-                d.setDate(d.getDate() + 1);
-                whereClause.start_time[Op.lt] = d;
+                const parsedEnd = parseLocalDayEnd(endDate);
+                if (!parsedEnd) {
+                    return res.status(400).json({ success: false, message: "Invalid endDate — expected yyyy-MM-dd" });
+                }
+                whereClause.start_time[Op.lte] = parsedEnd;
             }
         }
+
+        logger.info(`[GET ALL TRIPS] whereClause`, whereClause);
 
         const offset = (page - 1) * limit;
         const result = await Trip.findAndCountAll({
             where: whereClause,
             include: [{
                 model: Voiture,
-                as: 'vehicle',
-                attributes: ['immatriculation', 'marque', 'model']
+                as: "vehicle",
+                attributes: ["immatriculation", "marque", "model"]
             }],
-            order: [['start_time', 'DESC']],
+            order: [["start_time", "DESC"]],
             limit: parseInt(limit),
             offset: parseInt(offset)
         });
 
+        logger.info(`[GET ALL TRIPS] count=${result.count} returnedRows=${result.rows.length}`);
+
         const responseData = { success: true, data: result };
         await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
+        return res.json(responseData);
     } catch (error) {
-        logger.error("🔥 Error in getAllTrips:", error);
-        res.status(500).json({
+        logger.error(`[GET ALL TRIPS] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch trips",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
@@ -959,6 +1222,8 @@ exports.getAllTrips = async (req, res) => {
 exports.deleteTrip = async (req, res) => {
     try {
         const { tripId } = req.params;
+
+        logger.info(`[DELETE TRIP] Incoming request`, reqMeta(req));
 
         if (!tripId || isNaN(tripId)) {
             return res.status(400).json({
@@ -969,6 +1234,7 @@ exports.deleteTrip = async (req, res) => {
 
         const trip = await Trip.findByPk(tripId);
         if (!trip) {
+            logger.warn(`[DELETE TRIP] Trip not found tripId=${tripId}`);
             return res.status(404).json({
                 success: false,
                 message: "Trip not found"
@@ -978,123 +1244,26 @@ exports.deleteTrip = async (req, res) => {
         const vehicleId = trip.vehicle_id;
 
         await trip.destroy();
-        logger.info(`✅ Trip deleted: ${tripId}`);
+        logger.info(`[DELETE TRIP] Trip deleted tripId=${tripId} vehicleId=${vehicleId}`);
 
         await deleteCachedData(`trip:*${tripId}*`);
         await deleteCachedData(`trips:vehicle:${vehicleId}:*`);
         await deleteCachedData(`trips:all:*`);
 
-        res.json({
+        return res.json({
             success: true,
             message: "Trip deleted successfully"
         });
-
     } catch (error) {
-        logger.error("🔥 Error in deleteTrip:", error);
-        res.status(500).json({
+        logger.error(`[DELETE TRIP] Failed message=${error.message}`, {
+            meta: reqMeta(req),
+            stack: error.stack
+        });
+
+        return res.status(500).json({
             success: false,
             message: "Failed to delete trip",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
-        });
-    }
-};
-
-exports.getTripFull = async (req, res) => {
-    try {
-        const { tripId } = req.params;
-
-        logger.info(`ℹ️ Fetching FULL trip: ${tripId}`);
-
-        if (!tripId || isNaN(tripId)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid trip ID"
-            });
-        }
-
-        const cacheKey = `trip:full:clean:${tripId}`;
-
-        const cachedData = await getCachedData(cacheKey);
-        if (cachedData) {
-            return res.json(cachedData);
-        }
-
-        const trip = await Trip.findByPk(tripId, {
-            include: [{
-                model: Voiture,
-                as: 'vehicle',
-                attributes: ['id', 'immatriculation', 'marque', 'model', 'couleur', 'photo', 'mac_id_gps']
-            }]
-        });
-
-        if (!trip) {
-            return res.status(404).json({
-                success: false,
-                message: "Trip not found"
-            });
-        }
-
-        // ✅ Fetch ALL waypoints (focus mode)
-        const waypoints = await fetchWaypointsFromLocations(trip, MAX_WAYPOINTS_FOR_FOCUS, MAX_DB_ROWS_FOCUS);
-
-        logger.info(`📍 Fetched ${waypoints.length} waypoints (FULL)`);
-
-        const responseData = {
-            success: true,
-            data: {
-                trip: {
-                    id: trip.id,
-                    vehicleId: trip.vehicle_id,
-                    vehicleInfo: trip.vehicle,
-                    startTime: trip.start_time,
-                    endTime: trip.end_time,
-                    durationMinutes: trip.duration_minutes,
-                    durationFormatted: formatDuration(trip.duration_minutes),
-                    startLocation: {
-                        latitude: parseFloat(trip.start_latitude),
-                        longitude: parseFloat(trip.start_longitude),
-                        address: formatAddress(
-                            trip.start_address,
-                            trip.start_address_status,
-                            trip.start_latitude,
-                            trip.start_longitude
-                        )
-                    },
-                    endLocation: {
-                        latitude: parseFloat(trip.end_latitude),
-                        longitude: parseFloat(trip.end_longitude),
-                        address: formatAddress(
-                            trip.end_address,
-                            trip.end_address_status,
-                            trip.end_latitude,
-                            trip.end_longitude
-                        )
-                    },
-                    totalDistanceKm: parseFloat(trip.total_distance_km),
-                    avgSpeedKmh: parseFloat(trip.avg_speed_kmh),
-                    maxSpeedKmh: parseFloat(trip.max_speed_kmh),
-                    waypointCount: trip.waypoint_count,
-                    createdAt: trip.created_at
-                },
-                waypoints: waypoints.map(w => ({
-                    latitude: parseFloat(w.latitude),
-                    longitude: parseFloat(w.longitude),
-                    speed: parseFloat(w.speed || 0),
-                    timestamp: w.recorded_at,
-                    order: w.sequence_order
-                }))
-            }
-        };
-
-        await setCachedData(cacheKey, responseData);
-        res.json(responseData);
-
-    } catch (error) {
-        logger.error("🔥 Error in getTripFull:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch full trip",
-            error: process.env.NODE_ENV === 'production' ? undefined : error.message
+            error: process.env.NODE_ENV === "production" ? undefined : error.message
         });
     }
 };
