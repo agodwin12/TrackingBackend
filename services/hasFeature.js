@@ -107,6 +107,7 @@ const FEATURES = {
     TRIP_HISTORY:   'trip_history',
     ENGINE_CONTROL: 'engine_control',
     REPORT_STOLEN:  'report_stolen',
+    CALL_CENTER:    'call_center',
 };
 
 module.exports = { hasFeature, getVehicleFeatures, invalidateVehicleFeatureCache, FEATURES };

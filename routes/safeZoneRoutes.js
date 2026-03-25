@@ -8,6 +8,13 @@ const { requireFeature, FEATURES } = require('../middleware/subscriptionMiddlewa
 // All safe zone routes require authentication + safe_zone feature.
 // requireFeature is applied per-route (not via router.use) because
 // vehicle_id is resolved differently per endpoint — body on POST, params on GET.
+//
+// NOTE: DELETE /:id intentionally has NO requireFeature.
+// A DELETE request carries no body, so the middleware cannot resolve
+// vehicle_id and always returns 400 "vehicle_id is required".
+// Deleting a zone is a cleanup action — no subscription gate needed.
+// Ownership is enforced inside deleteSafeZone via req.user.id.
+
 router.post(
     '/',
     authMiddleware,
@@ -46,7 +53,7 @@ router.patch(
 router.delete(
     '/:id',
     authMiddleware,
-    requireFeature(FEATURES.SAFE_ZONE),
+    // No requireFeature — see note above
     safeZoneController.deleteSafeZone
 );
 

@@ -1,110 +1,221 @@
-const AssociationUserVoiture = require("../models/AssociationUserVoiture");
-const Voiture = require("../models/voiture");
+// controllers/voitureController.js
+const { Op }                             = require('sequelize');
+const User                               = require('../models/userModel');
+const Voiture                            = require('../models/voiture');
+const Subscription                       = require('../models/subscription');
+const AssociationUserVoiture             = require('../models/AssociationUserVoiture');
+const AssociationChauffeurVoiturePartner = require('../models/associationChauffeurVoiturePartner');
+const logger                             = require('../utils/logger');
 
+// Must stay in sync with authController.js
+const VOITURE_ATTRIBUTES = [
+    'id',
+    'voiture_unique_id',
+    'immatriculation',
+    'mac_id_gps',
+    'marque',
+    'model',
+    'couleur',
+    'photo',
+    'nickname',
+    'latitude',
+    'longitude',
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERNAL HELPERS  (mirrors authController exactly)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchRegularUserVehicles(userId) {
+    const rows = await AssociationUserVoiture.findAll({
+        where:   { user_id: userId },
+        include: [{ model: Voiture, as: 'voiture', attributes: VOITURE_ATTRIBUTES }],
+    });
+    return rows.map(r => r.voiture).filter(v => v !== null);
+}
+
+async function fetchChauffeurVehicles(chauffeurId) {
+    const rows = await AssociationChauffeurVoiturePartner.findAll({
+        where:   { chauffeur_id: chauffeurId },
+        include: [{ model: Voiture, as: 'voiture', attributes: VOITURE_ATTRIBUTES }],
+        order:   [['assigned_at', 'DESC']],
+    });
+    return rows.map(r => r.voiture).filter(v => v !== null);
+}
+
+async function fetchVehicleSubscriptionMap(userId, vehicleIds) {
+    if (!vehicleIds || vehicleIds.length === 0) return new Map();
+
+    const now = new Date();
+
+    logger.info(`\n${'─'.repeat(60)}`);
+    logger.info(`🔍 [SUB MAP] Checking subscriptions (getUserVehicles)`);
+    logger.info(`   userId     : ${userId}`);
+    logger.info(`   vehicleIds : [${vehicleIds.join(', ')}]`);
+    logger.info(`   now (UTC)  : ${now.toISOString()}`);
+
+    // Step A — fetch ALL rows to diagnose issues
+    const allSubs = await Subscription.findAll({
+        where: {
+            user_id:    userId,
+            vehicle_id: { [Op.in]: vehicleIds },
+        },
+        attributes: ['id', 'vehicle_id', 'status', 'end_date', 'user_id'],
+    });
+
+    logger.info(`\n📋 [SUB MAP] ALL rows (no filter) — found ${allSubs.length}:`);
+    if (allSubs.length === 0) {
+        logger.warn(`   ⚠️  NONE — no subscription rows for user_id=${userId} + these vehicle_ids`);
+    } else {
+        allSubs.forEach(s => {
+            const endDate    = s.end_date ? new Date(s.end_date) : null;
+            const notExpired = endDate ? endDate > now : false;
+            const statusOk   = s.status === 'ACTIVE';
+            logger.info(
+                `   id=${s.id} | vehicle_id=${s.vehicle_id} | ` +
+                `status="${s.status}" (==='ACTIVE': ${statusOk}) | ` +
+                `end_date=${endDate ? endDate.toISOString() : 'NULL'} | ` +
+                `end_date > now: ${notExpired}`
+            );
+            if (!statusOk)      logger.warn(`   ❌ BLOCKED: status="${s.status}", expected "ACTIVE"`);
+            if (endDate === null) logger.warn(`   ❌ BLOCKED: end_date is NULL`);
+            else if (!notExpired) logger.warn(`   ❌ BLOCKED: end_date is in the past`);
+        });
+    }
+
+    // Step B — apply the real filter
+    const activeSubs = await Subscription.findAll({
+        where: {
+            user_id:    userId,
+            vehicle_id: { [Op.in]: vehicleIds },
+            status:     'ACTIVE',
+            end_date:   { [Op.gt]: now },
+        },
+        attributes: ['id', 'vehicle_id', 'status', 'end_date'],
+    });
+
+    logger.info(`\n✅ [SUB MAP] After filter — found ${activeSubs.length}:`);
+    activeSubs.forEach(s => {
+        logger.info(`   id=${s.id} | vehicle_id=${s.vehicle_id} | end_date=${new Date(s.end_date).toISOString()}`);
+    });
+
+    const activeSet = new Set(activeSubs.map(s => Number(s.vehicle_id)));
+
+    const map = new Map();
+    for (const id of vehicleIds) {
+        const result = activeSet.has(Number(id));
+        map.set(id, result);
+        logger.info(`   📌 vehicle ${id} → has_active_subscription = ${result}`);
+    }
+
+    logger.info(`${'─'.repeat(60)}\n`);
+    return map;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/voitures/user/:user_id
+// Returns the same vehicle + subscription payload as the login endpoint.
+// Called by the dashboard after a successful payment to refresh state without
+// requiring the user to log out and back in.
+// ─────────────────────────────────────────────────────────────────────────────
 exports.getUserVehicles = async (req, res) => {
     try {
         const userId = Number(req.params.user_id);
-        console.log(`🔍 Fetching vehicles for user ID: ${userId}`);
 
         if (!userId || userId <= 0) {
-            console.log("❌ Invalid user ID.");
-            return res.status(400).json({ message: "Invalid user ID" });
+            return res.status(400).json({ success: false, message: 'Invalid user ID' });
         }
 
-        // Step 1: Get voiture_ids from association table
-        const associations = await AssociationUserVoiture.findAll({
-            where: { user_id: userId },
-            attributes: ["voiture_id"],
+        // Determine user type so we use the correct association table
+        const user = await User.findByPk(userId, {
+            attributes: ['id', 'partner_id'],
         });
 
-        if (associations.length === 0) {
-            console.log("❌ No vehicles found for this user.");
-            return res.status(404).json({ message: "No vehicles found" });
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        // Extract voiture IDs
-        const voitureIds = associations.map(a => a.voiture_id);
-        console.log("🚗 Vehicle IDs found:", voitureIds);
+        const isChauffeur = user.partner_id !== null && user.partner_id !== undefined;
 
-        // Step 2: Get vehicle details from voitures table
-        const voitures = await Voiture.findAll({
-            where: { id: voitureIds },
-            attributes: [
-                "id",
-                "marque",        // 🆕 ADDED - Brand name
-                "model",
-                "immatriculation",
-                "couleur",
-                "photo",
-                "nickname"       // 🆕 ADDED - Nickname
-            ],
+        const vehicles = isChauffeur
+            ? await fetchChauffeurVehicles(userId)
+            : await fetchRegularUserVehicles(userId);
+
+        if (vehicles.length === 0) {
+            return res.status(404).json({ success: false, message: 'No vehicles found' });
+        }
+
+        logger.info(`🚗 getUserVehicles — user ${userId} (${isChauffeur ? 'chauffeur' : 'regular'}) | ${vehicles.length} vehicle(s)`);
+
+        const vehicleIds      = vehicles.map(v => v.id);
+        const subscriptionMap = await fetchVehicleSubscriptionMap(userId, vehicleIds);
+
+        const vehiclesWithSubscription = vehicles.map(v => ({
+            ...v.toJSON(),
+            has_active_subscription: subscriptionMap.get(Number(v.id)) ?? false,
+        }));
+
+        const activeCount = vehiclesWithSubscription.filter(v => v.has_active_subscription).length;
+        logger.info(`✅ getUserVehicles — ${activeCount}/${vehicles.length} vehicle(s) with active subscription`);
+
+        return res.json({
+            success:  true,
+            vehicles: vehiclesWithSubscription,
         });
-
-        console.log("✅ Vehicles fetched successfully");
-        res.json({ success: true, vehicles: voitures });
 
     } catch (error) {
-        console.error("🔥 Error fetching vehicles:", error.message);
-        res.status(500).json({ message: "Server error", error: error.message });
+        logger.error('🔥 getUserVehicles error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error',
+            error:   error.message,
+        });
     }
 };
 
-
-
-
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/vehicles/:vehicleId/nickname
+// ─────────────────────────────────────────────────────────────────────────────
 exports.updateVehicleNickname = async (req, res) => {
     try {
         const { vehicleId } = req.params;
-        const { nickname } = req.body;
+        const { nickname }  = req.body;
 
-        console.log("📝 Update Nickname Request");
-        console.log("Vehicle ID:", vehicleId);
-        console.log("New Nickname:", nickname);
-
-        // Validate nickname (optional but recommended)
         if (nickname && nickname.length > 50) {
             return res.status(400).json({
                 success: false,
-                message: "Nickname must be 50 characters or less"
+                message: 'Nickname must be 50 characters or less',
             });
         }
 
-        // Find vehicle
         const vehicle = await Voiture.findByPk(vehicleId);
 
         if (!vehicle) {
-            console.log("❌ Vehicle not found");
-            return res.status(404).json({
-                success: false,
-                message: "Vehicle not found"
-            });
+            return res.status(404).json({ success: false, message: 'Vehicle not found' });
         }
 
-        console.log("✅ Vehicle found:", vehicle.immatriculation);
-
-        // Update nickname
         await vehicle.update({ nickname: nickname || null });
 
-        console.log("✅ Nickname updated successfully");
+        logger.info(`✅ Nickname updated — vehicle ${vehicleId}`);
 
-        res.json({
+        return res.json({
             success: true,
-            message: "Nickname updated successfully",
+            message: 'Nickname updated successfully',
             vehicle: {
-                id: vehicle.id,
+                id:              vehicle.id,
                 immatriculation: vehicle.immatriculation,
-                marque: vehicle.marque,
-                model: vehicle.model,
-                nickname: vehicle.nickname
-            }
+                marque:          vehicle.marque,
+                model:           vehicle.model,
+                nickname:        vehicle.nickname,
+            },
         });
 
     } catch (error) {
-        console.error("🔥 Error updating nickname:", error);
-        res.status(500).json({
+        logger.error('🔥 updateVehicleNickname error:', error.message);
+        return res.status(500).json({
             success: false,
-            message: "Server error",
-            error: error.message
+            message: 'Server error',
+            error:   error.message,
         });
     }
 };

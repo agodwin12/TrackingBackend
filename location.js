@@ -399,7 +399,6 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                                     logger.info(`   Current state: ${geofenceResult.currentState}`);
                                     logger.info(`📧 Geofence alert created and notification sent`);
                                 } else if (geofenceResult.currentState === 'inside') {
-                                    // Vehicle RETURNED to the geofence
                                     logger.info(`✅ VEHICLE RETURNED TO GEOFENCE!`);
                                     logger.info(`   Vehicle returned to the defined zone`);
                                     logger.info(`   Previous state: ${geofenceResult.previousState}`);
