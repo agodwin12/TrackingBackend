@@ -7,7 +7,7 @@ const redisClient = require("../config/redis");
 const logger = require("../utils/logger");
 const axios = require("axios");
 
-// Cache TTL: 5 minutes
+// Cache TTL
 const TRIP_CACHE_TTL = 300;
 const EMPTY_RESULT_TTL = 60;
 
@@ -18,29 +18,19 @@ const MAX_DB_ROWS = 20000;
 const MAX_DB_ROWS_FOCUS = 120000;
 const STATS_TRIP_LIMIT = 1000;
 
+// ✅ OSRM URL from env — localhost:5000 for dev, http://osrm:5000 for Docker prod
+const OSRM_URL = process.env.OSRM_URL || "http://localhost:5000";
+
 // ==================== DATE PARSING ====================
 
-/**
- * Parse a date-only string (e.g. "2026-03-12") as the START of that day
- * in local time (WAT = UTC+1), returning a plain JS Date that Sequelize
- * will compare correctly against sys_time values stored as local WAT timestamps.
- *
- * new Date("2026-03-12") parses as UTC midnight → wrong for WAT-stored data.
- * This helper instead builds "2026-03-12T00:00:00" without any timezone
- * suffix, so the JS engine treats it as local time — matching the DB values.
- */
 function parseLocalDayStart(dateStr) {
     if (!dateStr) return null;
-    // Accept "yyyy-MM-dd" or already a full ISO string
-    const datePart = dateStr.split("T")[0]; // strip time if present
+    const datePart = dateStr.split("T")[0];
     if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
     const d = new Date(`${datePart}T00:00:00`);
     return isNaN(d.getTime()) ? null : d;
 }
 
-/**
- * Parse a date-only string as the END of that day in local time (23:59:59).
- */
 function parseLocalDayEnd(dateStr) {
     if (!dateStr) return null;
     const datePart = dateStr.split("T")[0];
@@ -103,13 +93,11 @@ async function getCachedData(key) {
             logger.warn(`[TRIP CACHE] Redis not connected, skipping GET for key=${key}`);
             return null;
         }
-
         const cached = await redisClient.get(key);
         if (cached) {
             logger.debug(`[TRIP CACHE] HIT key=${key}`);
             return JSON.parse(cached);
         }
-
         logger.debug(`[TRIP CACHE] MISS key=${key}`);
         return null;
     } catch (error) {
@@ -126,7 +114,6 @@ async function setCachedData(key, data, ttl = TRIP_CACHE_TTL) {
             logger.warn(`[TRIP CACHE] Redis not connected, skipping SET for key=${key}`);
             return;
         }
-
         await redisClient.setEx(key, ttl, JSON.stringify(data));
         logger.debug(`[TRIP CACHE] SET key=${key} ttl=${ttl}`);
     } catch (error) {
@@ -142,11 +129,9 @@ async function deleteCachedData(pattern) {
             logger.warn(`[TRIP CACHE] Redis not connected, skipping DELETE for pattern=${pattern}`);
             return;
         }
-
         if (pattern.includes("*")) {
             const keys = await redisClient.keys(pattern);
             logger.info(`[TRIP CACHE] DELETE pattern=${pattern} matchedKeys=${keys.length}`);
-
             if (keys.length > 0) {
                 await redisClient.del(...keys);
             }
@@ -204,9 +189,6 @@ async function fetchWaypointsFromLocations(trip, maxPoints = MAX_WAYPOINTS_FOR_M
             `[TRIP WAYPOINTS] Start fetch tripId=${trip.id} vehicleId=${trip.vehicle_id || "n/a"} maxPoints=${maxPoints} maxDbRows=${maxDbRows}`
         );
 
-        // Query trip_waypoints directly — this table is always populated by the
-        // detection service and is not affected by location cleanup or trip_id
-        // linking issues on the raw locations table.
         const TripWaypoint = require("../models/tripWaypoint");
 
         const rows = await TripWaypoint.findAll({
@@ -224,7 +206,7 @@ async function fetchWaypointsFromLocations(trip, maxPoints = MAX_WAYPOINTS_FOR_M
             return [];
         }
 
-        // Filter out any invalid coordinates
+        // Filter invalid coordinates
         const points = [];
         let invalidCoordCount = 0;
 
@@ -292,6 +274,17 @@ async function fetchWaypointsFromLocations(trip, maxPoints = MAX_WAYPOINTS_FOR_M
 
 // ==================== OSRM ROAD SNAPPING ====================
 
+/**
+ * Snap GPS waypoints to roads using local OSRM instance.
+ *
+ * FIX: The old code used BATCH_SIZE - 1 as the step, which caused batches to
+ * overlap by 1 point (correct) but then the slice was also BATCH_SIZE wide,
+ * meaning the overlap point appeared twice in allSnappedPoints. Fixed below:
+ * - Each batch is exactly BATCH_SIZE points
+ * - Batches overlap by 1 point so OSRM can join them seamlessly
+ * - The overlapping point is stripped from the start of each batch result
+ *   (except the first batch) before appending
+ */
 async function snapToRoadsOSRM(waypoints) {
     try {
         if (!waypoints || waypoints.length < 2) {
@@ -299,54 +292,98 @@ async function snapToRoadsOSRM(waypoints) {
             return waypoints;
         }
 
+        // OSRM match API accepts up to 100 coordinates per request
         const BATCH_SIZE = 100;
         let allSnappedPoints = [];
+        let batchIndex = 0;
 
         for (let i = 0; i < waypoints.length; i += BATCH_SIZE - 1) {
-            const batch = waypoints.slice(i, Math.min(i + BATCH_SIZE, waypoints.length));
-            const coordinates = batch.map((wp) => `${wp.longitude},${wp.latitude}`).join(";");
-            const url = `https://router.project-osrm.org/match/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`;
+            // Slice a batch of up to BATCH_SIZE points
+            const batch = waypoints.slice(i, i + BATCH_SIZE);
 
-            logger.debug(`[TRIP OSRM] Request batchIndex=${Math.floor(i / BATCH_SIZE) + 1} batchSize=${batch.length}`);
+            // Build coordinate string: "lng,lat;lng,lat;..."
+            const coordinates = batch
+                .map((wp) => `${wp.longitude},${wp.latitude}`)
+                .join(";");
 
-            const response = await axios.get(url, { timeout: 10000 });
+            // ✅ Use local OSRM from env var
+            const url = `${OSRM_URL}/match/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`;
 
-            if (
-                response.data.code !== "Ok" ||
-                !response.data.matchings ||
-                response.data.matchings.length === 0
-            ) {
-                logger.warn(`[TRIP OSRM] Matching failed for batch, using original GPS points`, {
-                    code: response.data.code
-                });
-                allSnappedPoints.push(...batch);
-                continue;
+            logger.debug(`[TRIP OSRM] Request batchIndex=${batchIndex + 1} batchSize=${batch.length} url=${OSRM_URL}`);
+
+            try {
+                const response = await axios.get(url, { timeout: 10000 });
+
+                if (
+                    response.data.code !== "Ok" ||
+                    !response.data.matchings ||
+                    response.data.matchings.length === 0
+                ) {
+                    // OSRM could not match this batch — fall back to raw GPS for this batch
+                    logger.warn(`[TRIP OSRM] Matching failed for batchIndex=${batchIndex + 1} code=${response.data.code}, using raw GPS points`);
+
+                    // ✅ FIX: skip the first point on subsequent batches to avoid duplicates
+                    const batchPoints = batchIndex === 0 ? batch : batch.slice(1);
+                    allSnappedPoints.push(...batchPoints.map((wp, idx) => ({
+                        latitude: wp.latitude,
+                        longitude: wp.longitude,
+                        speed: wp.speed || 0,
+                        recorded_at: wp.recorded_at,
+                        sequence_order: allSnappedPoints.length + idx + 1
+                    })));
+
+                    batchIndex++;
+                    continue;
+                }
+
+                // Collect all matched geometry coordinates across all matchings
+                // (OSRM may split one batch into multiple matchings for disconnected roads)
+                const snappedCoords = [];
+                for (const matching of response.data.matchings) {
+                    snappedCoords.push(...matching.geometry.coordinates);
+                }
+
+                // ✅ FIX: skip the first snapped point on subsequent batches to avoid
+                // duplicating the join point between batches
+                const coordsToAdd = batchIndex === 0 ? snappedCoords : snappedCoords.slice(1);
+
+                const snappedWaypoints = coordsToAdd.map((coord, idx) => ({
+                    latitude: coord[1],   // GeoJSON is [lng, lat]
+                    longitude: coord[0],
+                    speed: 0,
+                    recorded_at: new Date(),
+                    sequence_order: allSnappedPoints.length + idx + 1
+                }));
+
+                allSnappedPoints.push(...snappedWaypoints);
+
+                logger.info(
+                    `[TRIP OSRM] Batch success batchIndex=${batchIndex + 1} input=${batch.length} output=${snappedWaypoints.length} total=${allSnappedPoints.length}`
+                );
+
+            } catch (batchError) {
+                // Network error or timeout for this batch — fall back to raw GPS
+                logger.error(`[TRIP OSRM] Batch ${batchIndex + 1} request failed: ${batchError.message}`);
+
+                const batchPoints = batchIndex === 0 ? batch : batch.slice(1);
+                allSnappedPoints.push(...batchPoints.map((wp, idx) => ({
+                    latitude: wp.latitude,
+                    longitude: wp.longitude,
+                    speed: wp.speed || 0,
+                    recorded_at: wp.recorded_at,
+                    sequence_order: allSnappedPoints.length + idx + 1
+                })));
             }
 
-            const geometry = response.data.matchings[0].geometry;
-            const snappedCoords = geometry.coordinates;
-
-            const snappedWaypoints = snappedCoords.map((coord, index) => ({
-                latitude: coord[1],
-                longitude: coord[0],
-                speed: 0,
-                recorded_at: new Date(),
-                sequence_order: allSnappedPoints.length + index + 1
-            }));
-
-            allSnappedPoints.push(...snappedWaypoints);
-
-            logger.info(
-                `[TRIP OSRM] Batch success batchIndex=${Math.floor(i / BATCH_SIZE) + 1} input=${batch.length} output=${snappedWaypoints.length}`
-            );
+            batchIndex++;
         }
 
         logger.info(`[TRIP OSRM] Total snapping input=${waypoints.length} output=${allSnappedPoints.length}`);
         return allSnappedPoints;
+
     } catch (error) {
-        logger.error(`[TRIP OSRM] Error message=${error.message}`, {
-            stack: error.stack
-        });
+        logger.error(`[TRIP OSRM] Fatal error message=${error.message}`, { stack: error.stack });
+        // Return original waypoints so the trip still renders
         return waypoints;
     }
 }
@@ -518,6 +555,7 @@ exports.getVehicleTrips = async (req, res) => {
 
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET VEHICLE TRIPS] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -619,6 +657,7 @@ exports.getTripDetails = async (req, res) => {
 
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET TRIP DETAILS] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -725,6 +764,7 @@ exports.getTripRoute = async (req, res) => {
 
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET TRIP ROUTE] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -788,34 +828,75 @@ exports.getTripDetailsWithRoute = async (req, res) => {
             total_distance_km: trip.total_distance_km,
             waypoint_count: trip.waypoint_count,
             shouldSnapToRoads,
-            limit
+            limit,
+            osrmUrl: OSRM_URL
         });
 
+        // ── Fetch waypoints from trip_waypoints table ──────────────────────────
         let waypoints = await fetchWaypointsFromLocations(trip, limit, MAX_DB_ROWS);
-        logger.info(`[GET TRIP DETAILS WITH ROUTE] Clean GPS waypoints fetched tripId=${tripId} count=${waypoints.length}`);
+        logger.info(`[GET TRIP DETAILS WITH ROUTE] GPS waypoints fetched tripId=${tripId} count=${waypoints.length}`);
 
+        // ── Fallback: if trip_waypoints is empty use start/end from trips table ─
+        // This covers edge cases (very old trips, detection service gaps).
+        // We return a 2-point straight line so Flutter still renders something.
+        let usingFallback = false;
+
+        if (waypoints.length === 0) {
+            const startLat = parseFloat(trip.start_latitude);
+            const startLng = parseFloat(trip.start_longitude);
+            const endLat   = parseFloat(trip.end_latitude);
+            const endLng   = parseFloat(trip.end_longitude);
+
+            const validStart = startLat && startLng && Math.abs(startLat) <= 90 && Math.abs(startLng) <= 180;
+            const validEnd   = endLat   && endLng   && Math.abs(endLat)   <= 90 && Math.abs(endLng)   <= 180;
+
+            if (validStart && validEnd) {
+                logger.warn(`[GET TRIP DETAILS WITH ROUTE] No waypoints for tripId=${tripId} — using start/end fallback`);
+                waypoints = [
+                    { latitude: startLat, longitude: startLng, speed: 0, recorded_at: trip.start_time, sequence_order: 1 },
+                    { latitude: endLat,   longitude: endLng,   speed: 0, recorded_at: trip.end_time,   sequence_order: 2 }
+                ];
+                usingFallback = true;
+            } else {
+                logger.warn(`[GET TRIP DETAILS WITH ROUTE] No waypoints and no valid coords for tripId=${tripId}`);
+                return res.status(404).json({
+                    success: false,
+                    message: "No route data available for this trip"
+                });
+            }
+        }
+
+        // ── OSRM road snapping ─────────────────────────────────────────────────
+        // Skip snapping for fallback (only 2 points — not meaningful to snap)
         let finalRoute = waypoints;
         let snappingApplied = false;
 
-        if (shouldSnapToRoads && waypoints.length >= 2) {
-            logger.info(`[GET TRIP DETAILS WITH ROUTE] Starting OSRM snapping tripId=${tripId}`);
+        if (shouldSnapToRoads && !usingFallback && waypoints.length >= 2) {
+            logger.info(`[GET TRIP DETAILS WITH ROUTE] Starting OSRM snapping tripId=${tripId} osrmUrl=${OSRM_URL}`);
 
             try {
                 const snappedRoute = await snapToRoadsOSRM(waypoints);
 
-                if (snappedRoute && snappedRoute.length > waypoints.length * 0.3) {
+                // Accept the snapped result only if it has a reasonable number of points.
+                // Threshold: at least 30% of the input count.
+                if (snappedRoute && snappedRoute.length >= Math.max(2, waypoints.length * 0.3)) {
                     finalRoute = snappedRoute;
                     snappingApplied = true;
                     logger.info(`[GET TRIP DETAILS WITH ROUTE] OSRM applied tripId=${tripId} input=${waypoints.length} output=${snappedRoute.length}`);
                 } else {
-                    logger.warn(`[GET TRIP DETAILS WITH ROUTE] OSRM insufficient result tripId=${tripId}`);
+                    logger.warn(`[GET TRIP DETAILS WITH ROUTE] OSRM result too sparse tripId=${tripId} — using raw GPS`);
                 }
-            } catch (error) {
-                logger.error(`[GET TRIP DETAILS WITH ROUTE] OSRM failed tripId=${tripId} message=${error.message}`, {
-                    stack: error.stack
+            } catch (osrmError) {
+                // Non-fatal — raw GPS waypoints are still a valid fallback
+                logger.error(`[GET TRIP DETAILS WITH ROUTE] OSRM failed tripId=${tripId} message=${osrmError.message}`, {
+                    stack: osrmError.stack
                 });
             }
         }
+
+        logger.info(
+            `[GET TRIP DETAILS WITH ROUTE] Response ready tripId=${tripId} totalWaypoints=${waypoints.length} returnedWaypoints=${finalRoute.length} snapped=${snappingApplied} fallback=${usingFallback}`
+        );
 
         const responseData = {
             success: true,
@@ -862,23 +943,31 @@ exports.getTripDetailsWithRoute = async (req, res) => {
                     order: w.sequence_order
                 })),
                 metadata: {
-                    totalWaypoints: waypoints.length,
+                    totalWaypoints: usingFallback ? 0 : waypoints.length,
                     returnedWaypoints: finalRoute.length,
-                    isSampled: waypoints.length >= MAX_WAYPOINTS_FOR_MAP,
+                    isSampled: !usingFallback && waypoints.length >= MAX_WAYPOINTS_FOR_MAP,
                     isSnappedToRoads: snappingApplied,
+                    isFallback: usingFallback,
                     samplingRatio: waypoints.length > 0
-                        ? (finalRoute.length / waypoints.length).toFixed(2)
+                        ? parseFloat((finalRoute.length / waypoints.length).toFixed(2))
                         : 1,
                     tripDistanceKm: parseFloat(trip.total_distance_km),
-                    source: snappingApplied ? "osrm_roads" : "clean_gps"
+                    source: usingFallback
+                        ? "start_end_only"
+                        : snappingApplied
+                            ? "osrm_roads"
+                            : "raw_gps"
                 }
             }
         };
 
-        logger.info(`[GET TRIP DETAILS WITH ROUTE] Response ready tripId=${tripId} totalWaypoints=${waypoints.length} returnedWaypoints=${finalRoute.length} snapped=${snappingApplied}`);
+        // ✅ Do not cache fallback responses — real waypoints may appear later
+        if (!usingFallback) {
+            await setCachedData(cacheKey, responseData);
+        }
 
-        await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET TRIP DETAILS WITH ROUTE] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -952,14 +1041,7 @@ exports.getTripFull = async (req, res) => {
         logger.info(`[GET FULL TRIP] Waypoints result tripId=${tripId} count=${waypoints.length}`);
 
         if (waypoints.length === 0) {
-            logger.warn(`[GET FULL TRIP] No waypoints found for full trip tripId=${tripId}`, {
-                tripId: trip.id,
-                vehicleId: trip.vehicle_id,
-                tripStart: trip.start_time,
-                tripEnd: trip.end_time,
-                tripMac: trip.mac_id_gps,
-                vehicleMac: trip.vehicle?.mac_id_gps
-            });
+            logger.warn(`[GET FULL TRIP] No waypoints found for full trip tripId=${tripId}`);
         } else {
             logger.info(`[GET FULL TRIP] Waypoint boundaries tripId=${tripId}`, {
                 firstWaypoint: waypoints[0],
@@ -1018,6 +1100,7 @@ exports.getTripFull = async (req, res) => {
 
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET FULL TRIP] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -1139,6 +1222,7 @@ exports.getVehicleTripStats = async (req, res) => {
 
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET VEHICLE TRIP STATS] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -1205,6 +1289,7 @@ exports.getAllTrips = async (req, res) => {
         const responseData = { success: true, data: result };
         await setCachedData(cacheKey, responseData);
         return res.json(responseData);
+
     } catch (error) {
         logger.error(`[GET ALL TRIPS] Failed message=${error.message}`, {
             meta: reqMeta(req),
@@ -1254,6 +1339,7 @@ exports.deleteTrip = async (req, res) => {
             success: true,
             message: "Trip deleted successfully"
         });
+
     } catch (error) {
         logger.error(`[DELETE TRIP] Failed message=${error.message}`, {
             meta: reqMeta(req),
