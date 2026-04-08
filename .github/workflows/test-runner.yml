@@ -1,0 +1,22 @@
+name: Test Runner
+
+on:
+  push:
+    branches:
+      - test
+
+jobs:
+  test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test server
+        run: |
+          echo "Runner is working"
+          whoami
+          hostname
+          pwd
+          ls -lah
