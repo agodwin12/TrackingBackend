@@ -1,0 +1,37 @@
+name: Deploy TrackingBackend on test
+
+on:
+  push:
+    branches:
+      - test
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Deploy on VPS
+        run: |
+          set -e
+
+          APP_DIR=/home/ubuntu/tesTracking/TrackingBackend
+
+          echo "Using app dir: $APP_DIR"
+          cd "$APP_DIR"
+
+          echo "Current user:"
+          whoami
+
+          echo "Pull latest code from test branch"
+          git fetch origin
+          git reset --hard origin/test
+
+          echo "Rebuild and restart containers"
+          docker compose down
+          docker compose up -d --build
+
+          echo "Remove dangling images"
+          docker image prune -f
+
+          echo "Deployment finished"
+          docker compose ps
