@@ -9,9 +9,13 @@ const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 const logger = require('./utils/logger');
 
-// ✅ Import Routes
-const vehicleRoutes = require('./routes/vehicleRoutes');
+
 const authRoutes = require('./routes/authRoutes');
+// ✅ Import Routes
+
+
+const vehicleRoutes = require('./routes/vehicleRoutes');
+
 const voitureRoutes = require('./routes/voitureRoutes');
 const dashboardVehicleRoutes = require('./routes/dashboardVehicleRoutes');
 const gpsRoutes = require('./routes/gpsRoutes');
@@ -79,7 +83,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ⚠️  WEBHOOK ROUTE — MUST BE REGISTERED BEFORE bodyParser.json()
+//   WEBHOOK ROUTE — MUST BE REGISTERED BEFORE bodyParser.json()
 // express.raw() captures the raw Buffer needed for HMAC signature verification.
 // If bodyParser.json() runs first, req.body becomes a parsed object and
 // signature verification will always fail.

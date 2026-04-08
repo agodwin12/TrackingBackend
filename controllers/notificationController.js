@@ -159,36 +159,59 @@ exports.sendToUser = async (userId, notification) => {
         // All FCM data values must be strings
         const dataPayload = {};
         if (notification.data) {
-            Object.keys(notification.data).forEach(key => {
+            Object.keys(notification.data).forEach((key) => {
                 dataPayload[key] = String(notification.data[key]);
             });
         }
 
-        let successCount     = 0;
-        let failureCount     = 0;
+        let successCount = 0;
+        let failureCount = 0;
         const tokensToRemove = [];
 
         for (const token of tokens) {
             try {
-                await admin.messaging().send({
+                const message = {
+                    token,
                     notification: {
                         title: notification.title,
-                        body:  notification.body,
+                        body: notification.body,
                     },
-                    data:  dataPayload,
-                    token,
+                    data: dataPayload,
+
                     android: {
                         priority: 'high',
                         notification: {
-                            sound:        'default',
+                            sound: 'default',
                             click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                            channel_id: 'default_channel',
                         },
                     },
+
                     apns: {
-                        payload: { aps: { sound: 'default' } },
+                        headers: {
+                            'apns-priority': '10',
+                            'apns-push-type': 'alert',
+                        },
+                        payload: {
+                            aps: {
+                                alert: {
+                                    title: notification.title,
+                                    body: notification.body,
+                                },
+                                sound: 'default',
+                                badge: 1,
+                                'content-available': 1,
+                            },
+                        },
                     },
-                });
+                };
+
+                const response = await admin.messaging().send(message);
                 successCount++;
+
+                logger.info(
+                    `[NOTIFICATION] Sent successfully to token (user ${userId}) messageId=${response}`
+                );
             } catch (error) {
                 failureCount++;
                 logger.error(`[NOTIFICATION] Failed to send to token: ${error.message}`);
@@ -202,17 +225,28 @@ exports.sendToUser = async (userId, notification) => {
             }
         }
 
-        logger.info(`[NOTIFICATION] Result: ${successCount} success, ${failureCount} failure(s)`);
+        logger.info(
+            `[NOTIFICATION] Result: ${successCount} success, ${failureCount} failure(s)`
+        );
 
         if (tokensToRemove.length > 0) {
-            await DeviceToken.destroy({ where: { token: tokensToRemove } });
+            await DeviceToken.destroy({
+                where: { token: tokensToRemove }
+            });
             logger.info(`[NOTIFICATION] Removed ${tokensToRemove.length} stale token(s)`);
         }
 
-        return { success: true, successCount, failureCount };
+        return {
+            success: true,
+            successCount,
+            failureCount
+        };
     } catch (error) {
         logger.error('[NOTIFICATION] sendToUser error:', error.message);
-        return { success: false, error: error.message };
+        return {
+            success: false,
+            error: error.message
+        };
     }
 };
 

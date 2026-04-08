@@ -26,6 +26,7 @@ router.get(
     '/',
     authMiddleware,
     requireFeature(FEATURES.SAFE_ZONE),
+
     safeZoneController.getAllSafeZones
 );
 

@@ -12,7 +12,7 @@ const socketService = require('./services/socketService');
 const logger = require('./utils/logger');
 const { startGPSFetchCycle, stopGPSFetchCycle, isRunning } = require('./location');
 const TripDetectionCron      = require('./jobs/tripDetectionCron');
-const SubscriptionExpiryCron = require('./jobs/subscriptionExpiryCron');
+const SubscriptionExpiryCron = require('./jobs/subscriptionExpiryCron');  // ✅ NEW
 const GeocodingService = require('./services/geocodingService');
 
 // ✅ Security Check Job
@@ -85,14 +85,14 @@ async function initializeServices() {
         errors.push('Trip Detection');
     }
 
-    // 5. Subscription Expiry Cron
+    // 5. Subscription Expiry Cron  ✅ NEW
     logger.info('🔄 [5/6] Starting Subscription Expiry Cron...');
     try {
         SubscriptionExpiryCron.start();
-        logger.info('✅ Subscription Expiry Cron: STARTED\n');
+        logger.info('✅ Subscription Expiry Cron: STARTED (daily at 08:00)\n');
     } catch (error) {
         logger.error('❌ Subscription Expiry Cron: FAILED -', error.message, '\n');
-        errors.push('Expiry Cron');
+        errors.push('Subscription Expiry');
     }
 
     // 6. Security Movement Check
@@ -221,15 +221,16 @@ async function gracefulShutdown(signal) {
         logger.info('✅ Trip Detection Cron stopped');
     } catch (error) {
         logger.error('❌ Trip Detection Cron stop failed:', error.message);
-        errors.push('Trip Cron');
+        errors.push('TripCron');
     }
 
+    // 7. Stop Subscription Expiry Cron  ✅ NEW
     try {
         SubscriptionExpiryCron.stop();
         logger.info('✅ Subscription Expiry Cron stopped');
     } catch (error) {
         logger.error('❌ Subscription Expiry Cron stop failed:', error.message);
-        errors.push('Expiry Cron');
+        errors.push('ExpiryCron');
     }
 
     logger.info('\n╔════════════════════════════════════════╗');
@@ -282,20 +283,20 @@ const optionalButDefinedVars = [
 
 logger.info('\n🔍 Checking required environment variables...');
 
-const missingVars         = requiredEnvVars.filter(v => process.env[v] === undefined);
-const undefinedOptionalVars = optionalButDefinedVars.filter(v => process.env[v] === undefined);
+const missingVars = requiredEnvVars.filter(varName => process.env[varName] === undefined);
+const undefinedOptionalVars = optionalButDefinedVars.filter(varName => process.env[varName] === undefined);
 
 if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
     logger.error('❌ Missing required environment variables:');
 
     if (missingVars.length > 0) {
         logger.error('\n  Required (must have value):');
-        missingVars.forEach(v => logger.error(`   - ${v}`));
+        missingVars.forEach(varName => logger.error(`   - ${varName}`));
     }
 
     if (undefinedOptionalVars.length > 0) {
         logger.error('\n  Required (can be empty, but must be defined):');
-        undefinedOptionalVars.forEach(v => logger.error(`   - ${v}`));
+        undefinedOptionalVars.forEach(varName => logger.error(`   - ${varName}`));
     }
 
     logger.error('\n⚠️  Please check your .env file');
@@ -303,7 +304,7 @@ if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
 } else {
     logger.info('✅ All required environment variables are set');
 
-    const emptyPasswords = optionalButDefinedVars.filter(v => process.env[v] === '');
+    const emptyPasswords = optionalButDefinedVars.filter(varName => process.env[varName] === '');
     if (emptyPasswords.length > 0) {
         logger.warn(`⚠️  Note: Empty passwords detected for: ${emptyPasswords.join(', ')}`);
     }
@@ -311,4 +312,5 @@ if (missingVars.length > 0 || undefinedOptionalVars.length > 0) {
     logger.info('');
 }
 
+// ========== START THE SERVER ==========
 startServer();
