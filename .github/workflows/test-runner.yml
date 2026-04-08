@@ -1,4 +1,4 @@
-name: Test Runner
+name: Deploy on VPS
 
 on:
   push:
@@ -6,17 +6,29 @@ on:
       - test
 
 jobs:
-  test:
+  deploy:
     runs-on: self-hosted
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Test server
+      - name: Deploy with Docker Compose
         run: |
-          echo "Runner is working"
-          whoami
-          hostname
-          pwd
-          ls -lah
+          set -e
+
+          APP_DIR=/home/ubuntu/TrackinBackend
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            echo "Project not found in $APP_DIR"
+            exit 1
+          fi
+
+          cd "$APP_DIR"
+          git fetch origin
+          git reset --hard origin/test
+
+          docker compose down
+          docker compose up -d --build
+
+          docker image prune -f
