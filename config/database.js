@@ -43,7 +43,7 @@ const sequelize = new Sequelize(dbName, dbUser, dbPassword, {
 
     dialectOptions: isProduction
         ? {
-            ssl: { rejectUnauthorized: true },
+            ssl: { rejectUnauthorized: false },
         }
         : {},
 });

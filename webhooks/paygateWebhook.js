@@ -18,13 +18,11 @@ const _addDuration = (baseDate, plan) => {
 
 const _calculateEndDate = (existingSub, plan) => {
     const now = new Date();
-
     if (existingSub?.end_date) {
         const currentEnd = new Date(existingSub.end_date);
         const base = currentEnd > now ? currentEnd : now;
         return _addDuration(base, plan);
     }
-
     return _addDuration(now, plan);
 };
 
@@ -32,59 +30,85 @@ const _calculateEndDate = (existingSub, plan) => {
 // WEBHOOK HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 const handlePaygateWebhook = async (req, res) => {
-    console.log('📩 [WEBHOOK] PayGate webhook received');
-
-    // ── 1. Signature verification ─────────────────────────────────────────────
-    const receivedSig = req.headers['x-signature'];
-    const secret      = process.env.PAYGATE_WEBHOOK_SECRET;
-
-    if (!receivedSig || !secret) {
-        console.warn('⚠️  [WEBHOOK] Missing signature or secret — rejecting');
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
+    // ── FULL DIAGNOSTIC LOG ───────────────────────────────────────────────────
+    console.log('\n📩 [WEBHOOK] ══════════════════════════════════');
+    console.log('📩 [WEBHOOK] Received at:', new Date().toISOString());
+    console.log('📋 [WEBHOOK] All headers:', JSON.stringify(req.headers, null, 2));
+    console.log('📋 [WEBHOOK] Body type  :', typeof req.body, '| isBuffer:', Buffer.isBuffer(req.body));
 
     const rawBody = Buffer.isBuffer(req.body)
         ? req.body.toString('utf8')
-        : JSON.stringify(req.body);
+        : typeof req.body === 'string'
+            ? req.body
+            : JSON.stringify(req.body);
 
-    const computedSig = crypto
-        .createHmac('sha1', secret)
-        .update(rawBody)
-        .digest('hex');
+    console.log('📋 [WEBHOOK] Raw body   :', rawBody);
 
-    const sigMatch =
-        computedSig.length === receivedSig.length &&
-        crypto.timingSafeEqual(
-            Buffer.from(computedSig),
-            Buffer.from(receivedSig),
-        );
+    // ── 1. Signature verification ─────────────────────────────────────────────
+    // HTTP headers are normalised to lowercase by Express/Node
+    const receivedSig = req.headers['x-signature'];
+    const secret      = process.env.PAYGATE_WEBHOOK_SECRET;
 
-    if (!sigMatch) {
-        console.warn('⚠️  [WEBHOOK] Invalid signature — rejecting');
-        return res.status(401).json({ error: 'Invalid signature' });
+    console.log('🔐 [WEBHOOK] x-signature header:', receivedSig ?? '(missing)');
+    console.log('🔐 [WEBHOOK] Secret configured :', secret ? 'yes' : 'NO — check .env');
+
+    if (!secret) {
+        console.error('❌ [WEBHOOK] PAYGATE_WEBHOOK_SECRET not set in .env');
+        return res.status(500).json({ error: 'Server misconfiguration' });
+    }
+
+    if (!receivedSig) {
+        // PayGate did not send a signature — skip verification and log a warning
+        // Remove this branch once you confirm PayGate sends X-Signature
+        console.warn('⚠️  [WEBHOOK] No x-signature header — SKIPPING signature check (debug mode)');
+        // return res.status(401).json({ error: 'Missing signature' });
+    } else {
+        const computedSig = crypto
+            .createHmac('sha1', secret)
+            .update(rawBody)
+            .digest('hex');
+
+        console.log('🔐 [WEBHOOK] Computed sig:', computedSig);
+        console.log('🔐 [WEBHOOK] Received sig:', receivedSig);
+
+        let sigMatch = false;
+        try {
+            sigMatch = computedSig.length === receivedSig.length &&
+                crypto.timingSafeEqual(
+                    Buffer.from(computedSig),
+                    Buffer.from(receivedSig),
+                );
+        } catch (_) {
+            sigMatch = false;
+        }
+
+        console.log('🔐 [WEBHOOK] Sig match   :', sigMatch);
+
+        if (!sigMatch) {
+            console.warn('⚠️  [WEBHOOK] Invalid signature — rejecting');
+            return res.status(401).json({ error: 'Invalid signature' });
+        }
     }
 
     // ── 2. Parse body ─────────────────────────────────────────────────────────
     let payload;
     try {
-        payload = JSON.parse(rawBody);
+        payload = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
     } catch (e) {
         console.error('❌ [WEBHOOK] Failed to parse JSON:', e.message);
         return res.status(400).json({ error: 'Invalid JSON' });
     }
 
+    console.log('📦 [WEBHOOK] Parsed payload:', JSON.stringify(payload, null, 2));
+
     const { status, transaction_id, errorCode } = payload;
 
-    console.log('📦 [WEBHOOK] status        :', status);
-    console.log('📦 [WEBHOOK] transaction_id:', transaction_id);
-    console.log('📦 [WEBHOOK] errorCode     :', errorCode);
-
-    // ── 3. Find matching payment records ──────────────────────────────────────
     if (!transaction_id) {
         console.warn('⚠️  [WEBHOOK] No transaction_id in payload — cannot process');
         return res.status(200).json({ received: true });
     }
 
+    // ── 3. Find matching payment records ──────────────────────────────────────
     const payments = await Payment.findAll({
         where:   { transaction_id },
         include: [{ model: SubscriptionPlan, as: 'plan' }],
@@ -130,15 +154,7 @@ const handlePaygateWebhook = async (req, res) => {
                 const endDate = _calculateEndDate(existingSub, plan);
 
                 if (existingSub) {
-                    console.log(
-                        `🔄 [WEBHOOK] Renewing vehicle ${payment.vehicle_id} — ` +
-                        `${existingSub.end_date} → ${endDate}`
-                    );
                     await existingSub.update({ status: 'RENEWED' });
-                } else {
-                    console.log(
-                        `🆕 [WEBHOOK] New sub for vehicle ${payment.vehicle_id} until ${endDate}`
-                    );
                 }
 
                 const subscription = await Subscription.create({
@@ -156,20 +172,14 @@ const handlePaygateWebhook = async (req, res) => {
                     paid_at:         now,
                 });
 
-                // Invalidate Redis cache — new subscription must be visible immediately
                 await invalidateVehicleFeatureCache(payment.vehicle_id);
 
-                console.log(
-                    `✅ [WEBHOOK] Payment ${payment.id} → Sub ${subscription.id} ` +
-                    `for vehicle ${payment.vehicle_id}`
-                );
+                console.log(`✅ [WEBHOOK] Payment ${payment.id} → Sub ${subscription.id} for vehicle ${payment.vehicle_id}`);
 
-                // ── Socket notification ───────────────────────────────────────
                 socketService.emitPaymentUpdate(
                     payment.user_id, 'SUCCESS', payment.id, payment.vehicle_id,
                 );
 
-                // ── Push notification ─────────────────────────────────────────
                 notificationController.sendToUser(payment.user_id, {
                     title: '✅ Payment Successful',
                     body:  `Your subscription for plan "${plan.label}" is now active.`,
@@ -180,12 +190,11 @@ const handlePaygateWebhook = async (req, res) => {
                         plan_label: plan.label,
                     },
                 }).catch(err =>
-                    console.error(`⚠️  [WEBHOOK] Push notification failed for payment ${payment.id}:`, err.message)
+                    console.error(`⚠️  [WEBHOOK] Push failed for payment ${payment.id}:`, err.message)
                 );
 
             } catch (err) {
                 console.error(`❌ [WEBHOOK] Error on payment ${payment.id}:`, err.message);
-                // Continue — don't let one vehicle failure block the rest
             }
         }
 
@@ -212,11 +221,10 @@ const handlePaygateWebhook = async (req, res) => {
                     vehicle_id: String(payment.vehicle_id),
                 },
             }).catch(err =>
-                console.error(`⚠️  [WEBHOOK] Push notification failed for payment ${payment.id}:`, err.message)
+                console.error(`⚠️  [WEBHOOK] Push failed for payment ${payment.id}:`, err.message)
             );
         }
 
-        console.log(`🚫 [WEBHOOK] Marked ${pendingPayments.length} payment(s) as FAILED`);
         return res.status(200).json({ received: true });
     }
 

@@ -7,7 +7,7 @@ const { checkSafeZoneViolation } = require('./controllers/safeZoneController');
 const { checkGeofenceViolation } = require('./controllers/geofenceMonitorController');
 const SpeedAlertService = require('./services/speedAlertService');
 const TimeZoneAlertService = require('./services/timeZoneAlertService');
-const DeviceAlertService = require('./services/deviceAlertService'); 
+const DeviceAlertService = require('./services/deviceAlertService');
 const BatteryMonitoringService = require('./services/batteryMonitoringService');
 const logger = require('./utils/logger');
 require('dotenv').config();
@@ -319,6 +319,21 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
                         // Cache invalidation
                         await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
+
+                        // ✅ Write back last known position to voitures table so login/refresh
+                        // snapshots always carry a real coordinate instead of the registration default.
+                        // Guard against 0,0 — those are pre-fix satellite readings, not real positions.
+                        if (gpsData.latitude !== 0 || gpsData.longitude !== 0) {
+                            try {
+                                await connection.execute(
+                                    'UPDATE voitures SET latitude = ?, longitude = ? WHERE id = ?',
+                                    [gpsData.latitude, gpsData.longitude, vehicleId]
+                                );
+                                logger.debug(`📍 [${accountName}] voitures position updated: vehicle=${vehicleId}, lat=${gpsData.latitude}, lng=${gpsData.longitude}`);
+                            } catch (updateError) {
+                                logger.error(`❌ [${accountName}] Failed to update voitures position for vehicle ${vehicleId}:`, updateError.message);
+                            }
+                        }
 
                         // Socket.IO - GPS update
                         socketService.emitGPSUpdate(vehicleId, {

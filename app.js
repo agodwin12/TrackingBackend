@@ -29,6 +29,7 @@ const pinRoutes = require('./routes/pinRoutes');
 const geofenceRoutes = require('./routes/geofenceRoutes');
 const paygate = require('./routes/payGate.routes');
 const paymentRoutes = require('./routes/paymentRoutes');
+const leaseCutoffRoutes = require('./routes/leaseCutoffRoutes');
 const { handlePaygateWebhook } = require('./webhooks/paygateWebhook');
 
 // ⚠️  DEV ONLY — not imported in production
@@ -85,7 +86,7 @@ if (process.env.NODE_ENV === 'production') {
 // signature verification will always fail.
 // ═══════════════════════════════════════════════════════════════════════════
 app.post(
-    '/api/webhooks/paygate',
+    '/api/webhook/paygate',
     express.raw({ type: 'application/json' }),
     handlePaygateWebhook
 );
@@ -186,6 +187,8 @@ app.use('/api/pin', pinRoutes);
 app.use('/api/geofence', geofenceRoutes);
 app.use('/api', paygate);
 app.use('/api/payments', paymentRoutes);
+app.use('/api', leaseCutoffRoutes);
+
 
 // ========== 404 HANDLER ==========
 app.use((req, res) => {

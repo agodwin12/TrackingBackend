@@ -91,6 +91,26 @@ const User = sequelize.define("users", {
         defaultValue: true,
         comment: 'Whether user needs to change password on first login',
     },
+    pin_hash: {
+        type: DataTypes.STRING(64),
+        allowNull: true,
+        comment: 'SHA-256 hash of the user PIN',
+    },
+    geofence_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+    },
+    safe_zone_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+    },
+    battery_alerts_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: true,
+        defaultValue: true,
+    },
     speed_alerts_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
@@ -104,12 +124,19 @@ const User = sequelize.define("users", {
     refresh_token: {
         type: DataTypes.STRING(500),
         allowNull: true,
-        comment: 'JWT refresh token for automatic token renewal',
+        comment: 'Keycloak refresh token stored for logout/revocation',
     },
     refresh_token_expires_at: {
         type: DataTypes.DATE,
         allowNull: true,
-        comment: 'Expiration date of the refresh token',
+        comment: 'Expiration date of the Keycloak refresh token',
+    },
+    // ── Keycloak integration ──────────────────────────────────────────────────
+    keycloak_id: {
+        type: DataTypes.STRING(36),
+        allowNull: true,
+        unique: true,
+        comment: 'Keycloak user UUID (sub claim). Populated on first Keycloak login.',
     },
 }, {
     timestamps: true,

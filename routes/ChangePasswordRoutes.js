@@ -1,43 +1,28 @@
 // routes/ChangePasswordRoutes.js
-
-const express = require("express");
-const ChangePasswordController = require("../controllers/changePasswordController");
-const ForgotPasswordController = require("../controllers/forgotPasswordController");
+const express                  = require('express');
+const ChangePasswordController = require('../controllers/changePasswordController');
+const ForgotPasswordController = require('../controllers/forgotPasswordController');
+const authMiddleware           = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-// ========================================
-// 🔒 CHANGE PASSWORD ROUTES
-// ========================================
+// ── Existing password routes (tracking app users) ─────────────────────────────
+router.post('/users/set-password',             ChangePasswordController.setPassword);
+router.post('/users/set-password-first-login', ChangePasswordController.setPasswordFirstLogin);
+router.post('/set-password',                   ChangePasswordController.setPasswordFirstLogin);
+router.post('/password/users/change-password', ChangePasswordController.changePasswordByVehicleId);
 
-// Set Password (for first-time login or password reset)
-router.post("/users/set-password", ChangePasswordController.setPassword);
+// ── Forgot password (OTP-based) ───────────────────────────────────────────────
+router.post('/auth/forgot-password/request-otp',  ForgotPasswordController.requestOTP);
+router.post('/auth/forgot-password/verify-otp',   ForgotPasswordController.verifyOTP);
+router.post('/auth/forgot-password/reset-password', ForgotPasswordController.resetPassword);
+router.post('/auth/forgot-password/resend-otp',   ForgotPasswordController.resendOTP);
 
-// Set Password for first login (no old password required)
-router.post("/users/set-password-first-login", ChangePasswordController.setPasswordFirstLogin);
+// ── Recouvrement / partner routes (Keycloak-authenticated) ───────────────────
+// PUT /api/partner/change-password  { currentPassword, newPassword }
+router.put('/partner/change-password', authMiddleware, ChangePasswordController.changePasswordPartner);
 
-// Alternative route for first login
-router.post("/set-password", ChangePasswordController.setPasswordFirstLogin);
-
-// Change password using vehicle ID (existing functionality)
-router.post("/password/users/change-password", ChangePasswordController.changePasswordByVehicleId);
-
-
-// ========================================
-// 📱 FORGOT PASSWORD ROUTES (OTP-based)
-// ========================================
-
-// Step 1: Request OTP for password reset
-router.post("/auth/forgot-password/request-otp", ForgotPasswordController.requestOTP);
-
-// Step 2: Verify OTP code
-router.post("/auth/forgot-password/verify-otp", ForgotPasswordController.verifyOTP);
-
-// Step 3: Reset password with verified token
-router.post("/auth/forgot-password/reset-password", ForgotPasswordController.resetPassword);
-
-// Optional: Resend OTP if expired or not received
-router.post("/auth/forgot-password/resend-otp", ForgotPasswordController.resendOTP);
-
+// POST /api/partner/logout  { refreshToken }
+router.post('/partner/logout', authMiddleware, ChangePasswordController.logoutPartner);
 
 module.exports = router;

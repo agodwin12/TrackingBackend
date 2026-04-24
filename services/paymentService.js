@@ -96,7 +96,7 @@ const initiateSubscriptionPayment = async ({
 
     // ── MOBILE MONEY ──────────────────────────────────────────────────────────
     if (method === 'MOBILE_MONEY') {
-        const customRef = `WGO-${uuidv4().replace(/-/g, '').substring(0, 12).toUpperCase()}`;
+        const customRef = `FLT-${uuidv4().replace(/-/g, '').substring(0, 12).toUpperCase()}`;
 
         const payment = await Payment.create({
             user_id, vehicle_id, plan_id,
