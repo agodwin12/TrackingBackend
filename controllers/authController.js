@@ -283,9 +283,11 @@ exports.refreshToken = async (req, res) => {
             return res.status(401).json({
                 message: 'Session expired. Please login again.',
                 code:    'REFRESH_TOKEN_EXPIRED',
+
             });
         }
         logger.error('🔥 Refresh token error:', err.message);
         return res.status(500).json({ message: 'Error refreshing token' });
     }
 };
+//try
