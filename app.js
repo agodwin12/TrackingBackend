@@ -31,6 +31,8 @@ const paygate = require('./routes/payGate.routes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const leaseCutoffRoutes = require('./routes/leaseCutoffRoutes');
 const { handlePaygateWebhook } = require('./webhooks/paygateWebhook');
+const { getAppConfig } = require('./controllers/appConfigController');
+
 
 // ⚠️  DEV ONLY — not imported in production
 if (process.env.NODE_ENV !== 'production') {
@@ -169,6 +171,7 @@ if (process.env.NODE_ENV !== 'production') {
 
 // ========== API ROUTES ==========
 app.use('/api/auth', authRoutes);
+app.use('/api', leaseCutoffRoutes);
 app.use('/api', voitureRoutes);
 app.use('/api', vehicleRoutes);
 app.use('/api', dashboardVehicleRoutes);
@@ -187,7 +190,10 @@ app.use('/api/pin', pinRoutes);
 app.use('/api/geofence', geofenceRoutes);
 app.use('/api', paygate);
 app.use('/api/payments', paymentRoutes);
-app.use('/api', leaseCutoffRoutes);
+app.get('/api/app-config', getAppConfig);
+
+
+
 
 
 // ========== 404 HANDLER ==========

@@ -10,6 +10,8 @@ const TimeZoneAlertService = require('./services/timeZoneAlertService');
 const DeviceAlertService = require('./services/deviceAlertService');
 const BatteryMonitoringService = require('./services/batteryMonitoringService');
 const logger = require('./utils/logger');
+const redisClient = require('./config/redis');
+const cacheService = require('./services/cacheService');
 require('dotenv').config();
 
 // ========== MULTI-ACCOUNT GPS CONFIGURATION ==========
@@ -241,7 +243,8 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
     logger.debug(`\n📡 ========== GPS DATA PROCESSING [${accountName}] ==========`);
 
     const invalidatedVehicles = new Set();
-    const gpsUpdates = new Map();
+    const gpsUpdates          = new Map();
+    const macToVoitureId      = new Map(); // one DB lookup per unique MAC per cycle
 
     if (locations.success === 'true' && locations.data) {
         let totalRecords = 0;
@@ -249,29 +252,47 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
         for (const deviceData of locations.data) {
             if (deviceData.records && deviceData.records.length > 0) {
                 for (const record of deviceData.records) {
-                    const query = `
-                        INSERT INTO locations
-                        (sys_time, user_name, longitude, latitude, datetime, heart_time, speed, status, direction, mac_id_gps)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `;
-
-                    const formattedSysTime = convertToDatetime(record[0]);
+                    const formattedSysTime  = convertToDatetime(record[0]);
                     const formattedDatetime = convertToDatetime(record[6]);
                     const formattedHeartTime = convertToDatetime(record[7]);
-                    const macIdGps = record[11];
+                    const macIdGps   = record[11];
                     const statenumber = record[19] || '';
 
+                    // Resolve voiture_id — hit DB only once per unique MAC per cycle
+                    let voitureId = null;
+                    if (macToVoitureId.has(macIdGps)) {
+                        voitureId = macToVoitureId.get(macIdGps);
+                    } else {
+                        try {
+                            const [rows] = await connection.execute(
+                                'SELECT id FROM voitures WHERE mac_id_gps = ? LIMIT 1',
+                                [macIdGps]
+                            );
+                            voitureId = rows.length > 0 ? rows[0].id : null;
+                        } catch (e) {
+                            logger.error(`❌ [${accountName}] Failed to resolve voiture_id for MAC ${macIdGps}:`, e.message);
+                        }
+                        macToVoitureId.set(macIdGps, voitureId);
+                    }
+
+                    const query = `
+                        INSERT INTO locations
+                        (sys_time, user_name, longitude, latitude, datetime, heart_time, speed, status, direction, mac_id_gps, voiture_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `;
+
                     const values = [
-                        formattedSysTime,   // sys_time
-                        record[1],          // user_name
-                        record[2],          // longitude
-                        record[3],          // latitude
-                        formattedDatetime,  // datetime
-                        formattedHeartTime, // heart_time
-                        record[8],          // speed
-                        record[9],          // status
-                        record[10],         // direction
-                        macIdGps            // mac_id_gps
+                        formattedSysTime,
+                        record[1],
+                        record[2],
+                        record[3],
+                        formattedDatetime,
+                        formattedHeartTime,
+                        record[8],
+                        record[9],
+                        record[10],
+                        macIdGps,
+                        voitureId
                     ];
 
                     try {
@@ -281,16 +302,16 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                         invalidatedVehicles.add(macIdGps);
 
                         gpsUpdates.set(macIdGps, {
-                            latitude: parseFloat(record[3]),
-                            longitude: parseFloat(record[2]),
-                            speed: parseFloat(record[8]),
-                            status: record[9],
-                            direction: record[10],
-                            statenumber: statenumber, // 🆕 Store statenumber for battery monitoring
-                            timestamp: formattedDatetime || new Date().toISOString()
+                            latitude:    parseFloat(record[3]),
+                            longitude:   parseFloat(record[2]),
+                            speed:       parseFloat(record[8]),
+                            status:      record[9],
+                            direction:   record[10],
+                            statenumber: statenumber,
+                            timestamp:   formattedDatetime || new Date().toISOString()
                         });
 
-                        logger.debug(`💾 [${accountName}] Location saved: MAC=${macIdGps}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
+                        logger.debug(`💾 [${accountName}] Location saved: MAC=${macIdGps}, VoitureID=${voitureId}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
                     } catch (error) {
                         logger.error(`❌ [${accountName}] Error saving location:`, error.message);
                     }
@@ -302,7 +323,6 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
         logger.debug(`\n✅ [${accountName}] Total records saved: ${totalRecords}`);
 
-        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + ALL ALERT CHECKS
         if (invalidatedVehicles.size > 0) {
             for (const macId of invalidatedVehicles) {
                 try {
@@ -312,155 +332,148 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                     );
 
                     if (vehicles.length > 0) {
-                        const vehicleId = vehicles[0].id;
-                        const carModel = vehicles[0].model;
-                        const vehicleNickname = vehicles[0].nickname || vehicles[0].model;
-                        const gpsData = gpsUpdates.get(macId);
+                        const vehicleId      = vehicles[0].id;
+                        const carModel       = vehicles[0].model;
+                        const gpsData        = gpsUpdates.get(macId);
+                        const statusString   = gpsData.status ? String(gpsData.status) : '';
+                        const engineStatus   = (statusString.length > 2 && statusString[2] === '1') ? 'ON' : 'OFF';
 
-                        // Cache invalidation
-                        await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
+                        // ── WRITE-THROUGH CACHE ──────────────────────────────────────────
+                        // Build the full location payload and write it directly into Redis.
+                        // The app polls vehicle:{id}:location every 15s — this means it
+                        // will almost always hit Redis and never need to query locations table.
+                        // TTL = 60s: if GPS goes silent, cache expires and app falls back to DB.
+                        const locationPayload = {
+                            vehicleId,
+                            mac_id_gps:    macId,
+                            latitude:      gpsData.latitude,
+                            longitude:     gpsData.longitude,
+                            speed:         gpsData.speed,
+                            car_model:     carModel,
+                            engine_status: engineStatus,
+                            raw_status:    gpsData.status,
+                            timestamp:     gpsData.timestamp,
+                        };
+                        try {
+                            await cacheService.set(
+                                `vehicle:${vehicleId}:location`,
+                                locationPayload,
+                                60  // 60s TTL — refreshed every ~10s by GPS cycle
+                            );
+                            logger.debug(`💾 [${accountName}] Cache written: vehicle:${vehicleId}:location`);
+                        } catch (cacheErr) {
+                            logger.error(`❌ [${accountName}] Cache write error vehicle ${vehicleId}:`, cacheErr.message);
+                        }
 
-                        // ✅ Write back last known position to voitures table so login/refresh
-                        // snapshots always carry a real coordinate instead of the registration default.
-                        // Guard against 0,0 — those are pre-fix satellite readings, not real positions.
+                        // ── VELOCITY FILTER CACHE ────────────────────────────────────────
+                        // Store last valid position keyed by mac_id_gps so geofenceMonitor
+                        // can do the velocity check from Redis instead of querying locations.
+                        // Only write when coordinate is real (not 0,0).
                         if (gpsData.latitude !== 0 || gpsData.longitude !== 0) {
+                            try {
+                                await redisClient.setEx(
+                                    `gps:last:${macId}`,
+                                    7200, // 2h TTL — covers any reasonable GPS silence window
+                                    JSON.stringify({
+                                        latitude:  gpsData.latitude,
+                                        longitude: gpsData.longitude,
+                                        sys_time:  gpsData.timestamp,
+                                    })
+                                );
+                                logger.debug(`📍 [${accountName}] Velocity cache written: gps:last:${macId}`);
+                            } catch (velCacheErr) {
+                                logger.error(`❌ [${accountName}] Velocity cache write error MAC ${macId}:`, velCacheErr.message);
+                            }
+
+                            // Also keep voitures table in sync for login snapshots
                             try {
                                 await connection.execute(
                                     'UPDATE voitures SET latitude = ?, longitude = ? WHERE id = ?',
                                     [gpsData.latitude, gpsData.longitude, vehicleId]
                                 );
-                                logger.debug(`📍 [${accountName}] voitures position updated: vehicle=${vehicleId}, lat=${gpsData.latitude}, lng=${gpsData.longitude}`);
                             } catch (updateError) {
-                                logger.error(`❌ [${accountName}] Failed to update voitures position for vehicle ${vehicleId}:`, updateError.message);
+                                logger.error(`❌ [${accountName}] voitures position update error vehicle ${vehicleId}:`, updateError.message);
                             }
                         }
 
-                        // Socket.IO - GPS update
+                        // Socket.IO — GPS update
                         socketService.emitGPSUpdate(vehicleId, {
-                            latitude: gpsData.latitude,
-                            longitude: gpsData.longitude,
-                            speed: gpsData.speed,
-                            car_model: carModel,
-                            status: gpsData.status,
-                            direction: gpsData.direction,
-                            timestamp: gpsData.timestamp,
-                            mac_id_gps: macId
+                            latitude:    gpsData.latitude,
+                            longitude:   gpsData.longitude,
+                            speed:       gpsData.speed,
+                            car_model:   carModel,
+                            status:      gpsData.status,
+                            direction:   gpsData.direction,
+                            timestamp:   gpsData.timestamp,
+                            mac_id_gps:  macId
                         });
 
-                        // Determine GPS status
-                        let gpsStatus = "Disconnected";
-                        if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = "Connected";
-
-                        // Socket.IO - Dashboard update
+                        // Socket.IO — Dashboard update
+                        let gpsStatus = 'Disconnected';
+                        if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = 'Connected';
                         socketService.emitDashboardUpdate(vehicleId, {
-                            speed: gpsData.speed,
-                            gpsStatus: gpsStatus,
-                            vehicleStatus: gpsStatus === "Connected" ? "Active" : "Inactive"
+                            speed:         gpsData.speed,
+                            gpsStatus:     gpsStatus,
+                            vehicleStatus: gpsStatus === 'Connected' ? 'Active' : 'Inactive'
                         });
 
                         // ========== ALERT CHECKS ==========
                         logger.debug(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
 
-                        // 🔋 0. BATTERY MONITORING CHECK (FIRST - runs on every GPS update)
+                        // 0. Battery monitoring
                         try {
-                            logger.debug(`🔋 Checking battery level for vehicle ${vehicleId}...`);
-
                             await BatteryMonitoringService.processBatteryLevel({
                                 statenumber: gpsData.statenumber,
                                 StateNumber: gpsData.statenumber,
-                                weidu: gpsData.latitude,
-                                jingdu: gpsData.longitude,
-                                latitude: gpsData.latitude,
-                                longitude: gpsData.longitude
+                                weidu:       gpsData.latitude,
+                                jingdu:      gpsData.longitude,
+                                latitude:    gpsData.latitude,
+                                longitude:   gpsData.longitude
                             }, macId);
-
-                            logger.debug(`✅ Battery monitoring check completed for vehicle ${vehicleId}`);
                         } catch (batteryError) {
-                            logger.error(`❌ Battery monitoring error for vehicle ${vehicleId}:`, batteryError.message);
+                            logger.error(`❌ Battery monitoring error vehicle ${vehicleId}:`, batteryError.message);
                         }
 
-                        // ✅ 1. Safe zone violation check (FIXED - handles both leave AND return)
+                        // 1. Safe zone
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-
-                            // Handle vehicle LEAVING safe zone
-                            if (safeZoneResult.violation && safeZoneResult.isFirstAlert) {
-                                logger.info(`🚨 SAFE ZONE VIOLATION DETECTED!`);
-                                logger.info(`   Vehicle left the safe zone`);
-                                logger.info(`📧 Safe zone "left" alert created and notification sent`);
-                            }
-
-                            // ✅ FIXED: Handle vehicle RETURNING to safe zone
-                            if (safeZoneResult.returned && safeZoneResult.isFirstAlert) {
-                                logger.info(`✅ VEHICLE RETURNED TO SAFE ZONE!`);
-                                logger.info(`   Vehicle returned to safe zone`);
-                                logger.info(`📧 Safe zone "returned" alert created and notification sent`);
-                            }
+                            if (safeZoneResult.violation && safeZoneResult.isFirstAlert)
+                                logger.info(`🚨 SAFE ZONE VIOLATION vehicle ${vehicleId}`);
+                            if (safeZoneResult.returned && safeZoneResult.isFirstAlert)
+                                logger.info(`✅ VEHICLE RETURNED TO SAFE ZONE vehicle ${vehicleId}`);
                         } catch (safeZoneError) {
                             logger.error(`❌ Safe zone check error:`, safeZoneError.message);
                         }
 
-                        // ✅ 2. Geofence violation check (UPDATED - no more cooldown logic)
+                        // 2. Geofence
                         try {
                             const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-
-                            // Handle state changes (leaving or returning)
                             if (geofenceResult.stateChanged) {
-                                if (geofenceResult.currentState === 'outside') {
-                                    // Vehicle LEFT the geofence
-                                    logger.info(`🚨 GEOFENCE VIOLATION DETECTED!`);
-                                    logger.info(`   Vehicle left the defined zone`);
-                                    logger.info(`   Previous state: ${geofenceResult.previousState}`);
-                                    logger.info(`   Current state: ${geofenceResult.currentState}`);
-                                    logger.info(`📧 Geofence alert created and notification sent`);
-                                } else if (geofenceResult.currentState === 'inside') {
-                                    logger.info(`✅ VEHICLE RETURNED TO GEOFENCE!`);
-                                    logger.info(`   Vehicle returned to the defined zone`);
-                                    logger.info(`   Previous state: ${geofenceResult.previousState}`);
-                                    logger.info(`   Current state: ${geofenceResult.currentState}`);
-                                    logger.info(`📧 Geofence return alert created and notification sent`);
-                                }
-                            } else {
-                                // No state change - vehicle still in same state
-                                logger.debug(`ℹ️ No geofence state change (vehicle still ${geofenceResult.currentState || 'in previous state'})`);
+                                logger.info(`🚨 GEOFENCE STATE CHANGE vehicle ${vehicleId}: ${geofenceResult.previousState} → ${geofenceResult.currentState}`);
                             }
                         } catch (geofenceError) {
                             logger.error(`❌ Geofence check error:`, geofenceError.message);
                         }
 
-                        // ✅ 3. Speed violation check
+                        // 3. Speed
                         try {
                             await SpeedAlertService.checkSpeedViolation(
-                                vehicleId,
-                                macId,
-                                gpsData.speed,
-                                {
-                                    latitude: gpsData.latitude,
-                                    longitude: gpsData.longitude
-                                }
+                                vehicleId, macId, gpsData.speed,
+                                { latitude: gpsData.latitude, longitude: gpsData.longitude }
                             );
                         } catch (speedError) {
                             logger.error(`❌ Speed check error:`, speedError.message);
                         }
 
-                        // ✅ 4. Time zone violation check
+                        // 4. Time zone
                         try {
                             await TimeZoneAlertService.checkTimeZoneViolation(
-                                vehicleId,
-                                macId,
-                                gpsData.speed,
-                                {
-                                    latitude: gpsData.latitude,
-                                    longitude: gpsData.longitude
-                                }
+                                vehicleId, macId, gpsData.speed,
+                                { latitude: gpsData.latitude, longitude: gpsData.longitude }
                             );
                         } catch (timeZoneError) {
                             logger.error(`❌ Time zone check error:`, timeZoneError.message);
                         }
-
-                        // ✅ 5. Device disconnection/removal alarms
-                        // These are handled separately via alarm data processing
-                        // See processAlarmData() function which processes device alarms from GPS provider
 
                         logger.debug(`✅ All alert checks completed for vehicle ${vehicleId}`);
                     }
@@ -475,6 +488,7 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
     logger.debug(`\n========== GPS DATA PROCESSING COMPLETE [${accountName}] ==========\n`);
 }
+
 
 // ========== MAIN GPS FETCH CYCLE (MULTI-ACCOUNT) ==========
 async function fetchGPSData() {

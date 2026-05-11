@@ -1,854 +1,590 @@
-// controllers/geofenceMonitorController.js
 
-const VehicleSecurity = require('../models/vehicleSecurity');
-const Alert = require('../models/Alert');
+const Alert           = require('../models/Alert');
 const notificationController = require('./notificationController');
-const sequelize = require('../config/database');
+const sequelize       = require('../config/database');
 const { isInsideGeofence } = require('../services/geofenceService');
-const socketService = require('../services/socketService');
-const axios = require('axios');
+const socketService   = require('../services/socketService');
+const axios           = require('axios');
 const { hasFeature, FEATURES } = require('../services/hasFeature');
+const logger          = require('../utils/logger');
+const redisClient = require('../config/redis');
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
-// ✅ Cooldown period for geofence alerts (in minutes)
-const GEOFENCE_ALERT_COOLDOWN_MINUTES = 30;
+// ── tuneable constants ────────────────────────────────────────────────────────
+// Maximum plausible ground speed (km/h). Anything above this is a GPS spike.
+// 200 km/h is already very generous for Cameroon moto/car fleet.
+const MAX_PLAUSIBLE_SPEED_KMH = 200;
 
+// How many consecutive outside readings required before firing LEFT_ZONE alert.
+// 3 = need three back-to-back bad readings → covers the 2-minute Nsimalen incident.
+const OUTSIDE_CONFIRM_THRESHOLD = 3;
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── haversine distance (km) ───────────────────────────────────────────────────
+const haversineKm = (lat1, lng1, lat2, lng2) => {
+    const R    = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a    = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1 * Math.PI / 180) *
+        Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+// ── velocity / plausibility filter ───────────────────────────────────────────
 /**
- * ✅ Get user alert settings from users table
+ * Returns true if the new coordinate is plausible given recent history.
+ * Returns false if the implied speed vs the previous reading exceeds
+ * MAX_PLAUSIBLE_SPEED_KMH (i.e. the device teleported).
  */
-const getUserAlertSettings = async (userId) => {
+const isCoordinatePlausible = async (macIdGps, newLat, newLng) => {
     try {
-        console.log(`🔍 Fetching alert settings for user ${userId}`);
+        let prevLat, prevLng, prevTime;
 
-        const [user] = await sequelize.query(
-            'SELECT geofence_alerts_enabled, safe_zone_alerts_enabled FROM users WHERE id = ? LIMIT 1',
-            {
-                replacements: [userId],
-                type: sequelize.QueryTypes.SELECT
+        // Redis first — written by location.js on every GPS cycle, O(1)
+        const cached = await redisClient.get(`gps:last:${macIdGps}`);
+        if (cached) {
+            const p = JSON.parse(cached);
+            prevLat  = parseFloat(p.latitude);
+            prevLng  = parseFloat(p.longitude);
+            prevTime = new Date(p.sys_time);
+            logger.debug(`🛡️ [VelocityFilter] Redis HIT mac=${macIdGps}`);
+        } else {
+            // DB fallback — only on cold start or after Redis restart
+            logger.debug(`🛡️ [VelocityFilter] Redis MISS mac=${macIdGps} — querying DB`);
+            const rows = await sequelize.query(
+                `SELECT latitude, longitude, sys_time
+                 FROM   locations
+                 WHERE  mac_id_gps = :mac
+                   AND  latitude  != 0
+                   AND  longitude != 0
+                 ORDER  BY sys_time DESC
+                 LIMIT  1`,
+                { replacements: { mac: macIdGps }, type: sequelize.QueryTypes.SELECT }
+            );
+            if (!rows || rows.length === 0) {
+                return { plausible: true, reason: 'no_prior_data' };
             }
+            prevLat  = parseFloat(rows[0].latitude);
+            prevLng  = parseFloat(rows[0].longitude);
+            prevTime = new Date(rows[0].sys_time);
+        }
+
+        const distKm          = haversineKm(prevLat, prevLng, newLat, newLng);
+        const hoursElapsed    = (Date.now() - prevTime.getTime()) / 3_600_000;
+        const impliedSpeedKmh = hoursElapsed > 0
+            ? distKm / hoursElapsed
+            : distKm > 0.05 ? Infinity : 0;
+
+        logger.debug(
+            `🛡️ [VelocityFilter] mac=${macIdGps} dist=${distKm.toFixed(2)}km ` +
+            `elapsed=${(hoursElapsed * 60).toFixed(1)}min speed=${impliedSpeedKmh.toFixed(0)}km/h`
         );
 
+        if (impliedSpeedKmh > MAX_PLAUSIBLE_SPEED_KMH) {
+            logger.warn(
+                `🚨 [VelocityFilter] TELEPORT DETECTED mac=${macIdGps} ` +
+                `${distKm.toFixed(1)}km in ${(hoursElapsed * 60).toFixed(1)}min ` +
+                `(${impliedSpeedKmh.toFixed(0)}km/h) — coordinate REJECTED`
+            );
+            return { plausible: false, reason: 'velocity_exceeded', distKm, impliedSpeedKmh };
+        }
+
+        return { plausible: true, reason: 'ok', distKm, impliedSpeedKmh };
+
+    } catch (err) {
+        logger.error(`❌ [VelocityFilter] error: ${err.message}`);
+        return { plausible: true, reason: 'filter_error' };
+    }
+};
+
+// ── alert settings ────────────────────────────────────────────────────────────
+const getUserAlertSettings = async (userId) => {
+    try {
+        const [user] = await sequelize.query(
+            'SELECT geofence_alerts_enabled, safe_zone_alerts_enabled FROM users WHERE id = ? LIMIT 1',
+            { replacements: [userId], type: sequelize.QueryTypes.SELECT }
+        );
         if (user) {
-            const settings = {
+            return {
                 geofenceAlertsEnabled: user.geofence_alerts_enabled !== false,
                 safeZoneAlertsEnabled: user.safe_zone_alerts_enabled !== false,
             };
-
-            console.log(`✅ Alert settings retrieved for user ${userId}:`, settings);
-            return settings;
         }
-
-        console.warn(`⚠️ User ${userId} not found, using default settings`);
-        return {
-            geofenceAlertsEnabled: true,
-            safeZoneAlertsEnabled: true,
-        };
-    } catch (error) {
-        console.error(`❌ Error fetching user alert settings for user ${userId}:`, error);
-        return {
-            geofenceAlertsEnabled: true,
-            safeZoneAlertsEnabled: true,
-        };
+        return { geofenceAlertsEnabled: true, safeZoneAlertsEnabled: true };
+    } catch (err) {
+        logger.error(`❌ getUserAlertSettings: ${err.message}`);
+        return { geofenceAlertsEnabled: true, safeZoneAlertsEnabled: true };
     }
 };
 
-/**
- * ✅ UPDATED: Format location name - Better fallback handling
- */
-const formatLocationName = (locationInfo) => {
-    const { route, sublocality, locality, neighborhood, administrativeArea } = locationInfo;
-
-    // Priority 1: route + sublocality
-    if (route && sublocality) {
-        return `${route}, ${sublocality}`;
-    }
-
-    // Priority 2: route only
-    if (route) {
-        return route;
-    }
-
-    // Priority 3: sublocality only
-    if (sublocality) {
-        return sublocality;
-    }
-
-    // Priority 4: neighborhood
-    if (neighborhood) {
-        return neighborhood;
-    }
-
-    // Priority 5: locality (city/town)
-    if (locality) {
-        return locality;
-    }
-
-    // Priority 6: administrative area
-    if (administrativeArea) {
-        return administrativeArea;
-    }
-
-    // Last fallback: areaName or "Unknown Location"
-    return locationInfo.areaName || 'Unknown Location';
+// ── geocoding helpers ─────────────────────────────────────────────────────────
+const formatLocationName = ({ route, sublocality, locality, neighborhood, administrativeArea, areaName }) => {
+    if (route && sublocality) return `${route}, ${sublocality}`;
+    if (route)               return route;
+    if (sublocality)         return sublocality;
+    if (neighborhood)        return neighborhood;
+    if (locality)            return locality;
+    if (administrativeArea)  return administrativeArea;
+    return areaName || 'Unknown Location';
 };
 
-/**
- * ✅ UPDATED: Reverse geocode with better error handling and logging
- */
 const reverseGeocode = async (latitude, longitude) => {
     try {
-        console.log(`📍 Reverse geocoding: [${latitude}, ${longitude}]`);
-
-        const response = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
-            params: {
-                latlng: `${latitude},${longitude}`,
-                key: GOOGLE_MAPS_API_KEY,
-                language: 'en'
-            },
+        const res = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
+            params: { latlng: `${latitude},${longitude}`, key: GOOGLE_MAPS_API_KEY, language: 'en' },
             timeout: 5000
         });
 
-        console.log(`📡 Geocoding API Status: ${response.data.status}`);
+        if (res.data.status === 'OK' && res.data.results.length > 0) {
+            const result = res.data.results[0];
+            let neighborhood = null, locality = null, sublocality = null;
+            let route = null, administrativeArea = null, country = null;
 
-        if (response.data.status === 'OK' && response.data.results.length > 0) {
-            const result = response.data.results[0];
-            const formattedAddress = result.formatted_address;
-
-            // Extract detailed location components
-            let neighborhood = null;
-            let locality = null;
-            let sublocality = null;
-            let route = null;
-            let administrativeArea = null;
-            let country = null;
-
-            for (const component of result.address_components) {
-                if (component.types.includes('neighborhood')) {
-                    neighborhood = component.long_name;
-                } else if (component.types.includes('route')) {
-                    route = component.long_name;
-                } else if (component.types.includes('sublocality') || component.types.includes('sublocality_level_1')) {
-                    sublocality = component.long_name;
-                } else if (component.types.includes('locality')) {
-                    locality = component.long_name;
-                } else if (component.types.includes('administrative_area_level_2')) {
-                    if (!locality) administrativeArea = component.long_name;
-                } else if (component.types.includes('administrative_area_level_1')) {
-                    if (!locality && !administrativeArea) administrativeArea = component.long_name;
-                } else if (component.types.includes('country')) {
-                    country = component.long_name;
-                }
+            for (const c of result.address_components) {
+                if (c.types.includes('neighborhood'))                               neighborhood = c.long_name;
+                else if (c.types.includes('route'))                                 route        = c.long_name;
+                else if (c.types.includes('sublocality') || c.types.includes('sublocality_level_1')) sublocality = c.long_name;
+                else if (c.types.includes('locality'))                              locality     = c.long_name;
+                else if (c.types.includes('administrative_area_level_2') && !locality)             administrativeArea = c.long_name;
+                else if (c.types.includes('administrative_area_level_1') && !locality && !administrativeArea) administrativeArea = c.long_name;
+                else if (c.types.includes('country'))                               country      = c.long_name;
             }
 
-            // Build areaName with better fallback logic
-            const areaName = neighborhood || route || sublocality || locality || administrativeArea || country || formattedAddress.split(',')[0] || 'Unknown Location';
-
-            console.log(`✅ Geocoded successfully!`);
-            console.log(`   Route/Street: ${route || 'N/A'}`);
-            console.log(`   Sublocality: ${sublocality || 'N/A'}`);
-            console.log(`   Neighborhood: ${neighborhood || 'N/A'}`);
-            console.log(`   Locality: ${locality || 'N/A'}`);
-            console.log(`   Administrative Area: ${administrativeArea || 'N/A'}`);
-            console.log(`   Country: ${country || 'N/A'}`);
-            console.log(`   Full Address: ${formattedAddress}`);
-
+            const areaName = neighborhood || route || sublocality || locality || administrativeArea || country || result.formatted_address.split(',')[0] || 'Unknown Location';
             return {
-                formattedAddress: formattedAddress,
-                areaName: areaName,
+                formattedAddress: result.formatted_address, areaName,
                 locality: locality || administrativeArea || areaName,
-                neighborhood: neighborhood,
-                route: route,
-                sublocality: sublocality,
-                administrativeArea: administrativeArea,
-                country: country,
-                success: true
-            };
-        } else if (response.data.status === 'ZERO_RESULTS') {
-            console.warn(`⚠️ Geocoding returned ZERO_RESULTS - location may be in ocean/remote area`);
-            return {
-                formattedAddress: 'Unknown Location',
-                areaName: 'Unknown Location',
-                locality: 'Unknown Location',
-                success: false,
-                errorReason: 'ZERO_RESULTS'
-            };
-        } else if (response.data.status === 'OVER_QUERY_LIMIT') {
-            console.error(`❌ Google Maps API quota exceeded!`);
-            return {
-                formattedAddress: 'Location unavailable (API limit)',
-                areaName: 'Location unavailable',
-                locality: 'Location unavailable',
-                success: false,
-                errorReason: 'OVER_QUERY_LIMIT'
-            };
-        } else if (response.data.status === 'REQUEST_DENIED') {
-            console.error(`❌ Google Maps API request denied - check API key!`);
-            return {
-                formattedAddress: 'Location unavailable (API error)',
-                areaName: 'Location unavailable',
-                locality: 'Location unavailable',
-                success: false,
-                errorReason: 'REQUEST_DENIED'
-            };
-        } else {
-            console.warn(`⚠️ Geocoding failed: ${response.data.status}`);
-            console.warn(`   Error message: ${response.data.error_message || 'No error message'}`);
-            return {
-                formattedAddress: 'Unknown Location',
-                areaName: 'Unknown Location',
-                locality: 'Unknown Location',
-                success: false,
-                errorReason: response.data.status
+                neighborhood, route, sublocality, administrativeArea, country, success: true
             };
         }
-    } catch (error) {
-        console.error(`❌ Geocoding error:`, error.message);
 
-        // Check if it's a timeout
-        if (error.code === 'ECONNABORTED') {
-            console.error(`   Reason: Request timeout`);
-        }
-
-        // Check if it's a network error
-        if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-            console.error(`   Reason: Network error - cannot reach Google Maps API`);
-        }
-
-        return {
-            formattedAddress: 'Unknown Location',
-            areaName: 'Unknown Location',
-            locality: 'Unknown Location',
-            success: false,
-            errorReason: error.message
-        };
+        return { formattedAddress: 'Unknown Location', areaName: 'Unknown Location', locality: 'Unknown Location', success: false };
+    } catch (err) {
+        logger.error(`❌ reverseGeocode: ${err.message}`);
+        return { formattedAddress: 'Unknown Location', areaName: 'Unknown Location', locality: 'Unknown Location', success: false };
     }
 };
 
-/**
- * ✅ NEW: Get current geofence state from vehicle_security
- */
+// ── geofence state helpers ────────────────────────────────────────────────────
 const getCurrentGeofenceState = async (vehicleId) => {
     try {
-        const [security] = await sequelize.query(
-            `SELECT last_geofence_state, last_state_change_at
-             FROM vehicle_security
-             WHERE voiture_id = ?
-                 LIMIT 1`,
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+        const [row] = await sequelize.query(
+            `SELECT last_geofence_state, last_state_change_at,
+                    consecutive_outside_count, last_outside_at
+             FROM vehicle_security WHERE voiture_id = ? LIMIT 1`,
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
-
-        if (security) {
+        if (row) {
             return {
-                currentState: security.last_geofence_state || 'inside',
-                lastStateChangeAt: security.last_state_change_at ? new Date(security.last_state_change_at) : null
+                currentState:            row.last_geofence_state || 'inside',
+                lastStateChangeAt:       row.last_state_change_at ? new Date(row.last_state_change_at) : null,
+                consecutiveOutsideCount: parseInt(row.consecutive_outside_count) || 0,
+                lastOutsideAt:           row.last_outside_at ? new Date(row.last_outside_at) : null,
             };
         }
-
-        return {
-            currentState: 'inside',
-            lastStateChangeAt: null
-        };
-    } catch (error) {
-        console.error('🔥 Error getting current geofence state:', error);
-        return {
-            currentState: 'inside',
-            lastStateChangeAt: null
-        };
+        return { currentState: 'inside', lastStateChangeAt: null, consecutiveOutsideCount: 0, lastOutsideAt: null };
+    } catch (err) {
+        logger.error(`❌ getCurrentGeofenceState: ${err.message}`);
+        return { currentState: 'inside', lastStateChangeAt: null, consecutiveOutsideCount: 0, lastOutsideAt: null };
     }
 };
 
-/**
- * ✅ NEW: Update geofence state in vehicle_security
- */
 const updateGeofenceState = async (vehicleId, newState, crossingTime) => {
     try {
         await sequelize.query(
             `UPDATE vehicle_security
-             SET last_geofence_state = ?,
-                 last_state_change_at = ?
+             SET last_geofence_state = ?, last_state_change_at = ?
              WHERE voiture_id = ?`,
-            {
-                replacements: [newState, crossingTime, vehicleId],
-                type: sequelize.QueryTypes.UPDATE
-            }
+            { replacements: [newState, crossingTime, vehicleId], type: sequelize.QueryTypes.UPDATE }
         );
-
-        console.log(`✅ Updated geofence state: ${newState} at ${crossingTime}`);
         return true;
-    } catch (error) {
-        console.error('🔥 Error updating geofence state:', error);
+    } catch (err) {
+        logger.error(`❌ updateGeofenceState: ${err.message}`);
         return false;
     }
 };
 
 /**
- * ✅ NEW: Get active geofence alert (LEFT_ZONE that hasn't been resolved)
+ * Increment the consecutive-outside counter.
+ * Returns the new count so the caller can decide whether to fire the alert.
  */
+const incrementOutsideCounter = async (vehicleId) => {
+    try {
+        await sequelize.query(
+            `UPDATE vehicle_security
+             SET consecutive_outside_count = consecutive_outside_count + 1,
+                 last_outside_at = NOW()
+             WHERE voiture_id = ?`,
+            { replacements: [vehicleId], type: sequelize.QueryTypes.UPDATE }
+        );
+        // Read back the new value
+        const [row] = await sequelize.query(
+            'SELECT consecutive_outside_count FROM vehicle_security WHERE voiture_id = ? LIMIT 1',
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
+        );
+        return parseInt(row?.consecutive_outside_count) || 1;
+    } catch (err) {
+        logger.error(`❌ incrementOutsideCounter: ${err.message}`);
+        return 1;
+    }
+};
+
+/** Reset the counter when the vehicle returns inside. */
+const resetOutsideCounter = async (vehicleId) => {
+    try {
+        await sequelize.query(
+            `UPDATE vehicle_security
+             SET consecutive_outside_count = 0, last_outside_at = NULL
+             WHERE voiture_id = ?`,
+            { replacements: [vehicleId], type: sequelize.QueryTypes.UPDATE }
+        );
+    } catch (err) {
+        logger.error(`❌ resetOutsideCounter: ${err.message}`);
+    }
+};
+
 const getActiveGeofenceAlert = async (vehicleId) => {
     try {
         const [alert] = await sequelize.query(
             `SELECT id, alerted_at, alert_subtype, alert_status
              FROM alerts
-             WHERE voiture_id = ?
-               AND alert_type = 'geofence'
-               AND alert_subtype = 'LEFT_ZONE'
-               AND alert_status = 'ACTIVE'
-             ORDER BY alerted_at DESC
-                 LIMIT 1`,
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+             WHERE voiture_id = ? AND alert_type = 'geofence'
+               AND alert_subtype = 'LEFT_ZONE' AND alert_status = 'ACTIVE'
+             ORDER BY alerted_at DESC LIMIT 1`,
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
-
         return alert || null;
-    } catch (error) {
-        console.error('🔥 Error getting active geofence alert:', error);
+    } catch (err) {
+        logger.error(`❌ getActiveGeofenceAlert: ${err.message}`);
         return null;
     }
 };
 
-/**
- * ✅ NEW: Mark alert as resolved
- */
 const resolveAlert = async (alertId) => {
     try {
         await sequelize.query(
-            `UPDATE alerts
-             SET alert_status = 'RESOLVED'
-             WHERE id = ?`,
-            {
-                replacements: [alertId],
-                type: sequelize.QueryTypes.UPDATE
-            }
+            `UPDATE alerts SET alert_status = 'RESOLVED' WHERE id = ?`,
+            { replacements: [alertId], type: sequelize.QueryTypes.UPDATE }
         );
-
-        console.log(`✅ Alert ${alertId} marked as RESOLVED`);
+        logger.info(`✅ Alert ${alertId} resolved`);
         return true;
-    } catch (error) {
-        console.error('🔥 Error resolving alert:', error);
+    } catch (err) {
+        logger.error(`❌ resolveAlert: ${err.message}`);
         return false;
     }
 };
 
-/**
- * ✅ NEW: Format time string from minutes
- */
 const formatTimeAgo = (minutes) => {
-    if (minutes === 0) {
-        return 'just now';
-    } else if (minutes === 1) {
-        return '1 minute ago';
-    } else {
-        return `${minutes} minutes ago`;
-    }
+    if (minutes === 0)  return 'just now';
+    if (minutes === 1)  return '1 minute ago';
+    return `${minutes} minutes ago`;
 };
 
-/**
- * ✅ NEW: Initialize geofence state when geofence is created/enabled
- * This handles the case where vehicle is already outside when geofence is set up
- */
+// ── initialize state ──────────────────────────────────────────────────────────
 const initializeGeofenceState = async (vehicleId) => {
     try {
-        console.log(`\n========================================`);
-        console.log(`🎯 INITIALIZING GEOFENCE STATE`);
-        console.log(`========================================`);
-        console.log(`🚗 Vehicle ID: ${vehicleId}`);
-
-        // Get vehicle data
         const [voiture] = await sequelize.query(
             'SELECT id, mac_id_gps, geofence_zone, nickname, marque, model FROM voitures WHERE id = ?',
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
+        if (!voiture || !voiture.geofence_zone) return { success: false, reason: 'No geofence defined' };
 
-        if (!voiture || !voiture.geofence_zone) {
-            console.log(`⚠️ No geofence defined for vehicle ${vehicleId}`);
-            console.log(`========================================\n`);
-            return { success: false, reason: 'No geofence defined' };
-        }
-
-        // Get latest GPS location
         const [location] = await sequelize.query(
-            'SELECT latitude, longitude, datetime FROM locations WHERE mac_id_gps = ? ORDER BY datetime DESC LIMIT 1',
-            {
-                replacements: [voiture.mac_id_gps],
-                type: sequelize.QueryTypes.SELECT
-            }
+            'SELECT latitude, longitude FROM locations WHERE mac_id_gps = ? AND latitude != 0 AND longitude != 0 ORDER BY sys_time DESC LIMIT 1',
+            { replacements: [voiture.mac_id_gps], type: sequelize.QueryTypes.SELECT }
         );
+        if (!location) return { success: false, reason: 'No GPS data' };
 
-        if (!location) {
-            console.log(`⚠️ No GPS data available for vehicle ${vehicleId}`);
-            console.log(`========================================\n`);
-            return { success: false, reason: 'No GPS data' };
-        }
-
-        console.log(`📍 Current location: [${location.latitude}, ${location.longitude}]`);
-
-        // Parse geofence
         let geofenceZone;
         try {
             geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone)
-                : voiture.geofence_zone;
-        } catch (error) {
-            console.log(`❌ Invalid geofence data`);
-            console.log(`========================================\n`);
-            return { success: false, reason: 'Invalid geofence data' };
-        }
+                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
+        } catch (_) { return { success: false, reason: 'Invalid geofence data' }; }
 
-        // Check if vehicle is inside or outside
-        const isInside = isInsideGeofence(location.latitude, location.longitude, geofenceZone);
+        const isInside     = isInsideGeofence(location.latitude, location.longitude, geofenceZone);
         const initialState = isInside ? 'inside' : 'outside';
 
-        console.log(`🎯 Vehicle is currently: ${isInside ? '🟢 INSIDE' : '🔴 OUTSIDE'}`);
-        console.log(`📊 Setting initial state to: ${initialState}`);
-
-        // Update vehicle_security with initial state
         await sequelize.query(
             `UPDATE vehicle_security
-             SET last_geofence_state = ?,
-                 last_state_change_at = NOW()
+             SET last_geofence_state = ?, last_state_change_at = NOW(),
+                 consecutive_outside_count = 0, last_outside_at = NULL
              WHERE voiture_id = ?`,
-            {
-                replacements: [initialState, vehicleId],
-                type: sequelize.QueryTypes.UPDATE
-            }
+            { replacements: [initialState, vehicleId], type: sequelize.QueryTypes.UPDATE }
         );
 
-        console.log(`✅ Geofence state initialized successfully`);
-        console.log(`========================================\n`);
-
-        return {
-            success: true,
-            vehicleId,
-            initialState,
-            isInside,
-            latitude: location.latitude,
-            longitude: location.longitude
-        };
-
-    } catch (error) {
-        console.error(`❌ Error initializing geofence state:`, error);
-        console.log(`========================================\n`);
-        return { success: false, reason: 'Error occurred', error: error.message };
+        logger.info(`✅ Geofence state initialized vehicleId=${vehicleId} state=${initialState}`);
+        return { success: true, vehicleId, initialState, isInside, latitude: location.latitude, longitude: location.longitude };
+    } catch (err) {
+        logger.error(`❌ initializeGeofenceState: ${err.message}`);
+        return { success: false, reason: 'Error', error: err.message };
     }
 };
 
-/**
- * ✅ ENHANCED: Check geofence with state tracking
- */
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN CHECK — called from location.js on every GPS update
+// ══════════════════════════════════════════════════════════════════════════════
 const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
-    console.log(`\n========================================`);
-    console.log(`🚨 GEOFENCE CHECK STARTED`);
-    console.log(`========================================`);
-    console.log(`🚗 Vehicle ID: ${vehicleId}`);
-    console.log(`📍 Current Position: [${latitude}, ${longitude}]`);
+    logger.debug(`\n🚨 [Geofence] check vehicleId=${vehicleId} pos=[${latitude},${longitude}]`);
 
     try {
-        // ✅ STEP 1: Fetch vehicle data
-        console.log(`\n🔍 STEP 1: Fetching vehicle from database...`);
+        // ── STEP 1: vehicle + geofence zone ──────────────────────────────────
         const [voiture] = await sequelize.query(
-            'SELECT id, geofence_zone, nickname, marque, model FROM voitures WHERE id = ?',
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+            'SELECT id, mac_id_gps, geofence_zone, nickname, marque, model FROM voitures WHERE id = ?',
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
+        if (!voiture) return { violation: false, reason: 'Vehicle not found' };
 
-        if (!voiture) {
-            console.warn(`⚠️ Vehicle ${vehicleId} not found`);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'Vehicle not found' };
-        }
-
-        console.log(`✅ Vehicle found: ${voiture.nickname || `${voiture.marque} ${voiture.model}`}`);
-
-        // ✅ STEP 2: Check if geofencing is active
-        console.log(`\n🔍 STEP 2: Checking if geofencing is active...`);
+        // ── STEP 2: geofencing active? ────────────────────────────────────────
         const [security] = await sequelize.query(
             'SELECT id, voiture_id, is_active FROM vehicle_security WHERE voiture_id = ? LIMIT 1',
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
+        if (!security || !security.is_active) return { violation: false, reason: 'Geofencing not active' };
 
-        if (!security || !security.is_active) {
-            console.log(`ℹ️ Geofencing not active for vehicle ${vehicleId}`);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'Geofencing not active' };
-        }
-
-        console.log(`✅ Geofencing is ACTIVE`);
-
-        // ✅ STEP 2b: Check subscription
-        console.log(`\n🔍 STEP 2b: Checking geofence subscription...`);
+        // ── STEP 2b: subscription check ───────────────────────────────────────
         const hasGeofence = await hasFeature(vehicleId, FEATURES.GEOFENCE);
-        if (!hasGeofence) {
-            console.log(`ℹ️ Vehicle ${vehicleId} has no active geofence subscription — skipping`);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'No geofence subscription' };
-        }
-        console.log(`✅ Geofence subscription confirmed`);
+        if (!hasGeofence) return { violation: false, reason: 'No geofence subscription' };
 
-        // ✅ STEP 3: Check if geofence zone is defined
-        console.log(`\n🔍 STEP 3: Checking geofence zone...`);
-        if (!voiture.geofence_zone) {
-            console.warn(`⚠️ No geofence zone defined`);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'No geofence defined' };
+        // ── STEP 3: zone defined? ─────────────────────────────────────────────
+        if (!voiture.geofence_zone) return { violation: false, reason: 'No geofence defined' };
+
+        // ── STEP 4: VELOCITY / PLAUSIBILITY FILTER ────────────────────────────
+        //  Compare new coordinate against last DB position.
+        //  Reject if implied speed > MAX_PLAUSIBLE_SPEED_KMH.
+        const plausibility = await isCoordinatePlausible(voiture.mac_id_gps, latitude, longitude);
+        if (!plausibility.plausible) {
+            logger.warn(`🛡️ [Geofence] Coordinate rejected — velocity filter ` +
+                `(${plausibility.impliedSpeedKmh?.toFixed(0)} km/h) vehicleId=${vehicleId}`);
+            return {
+                violation: false,
+                reason:    'coordinate_rejected_velocity',
+                filter:    plausibility
+            };
         }
 
-        // ✅ STEP 4: Parse geofence zone
-        console.log(`\n🔍 STEP 4: Parsing geofence zone...`);
+        // ── STEP 5: parse zone ────────────────────────────────────────────────
         let geofenceZone;
         try {
             geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone)
-                : voiture.geofence_zone;
+                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
+        } catch (_) { return { violation: false, reason: 'Invalid geofence data' }; }
 
-            console.log(`✅ Geofence zone parsed: ${geofenceZone.length} points`);
-        } catch (parseError) {
-            console.error(`❌ Error parsing geofence zone:`, parseError);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'Invalid geofence data' };
-        }
-
-        // ✅ STEP 5: Check if vehicle is inside/outside
-        console.log(`\n🔍 STEP 5: Checking vehicle position...`);
-        const isInside = isInsideGeofence(latitude, longitude, geofenceZone);
+        // ── STEP 6: inside or outside? ────────────────────────────────────────
+        const isInside     = isInsideGeofence(latitude, longitude, geofenceZone);
         const currentState = isInside ? 'inside' : 'outside';
+        logger.debug(`🎯 [Geofence] vehicleId=${vehicleId} state=${currentState}`);
 
-        console.log(`🎯 Vehicle is: ${isInside ? '🟢 INSIDE' : '🔴 OUTSIDE'} geofence`);
-
-        // ✅ STEP 6: Get previous state
-        console.log(`\n🔍 STEP 6: Getting previous state...`);
+        // ── STEP 7: previous state ────────────────────────────────────────────
         let stateInfo = await getCurrentGeofenceState(vehicleId);
-        let previousState = stateInfo.currentState;
-        let lastStateChangeAt = stateInfo.lastStateChangeAt;
 
-        // ✅ AUTO-INITIALIZE: If state has never been set, initialize it now
-        if (!lastStateChangeAt) {
-            console.log(`\n🎯 FIRST GEOFENCE CHECK - Auto-initializing state...`);
-            const initResult = await initializeGeofenceState(vehicleId);
-
-            if (initResult.success) {
-                // Reload state after initialization
+        if (!stateInfo.lastStateChangeAt) {
+            // First ever check — initialize silently
+            const init = await initializeGeofenceState(vehicleId);
+            if (init.success) {
                 stateInfo = await getCurrentGeofenceState(vehicleId);
-                previousState = stateInfo.currentState;
-                lastStateChangeAt = stateInfo.lastStateChangeAt;
-
-                console.log(`✅ State auto-initialized: ${previousState}`);
-            } else {
-                console.warn(`⚠️ Auto-initialization failed, using default state`);
             }
         }
 
-        console.log(`📊 Previous state: ${previousState}`);
-        console.log(`📅 Last state change: ${lastStateChangeAt ? lastStateChangeAt.toISOString() : 'Never'}`);
+        const previousState = stateInfo.currentState;
+        logger.debug(`📊 [Geofence] vehicleId=${vehicleId} prev=${previousState} curr=${currentState} ` +
+            `outsideCount=${stateInfo.consecutiveOutsideCount}`);
 
-        // ✅ STEP 7: Detect state changes
-        console.log(`\n🔍 STEP 7: Detecting state changes...`);
-        const stateChanged = previousState !== currentState;
-
-        if (!stateChanged) {
-            console.log(`ℹ️ No state change - vehicle still ${currentState}`);
-            console.log(`========================================\n`);
-            return { violation: false, reason: 'No state change' };
-        }
-
-        // ✅ STATE CHANGED!
-        console.log(`\n========================================`);
-        console.log(`🎯 STATE CHANGE DETECTED!`);
-        console.log(`========================================`);
-        console.log(`📊 Previous: ${previousState} → Current: ${currentState}`);
-
-        const crossingTime = new Date();
-
-        // ✅ Update state in database
-        await updateGeofenceState(vehicleId, currentState, crossingTime);
-
-        // ✅ Handle alerts based on state change
+        // ── STEP 8: handle outside readings with debounce ─────────────────────
         if (currentState === 'outside') {
-            // ✅ Vehicle LEFT the zone
-            console.log(`🚨 Vehicle LEFT the geofence`);
 
-            // Check if there's already an active LEFT_ZONE alert
-            const existingAlert = await getActiveGeofenceAlert(vehicleId);
+            if (previousState === 'inside') {
+                // First outside reading after being inside — start the counter
+                const newCount = await incrementOutsideCounter(vehicleId);
+                logger.info(`⏳ [Geofence] vehicleId=${vehicleId} outside reading #${newCount}/${OUTSIDE_CONFIRM_THRESHOLD} — waiting for confirmation`);
 
-            if (existingAlert) {
-                console.log(`⚠️ Active LEFT_ZONE alert already exists (ID: ${existingAlert.id}). Skipping alert creation.`);
+                if (newCount < OUTSIDE_CONFIRM_THRESHOLD) {
+                    // Not enough consecutive outside readings yet — DO NOT alert
+                    return {
+                        violation:    false,
+                        reason:       'awaiting_confirmation',
+                        outsideCount: newCount,
+                        threshold:    OUTSIDE_CONFIRM_THRESHOLD
+                    };
+                }
+
+                // Threshold reached — this is a confirmed real exit
+                logger.warn(`🚨 [Geofence] vehicleId=${vehicleId} CONFIRMED outside after ${newCount} readings — firing alert`);
+                const crossingTime = new Date();
+                await updateGeofenceState(vehicleId, 'outside', crossingTime);
+
+                const existingAlert = await getActiveGeofenceAlert(vehicleId);
+                if (!existingAlert) {
+                    await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime, true);
+                }
+
+                return {
+                    violation:    true,
+                    stateChanged: true,
+                    previousState,
+                    currentState: 'outside',
+                    alertSubtype: 'LEFT_ZONE',
+                    crossingTime: crossingTime.toISOString(),
+                    outsideCount: newCount
+                };
+
             } else {
-                // Create new LEFT_ZONE alert
-                await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime, true);
+                // Already in outside state — just keep incrementing for logging,
+                // but don't fire another alert (existing alert guard handles this)
+                await incrementOutsideCounter(vehicleId);
+                logger.debug(`ℹ️ [Geofence] vehicleId=${vehicleId} still outside (state already = outside)`);
+                return { violation: true, reason: 'still_outside' };
             }
-        } else {
-            // ✅ Vehicle RETURNED to the zone
-            console.log(`✅ Vehicle RETURNED to the geofence`);
-
-            // Find and resolve the active LEFT_ZONE alert
-            const activeAlert = await getActiveGeofenceAlert(vehicleId);
-
-            if (activeAlert) {
-                console.log(`🔄 Resolving previous LEFT_ZONE alert (ID: ${activeAlert.id})`);
-                await resolveAlert(activeAlert.id);
-            }
-
-            // Create RETURNED_ZONE alert
-            await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'RETURNED_ZONE', crossingTime, true);
         }
 
-        console.log(`\n========================================`);
-        console.log(`✅ GEOFENCE STATE CHANGE COMPLETE`);
-        console.log(`========================================\n`);
+        // ── STEP 9: vehicle is INSIDE ─────────────────────────────────────────
+        // Always reset the counter immediately when back inside
+        await resetOutsideCounter(vehicleId);
 
-        return {
-            violation: currentState === 'outside',
-            stateChanged: true,
-            previousState,
-            currentState,
-            alertSubtype: currentState === 'outside' ? 'LEFT_ZONE' : 'RETURNED_ZONE',
-            crossingTime: crossingTime.toISOString()
-        };
+        if (previousState === 'outside') {
+            // Confirmed return — vehicle was genuinely outside (state = outside in DB)
+            logger.info(`✅ [Geofence] vehicleId=${vehicleId} RETURNED inside`);
+            const crossingTime = new Date();
+            await updateGeofenceState(vehicleId, 'inside', crossingTime);
 
-    } catch (error) {
-        console.error(`\n========================================`);
-        console.error(`❌ GEOFENCE CHECK ERROR`);
-        console.error(`========================================`);
-        console.error(`Error message:`, error.message);
-        console.error(`Stack trace:`, error.stack);
-        console.error(`========================================\n`);
-        return { violation: false, reason: 'Error occurred', error: error.message };
+            const activeAlert = await getActiveGeofenceAlert(vehicleId);
+            if (activeAlert) await resolveAlert(activeAlert.id);
+
+            await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'RETURNED_ZONE', crossingTime, true);
+
+            return {
+                violation:    false,
+                stateChanged: true,
+                previousState,
+                currentState: 'inside',
+                alertSubtype: 'RETURNED_ZONE',
+                crossingTime: crossingTime.toISOString()
+            };
+
+        } else if (previousState === 'inside') {
+            // Still inside — but counter may have been incrementing from pending
+            // outside readings that never hit the threshold (false alarm burst).
+            // Counter already reset above. No alert.
+            logger.debug(`ℹ️ [Geofence] vehicleId=${vehicleId} still inside — counter reset`);
+            return { violation: false, reason: 'still_inside' };
+        }
+
+        return { violation: false, reason: 'no_change' };
+
+    } catch (err) {
+        logger.error(`❌ [Geofence] checkGeofenceViolation error: ${err.message}`);
+        logger.error(err.stack);
+        return { violation: false, reason: 'error', error: err.message };
     }
 };
 
-/**
- * ✅ UPDATED: Create geofence alert (simplified - no STILL_OUTSIDE alerts)
- */
-const createGeofenceAlert = async (vehicleId, voiture, latitude, longitude, alertSubtype, crossingTime, shouldSendPushNotification) => {
+// ── create alert ──────────────────────────────────────────────────────────────
+const createGeofenceAlert = async (vehicleId, voiture, latitude, longitude, alertSubtype, crossingTime, shouldSendPush) => {
     try {
-        console.log(`\n📝 Creating ${alertSubtype} alert...`);
-
-        // Get vehicle owner
         const [vehicleOwner] = await sequelize.query(
-            `SELECT user_id FROM association_user_voitures WHERE voiture_id = ? LIMIT 1`,
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+            'SELECT user_id FROM association_user_voitures WHERE voiture_id = ? LIMIT 1',
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
+        if (!vehicleOwner?.user_id) { logger.warn(`⚠️ No owner for vehicle ${vehicleId}`); return; }
 
-        if (!vehicleOwner || !vehicleOwner.user_id) {
-            console.warn(`⚠️ No owner found for vehicle ${vehicleId}`);
-            return;
-        }
-
-        const userId = vehicleOwner.user_id;
-
-        // Get user alert settings
+        const userId       = vehicleOwner.user_id;
         const alertSettings = await getUserAlertSettings(userId);
-
-        // Get location name
         const locationInfo = await reverseGeocode(latitude, longitude);
         const locationName = formatLocationName(locationInfo);
+        const vehicleName  = voiture.nickname || `${voiture.marque} ${voiture.model}`;
+        const minutesSince = Math.round((Date.now() - new Date(crossingTime).getTime()) / 60_000);
+        const timeText     = formatTimeAgo(minutesSince);
 
-        console.log(`📍 Location: ${locationName}`);
+        const alertMessage    = alertSubtype === 'LEFT_ZONE'
+            ? `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName}`
+            : `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName}`;
+        const notificationTitle = alertSubtype === 'LEFT_ZONE' ? '⚠️ Geofence Alert' : '✅ Vehicle Returned';
 
-        const vehicleName = voiture.nickname || `${voiture.marque} ${voiture.model}`;
-
-        // Calculate time since crossing
-        const minutesSinceCrossing = Math.round((Date.now() - new Date(crossingTime).getTime()) / (1000 * 60));
-        const timeText = formatTimeAgo(minutesSinceCrossing);
-
-        // Create message based on alert type
-        let alertMessage;
-        let notificationTitle;
-
-        if (alertSubtype === 'LEFT_ZONE') {
-            alertMessage = `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName}`;
-            notificationTitle = '⚠️ Geofence Alert';
-        } else {
-            // RETURNED_ZONE
-            alertMessage = `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName}`;
-            notificationTitle = '✅ Vehicle Returned';
-        }
-
-        console.log(`📝 Alert Message: "${alertMessage}"`);
-
-        // Create alert in database
         const newAlert = await Alert.create({
-            voiture_id: vehicleId,
-            alert_type: 'geofence',
+            voiture_id:    vehicleId,
+            alert_type:    'geofence',
             alert_subtype: alertSubtype,
-            message: alertMessage,
-            latitude: latitude,
-            longitude: longitude,
-            alert_status: 'ACTIVE',
-            alerted_at: crossingTime,
-            sent: alertSettings.geofenceAlertsEnabled && shouldSendPushNotification,
-            read: false
+            message:       alertMessage,
+            latitude, longitude,
+            alert_status:  'ACTIVE',
+            alerted_at:    crossingTime,
+            sent:          alertSettings.geofenceAlertsEnabled && shouldSendPush,
+            read:          false
         });
 
-        console.log(`✅ Alert created in database (ID: ${newAlert.id})`);
+        logger.info(`✅ Alert created id=${newAlert.id} type=${alertSubtype} vehicle=${vehicleId}`);
 
-        // Send push notification
-        if (shouldSendPushNotification && alertSettings.geofenceAlertsEnabled) {
-            console.log(`\n📲 Sending push notification...`);
-
+        if (shouldSendPush && alertSettings.geofenceAlertsEnabled) {
             try {
-                const notificationResult = await notificationController.sendToUser(userId, {
+                await notificationController.sendToUser(userId, {
                     title: notificationTitle,
-                    body: alertMessage,
-                    data: {
-                        type: alertSubtype === 'LEFT_ZONE' ? 'geofence_violation' : 'geofence_return',
-                        alertSubtype: alertSubtype,
-                        vehicleId: String(vehicleId),
-                        vehicleName: vehicleName,
-                        latitude: String(latitude),
-                        longitude: String(longitude),
-                        locationName: locationName,
-                        formattedAddress: locationInfo.formattedAddress,
-                        crossingTime: crossingTime.toISOString(),
-                        timestamp: new Date().toISOString()
+                    body:  alertMessage,
+                    data:  {
+                        type:             alertSubtype === 'LEFT_ZONE' ? 'geofence_violation' : 'geofence_return',
+                        alertSubtype, vehicleId: String(vehicleId), vehicleName,
+                        latitude: String(latitude), longitude: String(longitude),
+                        locationName, formattedAddress: locationInfo.formattedAddress,
+                        crossingTime: crossingTime.toISOString(), timestamp: new Date().toISOString()
                     }
                 });
-
-                if (notificationResult.success) {
-                    console.log(`✅ Push notification sent (${notificationResult.successCount} devices)`);
-                } else {
-                    console.log(`⚠️ Push notification failed: ${notificationResult.message}`);
-                }
-            } catch (notifError) {
-                console.error(`❌ Push notification error:`, notifError.message);
-            }
-        } else {
-            console.log(`🔕 Push notification skipped (enabled: ${alertSettings.geofenceAlertsEnabled})`);
+            } catch (notifErr) { logger.error(`❌ Push notification error: ${notifErr.message}`); }
         }
 
-        // Emit Socket.IO notification
-        try {
-            if (socketService.isInitialized()) {
+        if (socketService.isInitialized()) {
+            try {
                 socketService.emitToVehicle(vehicleId, 'geofence_alert', {
-                    alertId: newAlert.id,
-                    type: alertSubtype,
+                    alertId: newAlert.id, type: alertSubtype,
                     severity: alertSubtype === 'LEFT_ZONE' ? 'warning' : 'info',
-                    title: notificationTitle,
-                    message: alertMessage,
-                    vehicleId: vehicleId,
-                    vehicleName: vehicleName,
-                    latitude: latitude,
-                    longitude: longitude,
-                    locationName: locationName,
-                    formattedAddress: locationInfo.formattedAddress,
-                    crossingTime: crossingTime.toISOString(),
-                    timestamp: new Date().toISOString()
+                    title: notificationTitle, message: alertMessage,
+                    vehicleId, vehicleName, latitude, longitude,
+                    locationName, formattedAddress: locationInfo.formattedAddress,
+                    crossingTime: crossingTime.toISOString(), timestamp: new Date().toISOString()
                 });
-                console.log(`✅ Socket.IO notification emitted`);
-            }
-        } catch (socketError) {
-            console.error(`❌ Socket.IO error:`, socketError.message);
+            } catch (sockErr) { logger.error(`❌ Socket.IO error: ${sockErr.message}`); }
         }
 
         return newAlert;
-
-    } catch (error) {
-        console.error(`❌ Error creating geofence alert:`, error);
-        throw error;
+    } catch (err) {
+        logger.error(`❌ createGeofenceAlert: ${err.message}`);
+        throw err;
     }
 };
 
-/**
- * API endpoint to manually check geofence status
- */
+// ── API endpoints ─────────────────────────────────────────────────────────────
 const getGeofenceStatus = async (req, res) => {
     const { vehicleId } = req.params;
-
     try {
         const [voiture] = await sequelize.query(
             'SELECT id, mac_id_gps, geofence_zone FROM voitures WHERE id = ?',
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
+        if (!voiture) return res.status(404).json({ error: 'Vehicle not found' });
 
-        if (!voiture) {
-            return res.status(404).json({ error: 'Vehicle not found' });
-        }
-
-        const [latestLocation] = await sequelize.query(
-            'SELECT latitude, longitude FROM locations WHERE mac_id_gps = ? ORDER BY datetime DESC LIMIT 1',
-            {
-                replacements: [vehicleId],
-                type: sequelize.QueryTypes.SELECT
-            }
+        const [loc] = await sequelize.query(
+            'SELECT latitude, longitude FROM locations WHERE mac_id_gps = ? AND latitude != 0 ORDER BY sys_time DESC LIMIT 1',
+            { replacements: [voiture.mac_id_gps], type: sequelize.QueryTypes.SELECT }
         );
+        if (!loc) return res.status(404).json({ error: 'No location data available' });
 
-        if (!latestLocation) {
-            return res.status(404).json({ error: 'No location data available' });
-        }
-
-        const result = await checkGeofenceViolation(
-            vehicleId,
-            latestLocation.latitude,
-            latestLocation.longitude
-        );
-
-        res.json({
-            success: true,
-            vehicleId: vehicleId,
-            currentLocation: {
-                latitude: latestLocation.latitude,
-                longitude: latestLocation.longitude
-            },
-            geofenceStatus: result
-        });
-
-    } catch (error) {
-        console.error('❌ Error getting geofence status:', error);
-        res.status(500).json({ error: 'Server error', details: error.message });
+        const result = await checkGeofenceViolation(vehicleId, loc.latitude, loc.longitude);
+        res.json({ success: true, vehicleId, currentLocation: { latitude: loc.latitude, longitude: loc.longitude }, geofenceStatus: result });
+    } catch (err) {
+        logger.error(`❌ getGeofenceStatus: ${err.message}`);
+        res.status(500).json({ error: 'Server error', details: err.message });
     }
 };
 
-/**
- * ✅ API endpoint to initialize geofence state
- * Call this after creating/updating a geofence
- */
 const initializeGeofenceStateEndpoint = async (req, res) => {
     const { vehicleId } = req.params;
-
     try {
-        console.log(`📥 Received request to initialize geofence state for vehicle ${vehicleId}`);
-
         const result = await initializeGeofenceState(vehicleId);
-
-        if (result.success) {
-            res.json({
-                success: true,
-                message: 'Geofence state initialized successfully',
-                data: result
-            });
-        } else {
-            res.status(400).json({
-                success: false,
-                message: result.reason || 'Failed to initialize geofence state',
-                data: result
-            });
-        }
-    } catch (error) {
-        console.error('❌ Error in initializeGeofenceStateEndpoint:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error',
-            error: error.message
-        });
+        if (result.success) res.json({ success: true, message: 'Geofence state initialized', data: result });
+        else res.status(400).json({ success: false, message: result.reason, data: result });
+    } catch (err) {
+        logger.error(`❌ initializeGeofenceStateEndpoint: ${err.message}`);
+        res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 };
 
