@@ -81,12 +81,7 @@ if (process.env.NODE_ENV === 'production') {
     }));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ⚠️  WEBHOOK ROUTE — MUST BE REGISTERED BEFORE bodyParser.json()
-// express.raw() captures the raw Buffer needed for HMAC signature verification.
-// If bodyParser.json() runs first, req.body becomes a parsed object and
-// signature verification will always fail.
-// ═══════════════════════════════════════════════════════════════════════════
+
 app.post(
     '/api/webhook/paygate',
     express.raw({ type: 'application/json' }),
@@ -163,11 +158,13 @@ app.get('/health', (req, res) => {
     });
 });
 
-// ⚠️  DEV ONLY — registered first so it is never intercepted by auth middleware
+//   DEV ONLY — registered first so it is never intercepted by auth middleware
 // on other /api routes
 if (process.env.NODE_ENV !== 'production') {
     app.use('/api/dev', devRoutes);
 }
+
+app.get('/api/app-config', getAppConfig);
 
 // ========== API ROUTES ==========
 app.use('/api/auth', authRoutes);
@@ -190,7 +187,7 @@ app.use('/api/pin', pinRoutes);
 app.use('/api/geofence', geofenceRoutes);
 app.use('/api', paygate);
 app.use('/api/payments', paymentRoutes);
-app.get('/api/app-config', getAppConfig);
+
 
 
 

@@ -25,6 +25,7 @@
     "geolib": "^3.3.4",
     "helmet": "^8.1.0",
     "ioredis": "^5.8.2",
+    "jose": "^6.2.3",
     "jsonwebtoken": "^9.0.2",
     "jwks-rsa": "^4.0.1",
     "moment": "^2.30.1",

@@ -24,6 +24,11 @@ const ROLE_APP_MAP = {
             'call_center', 'CALL_CENTER', 'DRIVER',
             'INDIVIDUAL_OWNER', 'PARTNER_ADMIN', 'SITE_MANAGER',
             'SUPER_ADMIN', 'TECH_ADMIN',
+
+            'utilisateur',
+            'UTILISATEUR',
+            'utilisateur_secondaire',
+            'UTILISATEUR_SECONDAIRE',
         ],
     },
     recouvrement_app: {
