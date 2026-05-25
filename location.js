@@ -14,6 +14,57 @@ const redisClient = require('./config/redis');
 const cacheService = require('./services/cacheService');
 require('dotenv').config();
 
+
+function gcj02ToWgs84(lat, lng) {
+    const a = 6378245.0;
+    const ee = 0.00669342162296594323;
+
+    function transformLat(x, y) {
+        let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0;
+        return ret;
+    }
+
+    function transformLng(x, y) {
+        let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+        return ret;
+    }
+
+    let dLat = transformLat(lng - 105.0, lat - 35.0);
+    let dLng = transformLng(lng - 105.0, lat - 35.0);
+    const radLat = lat / 180.0 * Math.PI;
+    let magic = Math.sin(radLat);
+    magic = 1 - ee * magic * magic;
+    const sqrtMagic = Math.sqrt(magic);
+    dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI);
+    dLng = (dLng * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI);
+
+    return { lat: lat - dLat, lng: lng - dLng };
+}
+
+
+// ========== SPEED SANITY FILTER ==========
+// Persists across fetch cycles. Keyed by mac_id_gps.
+const lastKnownPositions = new Map();
+
+let isFetchingGPS = false;
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+
 // ========== MULTI-ACCOUNT GPS CONFIGURATION ==========
 const GPS_ACCOUNTS = [
     {
@@ -238,6 +289,295 @@ async function processAlarmData(alarmData) {
     logger.debug('🚨 ========== ALARM DATA PROCESSING COMPLETE ==========\n');
 }
 
+const GPS_NOISE_CONFIG = {
+    maxBelievableSpeedKmh: parseFloat(process.env.GPS_MAX_BELIEVABLE_SPEED_KMH || '140'),
+    maxShortJumpDistanceKm: parseFloat(process.env.GPS_MAX_SHORT_JUMP_DISTANCE_KM || '8'),
+    shortJumpWindowMinutes: parseFloat(process.env.GPS_SHORT_JUMP_WINDOW_MINUTES || '10'),
+    speedMismatchToleranceKmh: parseFloat(process.env.GPS_SPEED_MISMATCH_TOLERANCE_KMH || '70'),
+
+    // HDOP is optional because your current record structure does not clearly show its index.
+    // Set GPS_HDOP_RECORD_INDEX in .env only when you know the exact index from the provider.
+    maxHdop: parseFloat(process.env.GPS_MAX_HDOP || '5'),
+    warnHdop: parseFloat(process.env.GPS_WARN_HDOP || '2.5'),
+
+    // Cameroon operational bounds.
+    // This prevents positions from jumping to another country/continent.
+    minLat: parseFloat(process.env.GPS_MIN_LAT || '1.5'),
+    maxLat: parseFloat(process.env.GPS_MAX_LAT || '13.5'),
+    minLng: parseFloat(process.env.GPS_MIN_LNG || '8.0'),
+    maxLng: parseFloat(process.env.GPS_MAX_LNG || '16.5'),
+};
+
+function parseNumberOrNull(value) {
+    const n = parseFloat(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+function getRecordTimestampMs(rawSysTime, formattedSysTime) {
+    const raw = Number(rawSysTime);
+
+    // Provider timestamps are usually milliseconds.
+    // If seconds are ever sent, normalize to milliseconds.
+    if (Number.isFinite(raw) && raw > 0) {
+        return raw < 10000000000 ? raw * 1000 : raw;
+    }
+
+    const parsed = Date.parse(formattedSysTime);
+    return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function isValidCoordinate(lat, lng) {
+    return (
+        Number.isFinite(lat) &&
+        Number.isFinite(lng) &&
+        lat >= -90 &&
+        lat <= 90 &&
+        lng >= -180 &&
+        lng <= 180 &&
+        !(lat === 0 && lng === 0)
+    );
+}
+
+function isInsideOperationalBounds(lat, lng) {
+    return (
+        lat >= GPS_NOISE_CONFIG.minLat &&
+        lat <= GPS_NOISE_CONFIG.maxLat &&
+        lng >= GPS_NOISE_CONFIG.minLng &&
+        lng <= GPS_NOISE_CONFIG.maxLng
+    );
+}
+
+function extractHdop(record) {
+    const hdopIndex = process.env.GPS_HDOP_RECORD_INDEX;
+
+    if (hdopIndex === undefined || hdopIndex === null || hdopIndex === '') {
+        return null;
+    }
+
+    const index = Number(hdopIndex);
+
+    if (!Number.isInteger(index) || index < 0 || index >= record.length) {
+        return null;
+    }
+
+    return parseNumberOrNull(record[index]);
+}
+
+function normalizeCoordinateByMapType(rawLat, rawLng) {
+    const mapType = String(GPS_CONFIG.mapType || 'WGS84')
+        .toUpperCase()
+        .replace('_', '-');
+
+    // IMPORTANT:
+    // Only convert when the provider really sends GCJ-02.
+    // If GPS_CONFIG.mapType is WGS84, keep the coordinates as-is.
+    if (mapType === 'GCJ02' || mapType === 'GCJ-02') {
+        return gcj02ToWgs84(rawLat, rawLng);
+    }
+
+    return {
+        lat: rawLat,
+        lng: rawLng
+    };
+}
+
+async function getLastKnownPosition(connection, macIdGps) {
+    const cached = lastKnownPositions.get(macIdGps);
+
+    if (cached) {
+        return cached;
+    }
+
+    try {
+        const [rows] = await connection.execute(
+            `
+                SELECT latitude, longitude, sys_time
+                FROM locations
+                WHERE mac_id_gps = ?
+                  AND latitude IS NOT NULL
+                  AND longitude IS NOT NULL
+                  AND latitude <> 0
+                  AND longitude <> 0
+                ORDER BY sys_time DESC
+                LIMIT 1
+            `,
+            [macIdGps]
+        );
+
+        if (!rows || rows.length === 0) {
+            return null;
+        }
+
+        const lat = parseFloat(rows[0].latitude);
+        const lng = parseFloat(rows[0].longitude);
+        const timestamp = Date.parse(rows[0].sys_time);
+
+        if (!isValidCoordinate(lat, lng) || !Number.isFinite(timestamp)) {
+            return null;
+        }
+
+        const lastKnown = {
+            lat,
+            lng,
+            timestamp
+        };
+
+        lastKnownPositions.set(macIdGps, lastKnown);
+        return lastKnown;
+    } catch (error) {
+        logger.warn(`⚠️ Could not load last known GPS point for MAC=${macIdGps}: ${error.message}`);
+        return null;
+    }
+}
+
+function classifyGpsPoint({
+                              macIdGps,
+                              corrected,
+                              hdop,
+                              reportedSpeedKmh,
+                              recordTimestampMs,
+                              lastKnown
+                          }) {
+    const reasons = [];
+    const metrics = {
+        distanceKm: null,
+        elapsedSeconds: null,
+        impliedSpeedKmh: null
+    };
+
+    if (!isValidCoordinate(corrected.lat, corrected.lng)) {
+        reasons.push('invalid_coordinate');
+        return {
+            accepted: false,
+            alertSafe: false,
+            quality: 'INVALID',
+            reasons,
+            metrics
+        };
+    }
+
+    if (!isInsideOperationalBounds(corrected.lat, corrected.lng)) {
+        reasons.push('outside_operational_bounds');
+        return {
+            accepted: false,
+            alertSafe: false,
+            quality: 'INVALID',
+            reasons,
+            metrics
+        };
+    }
+
+    if (hdop !== null && hdop > GPS_NOISE_CONFIG.maxHdop) {
+        reasons.push(`bad_hdop_${hdop}`);
+        return {
+            accepted: false,
+            alertSafe: false,
+            quality: 'INVALID',
+            reasons,
+            metrics
+        };
+    }
+
+    let alertSafe = true;
+    let quality = 'VALID';
+
+    if (hdop !== null && hdop > GPS_NOISE_CONFIG.warnHdop) {
+        reasons.push(`weak_hdop_${hdop}`);
+        alertSafe = false;
+        quality = 'LOW_CONFIDENCE';
+    }
+
+    if (lastKnown && Number.isFinite(lastKnown.timestamp)) {
+        const elapsedMs = recordTimestampMs - lastKnown.timestamp;
+        const elapsedHours = elapsedMs / 3600000;
+        const elapsedSeconds = elapsedMs / 1000;
+
+        if (elapsedMs <= 0) {
+            reasons.push('old_or_duplicate_timestamp');
+            return {
+                accepted: false,
+                alertSafe: false,
+                quality: 'INVALID',
+                reasons,
+                metrics
+            };
+        }
+
+        const distanceKm = haversineKm(
+            lastKnown.lat,
+            lastKnown.lng,
+            corrected.lat,
+            corrected.lng
+        );
+
+        const impliedSpeedKmh = elapsedHours > 0 ? distanceKm / elapsedHours : 0;
+
+        metrics.distanceKm = distanceKm;
+        metrics.elapsedSeconds = elapsedSeconds;
+        metrics.impliedSpeedKmh = impliedSpeedKmh;
+
+        // 1. Impossible movement speed.
+        if (
+            elapsedHours > 0 &&
+            elapsedHours < 1 &&
+            impliedSpeedKmh > GPS_NOISE_CONFIG.maxBelievableSpeedKmh
+        ) {
+            reasons.push(`impossible_speed_${impliedSpeedKmh.toFixed(0)}kmh`);
+            return {
+                accepted: false,
+                alertSafe: false,
+                quality: 'INVALID',
+                reasons,
+                metrics
+            };
+        }
+
+        // 2. Large jump while reported speed is almost zero.
+        // This is a very common GPS-noise pattern.
+        if (
+            distanceKm >= GPS_NOISE_CONFIG.maxShortJumpDistanceKm &&
+            elapsedSeconds <= GPS_NOISE_CONFIG.shortJumpWindowMinutes * 60 &&
+            reportedSpeedKmh <= 10
+        ) {
+            reasons.push(`large_jump_with_low_reported_speed_${distanceKm.toFixed(1)}km`);
+            return {
+                accepted: false,
+                alertSafe: false,
+                quality: 'INVALID',
+                reasons,
+                metrics
+            };
+        }
+
+        // 3. Calculated speed and reported speed disagree too much.
+        if (
+            distanceKm >= GPS_NOISE_CONFIG.maxShortJumpDistanceKm &&
+            elapsedSeconds <= GPS_NOISE_CONFIG.shortJumpWindowMinutes * 60 &&
+            impliedSpeedKmh > reportedSpeedKmh + GPS_NOISE_CONFIG.speedMismatchToleranceKmh
+        ) {
+            reasons.push(
+                `speed_mismatch_calc_${impliedSpeedKmh.toFixed(0)}kmh_reported_${reportedSpeedKmh.toFixed(0)}kmh`
+            );
+            return {
+                accepted: false,
+                alertSafe: false,
+                quality: 'INVALID',
+                reasons,
+                metrics
+            };
+        }
+    }
+
+    return {
+        accepted: true,
+        alertSafe,
+        quality,
+        reasons,
+        metrics
+    };
+}
+
+// ========== DATA PROCESSING ==========
 // ========== DATA PROCESSING ==========
 async function saveLocationsToDatabase(connection, locations, accountName) {
     logger.debug(`\n📡 ========== GPS DATA PROCESSING [${accountName}] ==========`);
@@ -247,18 +587,46 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
     const macToVoitureId      = new Map(); // one DB lookup per unique MAC per cycle
 
     if (locations.success === 'true' && locations.data) {
-        let totalRecords = 0;
+        let totalRecords       = 0;
+        let acceptedRecords    = 0;
+        let rejectedRecords    = 0;
+        let lowConfidenceRecords = 0;
 
         for (const deviceData of locations.data) {
             if (deviceData.records && deviceData.records.length > 0) {
                 for (const record of deviceData.records) {
-                    const formattedSysTime  = convertToDatetime(record[0]);
-                    const formattedDatetime = convertToDatetime(record[6]);
-                    const formattedHeartTime = convertToDatetime(record[7]);
-                    const macIdGps   = record[11];
-                    const statenumber = record[19] || '';
 
-                    // Resolve voiture_id — hit DB only once per unique MAC per cycle
+                    const formattedSysTime   = convertToDatetime(record[0]);
+                    const formattedDatetime  = convertToDatetime(record[6]);
+                    const formattedHeartTime = convertToDatetime(record[7]);
+
+                    const macIdGps          = record[11];
+                    const statenumber       = record[19] || '';
+                    const rawLat            = parseNumberOrNull(record[3]);
+                    const rawLng            = parseNumberOrNull(record[2]);
+                    const reportedSpeedKmh  = parseNumberOrNull(record[8]) || 0;
+                    const hdop              = extractHdop(record);
+                    const recordTimestampMs = getRecordTimestampMs(record[0], formattedSysTime);
+
+                    if (!macIdGps) {
+                        rejectedRecords++;
+                        logger.warn(`🚫 [${accountName}] Rejected GPS point: missing MAC ID`);
+                        continue;
+                    }
+
+                    if (rawLat === null || rawLng === null) {
+                        rejectedRecords++;
+                        logger.warn(`🚫 [${accountName}] Rejected GPS point: MAC=${macIdGps}, invalid raw coordinates Lat=${record[3]}, Lng=${record[2]}`);
+                        continue;
+                    }
+
+                    // ── GCJ-02 → WGS84 ─────────────────────────────────────────
+                    // 18gps.net sends GCJ-02 regardless of mapType param.
+                    // Conversion is forced unconditionally.
+                    const corrected = normalizeCoordinateByMapType(rawLat, rawLng);
+
+                    // ── RESOLVE voiture_id ──────────────────────────────────────
+                    // Hit DB only once per unique MAC per cycle
                     let voitureId = null;
                     if (macToVoitureId.has(macIdGps)) {
                         voitureId = macToVoitureId.get(macIdGps);
@@ -275,6 +643,40 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                         macToVoitureId.set(macIdGps, voitureId);
                     }
 
+                    // ── GPS QUALITY FILTER ──────────────────────────────────────
+                    const lastKnown  = await getLastKnownPosition(connection, macIdGps);
+                    const gpsQuality = classifyGpsPoint({
+                        macIdGps,
+                        corrected,
+                        hdop,
+                        reportedSpeedKmh,
+                        recordTimestampMs,
+                        lastKnown
+                    });
+
+                    if (!gpsQuality.accepted) {
+                        rejectedRecords++;
+
+                        const distanceText     = gpsQuality.metrics.distanceKm !== null
+                            ? `, Distance=${gpsQuality.metrics.distanceKm.toFixed(2)}km` : '';
+                        const elapsedText      = gpsQuality.metrics.elapsedSeconds !== null
+                            ? `, Elapsed=${gpsQuality.metrics.elapsedSeconds.toFixed(0)}s` : '';
+                        const impliedSpeedText = gpsQuality.metrics.impliedSpeedKmh !== null
+                            ? `, ImpliedSpeed=${gpsQuality.metrics.impliedSpeedKmh.toFixed(0)}km/h` : '';
+
+                        logger.warn(
+                            `🚫 [${accountName}] Rejected noisy GPS point: MAC=${macIdGps}, Lat=${corrected.lat}, Lng=${corrected.lng}, Reason=${gpsQuality.reasons.join('|')}${distanceText}${elapsedText}${impliedSpeedText}, ReportedSpeed=${reportedSpeedKmh}km/h, HDOP=${hdop ?? 'N/A'}`
+                        );
+                        continue;
+                    }
+
+                    if (gpsQuality.quality === 'LOW_CONFIDENCE') {
+                        lowConfidenceRecords++;
+                        logger.warn(
+                            `⚠️ [${accountName}] Low-confidence GPS point accepted without alert permission: MAC=${macIdGps}, Reason=${gpsQuality.reasons.join('|')}, HDOP=${hdop ?? 'N/A'}`
+                        );
+                    }
+
                     const query = `
                         INSERT INTO locations
                         (sys_time, user_name, longitude, latitude, datetime, heart_time, speed, status, direction, mac_id_gps, voiture_id)
@@ -282,36 +684,55 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                     `;
 
                     const values = [
-                        formattedSysTime,
-                        record[1],
-                        record[2],
-                        record[3],
-                        formattedDatetime,
-                        formattedHeartTime,
-                        record[8],
-                        record[9],
-                        record[10],
-                        macIdGps,
-                        voitureId
+                        formattedSysTime,   // sys_time
+                        record[1],          // user_name
+                        corrected.lng,      // longitude — WGS84
+                        corrected.lat,      // latitude  — WGS84
+                        formattedDatetime,  // datetime
+                        formattedHeartTime, // heart_time
+                        reportedSpeedKmh,   // speed
+                        record[9],          // status
+                        record[10],         // direction
+                        macIdGps,           // mac_id_gps
+                        voitureId           // voiture_id
                     ];
 
                     try {
                         await connection.execute(query, values);
-                        totalRecords++;
 
+                        totalRecords++;
+                        acceptedRecords++;
                         invalidatedVehicles.add(macIdGps);
 
-                        gpsUpdates.set(macIdGps, {
-                            latitude:    parseFloat(record[3]),
-                            longitude:   parseFloat(record[2]),
-                            speed:       parseFloat(record[8]),
-                            status:      record[9],
-                            direction:   record[10],
-                            statenumber: statenumber,
-                            timestamp:   formattedDatetime || new Date().toISOString()
+                        // Update last known accepted position for this device
+                        lastKnownPositions.set(macIdGps, {
+                            lat:       corrected.lat,
+                            lng:       corrected.lng,
+                            timestamp: recordTimestampMs
                         });
 
-                        logger.debug(`💾 [${accountName}] Location saved: MAC=${macIdGps}, VoitureID=${voitureId}, Lat=${record[3]}, Lng=${record[2]}, Speed=${record[8]} km/h`);
+                        gpsUpdates.set(macIdGps, {
+                            latitude:      corrected.lat,
+                            longitude:     corrected.lng,
+                            speed:         reportedSpeedKmh,
+                            status:        record[9],
+                            direction:     record[10],
+                            statenumber:   statenumber,
+                            timestamp:     formattedDatetime || new Date().toISOString(),
+                            quality:       gpsQuality.quality,
+                            alertSafe:     gpsQuality.alertSafe,
+                            qualityReasons: gpsQuality.reasons,
+                            hdop:          hdop
+                        });
+
+                        const distanceText     = gpsQuality.metrics.distanceKm !== null
+                            ? `, Distance=${gpsQuality.metrics.distanceKm.toFixed(2)}km` : '';
+                        const impliedSpeedText = gpsQuality.metrics.impliedSpeedKmh !== null
+                            ? `, ImpliedSpeed=${gpsQuality.metrics.impliedSpeedKmh.toFixed(0)}km/h` : '';
+
+                        logger.debug(
+                            `💾 [${accountName}] Location saved: MAC=${macIdGps}, VoitureID=${voitureId}, Lat=${corrected.lat}, Lng=${corrected.lng}, Speed=${reportedSpeedKmh} km/h, Quality=${gpsQuality.quality}${distanceText}${impliedSpeedText}, HDOP=${hdop ?? 'N/A'}`
+                        );
                     } catch (error) {
                         logger.error(`❌ [${accountName}] Error saving location:`, error.message);
                     }
@@ -322,7 +743,9 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
         }
 
         logger.debug(`\n✅ [${accountName}] Total records saved: ${totalRecords}`);
+        logger.info(`📊 [${accountName}] GPS quality summary: accepted=${acceptedRecords}, rejected=${rejectedRecords}, low_confidence=${lowConfidenceRecords}`);
 
+        // ✅ PROCESS CACHE INVALIDATION + SOCKET.IO EMISSION + ALERT CHECKS
         if (invalidatedVehicles.size > 0) {
             for (const macId of invalidatedVehicles) {
                 try {
@@ -335,66 +758,14 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                         const vehicleId      = vehicles[0].id;
                         const carModel       = vehicles[0].model;
                         const gpsData        = gpsUpdates.get(macId);
-                        const statusString   = gpsData.status ? String(gpsData.status) : '';
-                        const engineStatus   = (statusString.length > 2 && statusString[2] === '1') ? 'ON' : 'OFF';
 
-                        // ── WRITE-THROUGH CACHE ──────────────────────────────────────────
-                        // Build the full location payload and write it directly into Redis.
-                        // The app polls vehicle:{id}:location every 15s — this means it
-                        // will almost always hit Redis and never need to query locations table.
-                        // TTL = 60s: if GPS goes silent, cache expires and app falls back to DB.
-                        const locationPayload = {
-                            vehicleId,
-                            mac_id_gps:    macId,
-                            latitude:      gpsData.latitude,
-                            longitude:     gpsData.longitude,
-                            speed:         gpsData.speed,
-                            car_model:     carModel,
-                            engine_status: engineStatus,
-                            raw_status:    gpsData.status,
-                            timestamp:     gpsData.timestamp,
-                        };
-                        try {
-                            await cacheService.set(
-                                `vehicle:${vehicleId}:location`,
-                                locationPayload,
-                                60  // 60s TTL — refreshed every ~10s by GPS cycle
-                            );
-                            logger.debug(`💾 [${accountName}] Cache written: vehicle:${vehicleId}:location`);
-                        } catch (cacheErr) {
-                            logger.error(`❌ [${accountName}] Cache write error vehicle ${vehicleId}:`, cacheErr.message);
+                        if (!gpsData) {
+                            logger.warn(`⚠️ No GPS update found in memory for MAC=${macId}, skipping vehicle update`);
+                            continue;
                         }
 
-                        // ── VELOCITY FILTER CACHE ────────────────────────────────────────
-                        // Store last valid position keyed by mac_id_gps so geofenceMonitor
-                        // can do the velocity check from Redis instead of querying locations.
-                        // Only write when coordinate is real (not 0,0).
-                        if (gpsData.latitude !== 0 || gpsData.longitude !== 0) {
-                            try {
-                                await redisClient.setEx(
-                                    `gps:last:${macId}`,
-                                    7200, // 2h TTL — covers any reasonable GPS silence window
-                                    JSON.stringify({
-                                        latitude:  gpsData.latitude,
-                                        longitude: gpsData.longitude,
-                                        sys_time:  gpsData.timestamp,
-                                    })
-                                );
-                                logger.debug(`📍 [${accountName}] Velocity cache written: gps:last:${macId}`);
-                            } catch (velCacheErr) {
-                                logger.error(`❌ [${accountName}] Velocity cache write error MAC ${macId}:`, velCacheErr.message);
-                            }
-
-                            // Also keep voitures table in sync for login snapshots
-                            try {
-                                await connection.execute(
-                                    'UPDATE voitures SET latitude = ?, longitude = ? WHERE id = ?',
-                                    [gpsData.latitude, gpsData.longitude, vehicleId]
-                                );
-                            } catch (updateError) {
-                                logger.error(`❌ [${accountName}] voitures position update error vehicle ${vehicleId}:`, updateError.message);
-                            }
-                        }
+                        // Cache invalidation
+                        await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
 
                         // Socket.IO — GPS update
                         socketService.emitGPSUpdate(vehicleId, {
@@ -405,23 +776,31 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                             status:      gpsData.status,
                             direction:   gpsData.direction,
                             timestamp:   gpsData.timestamp,
-                            mac_id_gps:  macId
+                            mac_id_gps:  macId,
+                            gps_quality: gpsData.quality,
+                            alert_safe:  gpsData.alertSafe,
+                            hdop:        gpsData.hdop
                         });
 
-                        // Socket.IO — Dashboard update
+                        // Determine GPS status
                         let gpsStatus = 'Disconnected';
                         if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = 'Connected';
+
+                        // Socket.IO — Dashboard update
                         socketService.emitDashboardUpdate(vehicleId, {
                             speed:         gpsData.speed,
                             gpsStatus:     gpsStatus,
-                            vehicleStatus: gpsStatus === 'Connected' ? 'Active' : 'Inactive'
+                            vehicleStatus: gpsStatus === 'Connected' ? 'Active' : 'Inactive',
+                            gpsQuality:    gpsData.quality
                         });
 
                         // ========== ALERT CHECKS ==========
                         logger.debug(`\n🔍 Running alert checks for vehicle ${vehicleId}...`);
+                        logger.debug(`🛰️ GPS quality: ${gpsData.quality}, alertSafe=${gpsData.alertSafe}, reasons=${gpsData.qualityReasons.join('|') || 'none'}`);
 
-                        // 0. Battery monitoring
+                        // 🔋 0. Battery monitoring — runs regardless of alertSafe
                         try {
+                            logger.debug(`🔋 Checking battery level for vehicle ${vehicleId}...`);
                             await BatteryMonitoringService.processBatteryLevel({
                                 statenumber: gpsData.statenumber,
                                 StateNumber: gpsData.statenumber,
@@ -430,32 +809,50 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                                 latitude:    gpsData.latitude,
                                 longitude:   gpsData.longitude
                             }, macId);
+                            logger.debug(`✅ Battery monitoring check completed for vehicle ${vehicleId}`);
                         } catch (batteryError) {
-                            logger.error(`❌ Battery monitoring error vehicle ${vehicleId}:`, batteryError.message);
+                            logger.error(`❌ Battery monitoring error for vehicle ${vehicleId}:`, batteryError.message);
                         }
 
-                        // 1. Safe zone
+                        // Skip movement-based alerts if GPS point is low confidence
+                        if (!gpsData.alertSafe) {
+                            logger.warn(
+                                `⚠️ Skipping movement-based alerts for vehicle ${vehicleId}: GPS point is ${gpsData.quality}, reasons=${gpsData.qualityReasons.join('|') || 'none'}`
+                            );
+                            logger.debug(`✅ Alert checks skipped safely for vehicle ${vehicleId}`);
+                            continue;
+                        }
+
+                        // ✅ 1. Safe zone violation check
                         try {
                             const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (safeZoneResult.violation && safeZoneResult.isFirstAlert)
-                                logger.info(`🚨 SAFE ZONE VIOLATION vehicle ${vehicleId}`);
+                                logger.info(`🚨 SAFE ZONE VIOLATION DETECTED! Vehicle left the safe zone`);
                             if (safeZoneResult.returned && safeZoneResult.isFirstAlert)
-                                logger.info(`✅ VEHICLE RETURNED TO SAFE ZONE vehicle ${vehicleId}`);
+                                logger.info(`✅ VEHICLE RETURNED TO SAFE ZONE!`);
                         } catch (safeZoneError) {
                             logger.error(`❌ Safe zone check error:`, safeZoneError.message);
                         }
 
-                        // 2. Geofence
+                        // ✅ 2. Geofence violation check
                         try {
                             const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
                             if (geofenceResult.stateChanged) {
-                                logger.info(`🚨 GEOFENCE STATE CHANGE vehicle ${vehicleId}: ${geofenceResult.previousState} → ${geofenceResult.currentState}`);
+                                if (geofenceResult.currentState === 'outside') {
+                                    logger.info(`🚨 GEOFENCE VIOLATION DETECTED! Vehicle left the defined zone`);
+                                    logger.info(`   Previous: ${geofenceResult.previousState} → Current: ${geofenceResult.currentState}`);
+                                } else if (geofenceResult.currentState === 'inside') {
+                                    logger.info(`✅ VEHICLE RETURNED TO GEOFENCE!`);
+                                    logger.info(`   Previous: ${geofenceResult.previousState} → Current: ${geofenceResult.currentState}`);
+                                }
+                            } else {
+                                logger.debug(`ℹ️ No geofence state change (vehicle still ${geofenceResult.currentState || 'in previous state'})`);
                             }
                         } catch (geofenceError) {
                             logger.error(`❌ Geofence check error:`, geofenceError.message);
                         }
 
-                        // 3. Speed
+                        // ✅ 3. Speed violation check
                         try {
                             await SpeedAlertService.checkSpeedViolation(
                                 vehicleId, macId, gpsData.speed,
@@ -465,7 +862,7 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                             logger.error(`❌ Speed check error:`, speedError.message);
                         }
 
-                        // 4. Time zone
+                        // ✅ 4. Time zone violation check
                         try {
                             await TimeZoneAlertService.checkTimeZoneViolation(
                                 vehicleId, macId, gpsData.speed,
@@ -474,6 +871,8 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                         } catch (timeZoneError) {
                             logger.error(`❌ Time zone check error:`, timeZoneError.message);
                         }
+
+                        // ✅ 5. Device disconnection/removal alarms handled separately via processAlarmData()
 
                         logger.debug(`✅ All alert checks completed for vehicle ${vehicleId}`);
                     }
@@ -492,15 +891,22 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
 // ========== MAIN GPS FETCH CYCLE (MULTI-ACCOUNT) ==========
 async function fetchGPSData() {
+    if (isFetchingGPS) {
+        logger.warn('⏭️ Previous GPS fetch cycle is still running, skipping this tick');
+        return;
+    }
+
+    isFetchingGPS = true;
+    let connection = null;
+
     try {
         logger.info(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle for ${GPS_ACCOUNTS.length} accounts...`);
 
-        const connection = await connectToDatabase();
+        connection = await connectToDatabase();
 
         let totalAccountsProcessed = 0;
         let totalAccountsFailed = 0;
 
-        // ✅ Process each account sequentially
         for (let i = 0; i < GPS_ACCOUNTS.length; i++) {
             const account = GPS_ACCOUNTS[i];
 
@@ -513,7 +919,6 @@ async function fetchGPSData() {
                 if (loginData) {
                     const { token, userId } = loginData;
 
-                    // ✅ 1. Fetch and save location data for this account
                     const locations = await fetchLocations(token, userId);
                     if (locations) {
                         logger.info(`📍 Processing locations for ${account.name}...`);
@@ -522,7 +927,6 @@ async function fetchGPSData() {
                         logger.warn(`❌ Failed to fetch locations for ${account.name}`);
                     }
 
-                    // ✅ 2. Fetch and process alarm data for this account
                     try {
                         const alarmData = await fetchAlarmData(token, userId);
                         if (alarmData) {
@@ -540,7 +944,6 @@ async function fetchGPSData() {
                     totalAccountsFailed++;
                 }
 
-                // Small delay between accounts to avoid rate limiting
                 if (i < GPS_ACCOUNTS.length - 1) {
                     logger.debug('⏸️ Waiting 500ms before next account...');
                     await new Promise(resolve => setTimeout(resolve, 500));
@@ -550,12 +953,8 @@ async function fetchGPSData() {
                 logger.error(`🔥 Error processing ${account.name}:`, accountError.message);
                 logger.error('Stack trace:', accountError.stack);
                 totalAccountsFailed++;
-                // Continue to next account even if one fails
             }
         }
-
-        await connection.end();
-        logger.debug('✅ Database connection closed');
 
         logger.info(`\n✅ ========== ALL ACCOUNTS PROCESSED ==========`);
         logger.info(`📊 Summary: ${totalAccountsProcessed} successful, ${totalAccountsFailed} failed`);
@@ -564,6 +963,17 @@ async function fetchGPSData() {
     } catch (error) {
         logger.error('🔥 Error in GPS fetch cycle:', error.message);
         logger.error('Stack trace:', error.stack);
+    } finally {
+        if (connection) {
+            try {
+                await connection.end();
+                logger.debug('✅ Database connection closed');
+            } catch (closeError) {
+                logger.error('❌ Error closing database connection:', closeError.message);
+            }
+        }
+
+        isFetchingGPS = false;
     }
 }
 

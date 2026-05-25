@@ -71,6 +71,11 @@ const User = sequelize.define("users", {
         type: DataTypes.DATE,
         allowNull: true,
     },
+    type_partner: {
+        type: DataTypes.ENUM('SIMPLE_PARTNER', 'LEASE_PARTNER'),
+        allowNull: true,
+        defaultValue: 'SIMPLE_PARTNER',
+    },
     password: {
         type: DataTypes.STRING,
         allowNull: false,
@@ -131,7 +136,7 @@ const User = sequelize.define("users", {
         allowNull: true,
         comment: 'Expiration date of the Keycloak refresh token',
     },
-    // ── Keycloak integration ──────────────────────────────────────────────────
+    // ── Keycloak integration
     keycloak_id: {
         type: DataTypes.STRING(36),
         allowNull: true,

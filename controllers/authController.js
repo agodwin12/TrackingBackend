@@ -12,8 +12,7 @@ const AssociationChauffeurVoiturePartner = require('../models/associationChauffe
 const logger                           = require('../utils/logger');
 const keycloakService                  = require('../services/keycloakService');
 
-// ─── Vehicle attributes projected in login response ──────────────────────────
-
+// ─── Vehicle attributes projected in login response ───────────────────────────
 const VOITURE_ATTRIBUTES = [
     'id', 'voiture_unique_id', 'immatriculation', 'mac_id_gps',
     'marque', 'model', 'couleur', 'photo', 'nickname', 'latitude', 'longitude',
@@ -27,6 +26,28 @@ const normalizePhone = (phone) => {
     if (!cleaned.startsWith('+')) cleaned = '+' + cleaned;
     return cleaned;
 };
+
+/**
+ * Resolve app destination by looking up the partner's type_partner.
+ *
+ *   No partner_id          → 'tracking'   (regular owner account)
+ *   partner.LEASE_PARTNER  → 'recouvrement'
+ *   partner.SIMPLE_PARTNER → 'tracking'
+ */
+async function resolveAppType(partnerId) {
+    if (!partnerId) return 'tracking';
+
+    const partner = await User.findByPk(partnerId, {
+        attributes: ['type_partner'],
+    });
+
+    if (!partner) {
+        logger.warn(`⚠️ Partner ID ${partnerId} not found — defaulting to tracking`);
+        return 'tracking';
+    }
+
+    return partner.type_partner === 'LEASE_PARTNER' ? 'recouvrement' : 'tracking';
+}
 
 async function fetchRegularUserVehicles(userId) {
     const rows = await AssociationUserVoiture.findAll({
@@ -79,7 +100,7 @@ exports.login = async (req, res) => {
 
         logger.info(`🔹 Login attempt: ${normalizedPhone}`);
 
-        // ── Step 1: find user in local DB ────────────────────────────────────
+        // STEP 1: Find user in local DB
         const user = await User.findOne({ where: { phone: normalizedPhone } });
 
         if (!user) {
@@ -87,10 +108,8 @@ exports.login = async (req, res) => {
             return res.status(401).json({ message: 'Invalid phone number or password' });
         }
 
-        // ── Step 2: authenticate against Keycloak (double-check fallback) ────
-        // Phone number is the Keycloak username (confirmed)
+        // STEP 2: Authenticate against Keycloak
         const keycloakUsername = normalizedPhone;
-
         const result = await keycloakService.loginWithFallback(keycloakUsername, password);
 
         if (!result) {
@@ -100,31 +119,37 @@ exports.login = async (req, res) => {
 
         const { tokenData, clientId } = result;
 
-        // ── Step 3: decode Keycloak access token (no verify needed — we just got it) ──
+        // STEP 3: Decode Keycloak access token
         const decodedToken = jwt.decode(tokenData.access_token);
         const keycloakId   = decodedToken?.sub;
 
-        // ── Step 4: lazy-populate keycloak_id if first Keycloak login ────────
+        // STEP 4: Lazy-populate keycloak_id on first Keycloak login
         if (!user.keycloak_id && keycloakId) {
             await user.update({ keycloak_id: keycloakId });
             logger.info(`✅ keycloak_id populated for user ${user.id}: ${keycloakId}`);
         }
 
-        // ── Step 5: extract roles + resolve app_type ─────────────────────────
+        // STEP 5: Extract Keycloak roles
         const { clientRoles } = keycloakService.extractRolesFromToken(decodedToken, clientId);
-        const app_type        = keycloakService.resolveAppType(clientId, clientRoles);
 
-        logger.info(`👤 User ${user.id} | client=${clientId} | roles=${clientRoles} | app_type=${app_type}`);
+        // STEP 6: Resolve app_type from partner's type_partner
+        //
+        //   No partner_id          → tracking   (regular owner)
+        //   partner.LEASE_PARTNER  → recouvrement
+        //   partner.SIMPLE_PARTNER → tracking
+        //
+        const isChauffeur = user.partner_id !== null && user.partner_id !== undefined;
+        const app_type    = await resolveAppType(user.partner_id);
 
-        // ── Step 6: tracking-only enrichment (vehicles + subscriptions) ───────
-        let vehicles             = [];
-        let vehiclesWithSubs     = [];
-        let subscriptionStatus   = 'NONE';
+        logger.info(`👤 User ${user.id} | partner_id=${user.partner_id} | app_type=${app_type} | isChauffeur=${isChauffeur} | client=${clientId} | roles=${clientRoles}`);
+
+        // STEP 7: Tracking-only — fetch vehicles and subscriptions
+        //   Recouvrement users skip this block entirely.
+        let vehiclesWithSubs   = [];
+        let subscriptionStatus = 'NONE';
 
         if (app_type === 'tracking') {
-            const isChauffeur = user.partner_id !== null && user.partner_id !== undefined;
-
-            vehicles = isChauffeur
+            const vehicles = isChauffeur
                 ? await fetchChauffeurVehicles(user.id)
                 : await fetchRegularUserVehicles(user.id);
 
@@ -135,8 +160,8 @@ exports.login = async (req, res) => {
                 });
             }
 
-            const vehicleIds    = vehicles.map(v => v.id);
-            const subMap        = await fetchVehicleSubscriptionMap(user.id, vehicleIds);
+            const vehicleIds = vehicles.map(v => v.id);
+            const subMap     = await fetchVehicleSubscriptionMap(user.id, vehicleIds);
 
             vehiclesWithSubs = vehicles.map(v => ({
                 ...v.toJSON(),
@@ -147,14 +172,13 @@ exports.login = async (req, res) => {
             logger.info(`📋 Subscription: ${subscriptionStatus} | vehicles: ${vehicles.length}`);
         }
 
-        // ── Step 7: store Keycloak refresh token locally for logout use ───────
-        // We store it so logout can pass it back to Keycloak to revoke the session
+        // STEP 8: Store Keycloak refresh token for logout use
         await user.update({
             refresh_token:            tokenData.refresh_token,
             refresh_token_expires_at: new Date(Date.now() + tokenData.refresh_expires_in * 1000),
         });
 
-        // ── Step 8: set refresh token in httpOnly cookie ──────────────────────
+        // STEP 9: Set refresh token in httpOnly cookie
         res.cookie('refreshToken', tokenData.refresh_token, {
             httpOnly: true,
             secure:   process.env.NODE_ENV === 'production',
@@ -164,11 +188,11 @@ exports.login = async (req, res) => {
 
         logger.info(`✅ Login success — user ${user.id} | app_type=${app_type}`);
 
-        // ── Step 9: respond ───────────────────────────────────────────────────
+        // STEP 10: Respond
         return res.json({
             message:             'Login successful',
             isFirstLogin:        user.is_first_login,
-            app_type,                                   // 'tracking' | 'recouvrement'
+            app_type,                                   // 'tracking' | 'recouvrement' ← Flutter routes on this
             client_id:           clientId,
             roles:               clientRoles,
             subscription_status: subscriptionStatus,
@@ -185,7 +209,7 @@ exports.login = async (req, res) => {
                 partner_id:     user.partner_id,
             },
             vehicles:     vehiclesWithSubs,
-            accessToken:  tokenData.access_token,
+            accessToken:  tokenData.access_token,    // Keycloak RS256 token — works for both apps
             refreshToken: tokenData.refresh_token,
             expiresIn:    tokenData.expires_in,
         });
@@ -203,7 +227,6 @@ exports.logout = async (req, res) => {
         const userId   = req.user.id;
         const clientId = req.user.app_client;
 
-        // Get stored refresh token to revoke Keycloak session
         const refreshToken = req.cookies?.refreshToken
             || (await User.findByPk(userId, { attributes: ['refresh_token'] }))?.refresh_token;
 
@@ -211,7 +234,6 @@ exports.logout = async (req, res) => {
             await keycloakService.logout(refreshToken, clientId);
         }
 
-        // Clear local refresh token record
         await User.update(
             { refresh_token: null, refresh_token_expires_at: null },
             { where: { id: userId } }
@@ -283,11 +305,9 @@ exports.refreshToken = async (req, res) => {
             return res.status(401).json({
                 message: 'Session expired. Please login again.',
                 code:    'REFRESH_TOKEN_EXPIRED',
-
             });
         }
         logger.error('🔥 Refresh token error:', err.message);
         return res.status(500).json({ message: 'Error refreshing token' });
     }
 };
-//tryddd

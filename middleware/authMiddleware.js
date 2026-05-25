@@ -1,149 +1,119 @@
 // middleware/authMiddleware.js
-const jwt        = require('jsonwebtoken');
-const jwksClient = require('jwks-rsa');
-const User       = require('../models/userModel');
-const logger     = require('../utils/logger');
-const redisClient = require('../config/redis');
+const jwt  = require('jsonwebtoken');
+const User = require('../models/userModel');
+const logger = require('../utils/logger');
 
-// ─── JWKS client (caches signing keys automatically) ─────────────────────────
-
-const jwks = jwksClient({
-    jwksUri:             process.env.KEYCLOAK_JWKS_URL,
-    requestHeaders:      {},
-    timeout:             10000,
-    cache:               true,
-    cacheMaxEntries:     5,
-    cacheMaxAge:         600000, // 10 minutes
-    rateLimit:           true,
-    jwksRequestsPerMinute: 10,
-});
-
-const ISSUER           = process.env.KEYCLOAK_ISSUER;
-const ALLOWED_AUDIENCES = ['tracking_app', 'recouvrement_app'];
-
-// ─── Get signing key from JWKS ────────────────────────────────────────────────
-
-function getSigningKey(header) {
-    return new Promise((resolve, reject) => {
-        jwks.getSigningKey(header.kid, (err, key) => {
-            if (err) return reject(err);
-            resolve(key.getPublicKey());
-        });
-    });
-}
-
-// ─── Verify Keycloak RS256 token ──────────────────────────────────────────────
-
-async function verifyKeycloakToken(token) {
-    // Decode header first to get kid
-    const decoded = jwt.decode(token, { complete: true });
-    if (!decoded?.header?.kid) throw new Error('Invalid token structure');
-
-    const signingKey = await getSigningKey(decoded.header);
-
-    // Verify signature, issuer, expiry — audience is a list so we check manually
-    const payload = jwt.verify(token, signingKey, {
-        algorithms: ['RS256'],
-        issuer:     ISSUER,
-    });
-
-    // Audience check — token aud can be a string or array
-    const tokenAud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    const hasValidAud = tokenAud.some(a => ALLOWED_AUDIENCES.includes(a));
-    if (!hasValidAud) throw new Error(`Invalid audience: ${tokenAud}`);
-
-    return payload;
-}
-
-// ─── Resolve local DB user from keycloak_id (Redis-cached) ───────────────────
-
-async function resolveLocalUser(keycloakId) {
-    const cacheKey = `user:kc:${keycloakId}`;
-
-    const cached = await redisClient.get(cacheKey);
-    if (cached) {
-        try { return JSON.parse(cached); } catch { /* fall through */ }
-    }
-
-    const user = await User.findOne({
-        where:      { keycloak_id: keycloakId },
-        attributes: ['id', 'user_unique_id', 'phone', 'partner_id', 'keycloak_id'],
-    });
-
-    if (!user) return null;
-
-    const plain = user.toJSON();
-    // Cache for 5 minutes — short enough to pick up keycloak_id lazy-population
-    await redisClient.setEx(cacheKey, 300, JSON.stringify(plain));
-
-    return plain;
-}
-
-// ─── Determine app_client from token audience ─────────────────────────────────
-
-function resolveAppClient(payload) {
-    // azp (authorized party) is the most reliable — it's the client that requested the token
-    if (payload.azp && ALLOWED_AUDIENCES.includes(payload.azp)) return payload.azp;
-
-    // Fallback to aud
-    const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    return aud.find(a => ALLOWED_AUDIENCES.includes(a)) || null;
-}
-
-// ─── Main middleware ──────────────────────────────────────────────────────────
+const JWT_ACCESS_SECRET  = process.env.JWT_ACCESS_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
 const authMiddleware = async (req, res, next) => {
     try {
+        // STEP 1: Extract access token from Authorization header
         const authHeader = req.headers.authorization;
-        const token      = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        const accessToken = authHeader?.split(' ')[1];
 
-        if (!token) {
+        if (!accessToken) {
+            logger.warn('❌ No access token provided');
             return res.status(401).json({ message: 'Unauthorized: No token provided' });
         }
 
-        let payload;
         try {
-            payload = await verifyKeycloakToken(token);
-        } catch (err) {
-            if (err.name === 'TokenExpiredError') {
-                return res.status(401).json({
-                    message: 'Session expired. Please login again.',
-                    code:    'TOKEN_EXPIRED',
-                });
+            // STEP 2: Verify access token
+            const decoded = jwt.verify(accessToken, JWT_ACCESS_SECRET);
+            req.user = decoded;
+            logger.info(`✅ Valid access token for user ${decoded.id}`);
+            return next();
+
+        } catch (tokenError) {
+
+            // STEP 3: Access token expired → try refresh cookie
+            if (tokenError.name === 'TokenExpiredError') {
+                logger.info('⏰ Access token expired, attempting auto-refresh...');
+
+                const refreshToken = req.cookies?.refreshToken;
+
+                if (!refreshToken) {
+                    logger.warn('❌ No refresh token found in cookies');
+                    return res.status(401).json({
+                        message: 'Session expired. Please login again.',
+                        code: 'TOKEN_EXPIRED',
+                    });
+                }
+
+                try {
+                    // STEP 4: Verify refresh token
+                    const refreshDecoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+
+                    // STEP 5: Confirm refresh token still exists in DB
+                    const user = await User.findOne({
+                        where: { id: refreshDecoded.id, refresh_token: refreshToken },
+                    });
+
+                    if (!user) {
+                        logger.warn('❌ Refresh token not found in DB or user deleted');
+                        return res.status(401).json({
+                            message: 'Invalid session. Please login again.',
+                            code: 'INVALID_REFRESH_TOKEN',
+                        });
+                    }
+
+                    // STEP 6: Check DB-level expiry
+                    if (user.refresh_token_expires_at && new Date() > new Date(user.refresh_token_expires_at)) {
+                        logger.warn('❌ Refresh token expired in DB');
+                        await user.update({ refresh_token: null, refresh_token_expires_at: null });
+                        return res.status(401).json({
+                            message: 'Session expired. Please login again.',
+                            code: 'REFRESH_TOKEN_EXPIRED',
+                        });
+                    }
+
+                    // STEP 7: Issue new access token
+                    const isChauffeur = user.partner_id !== null && user.partner_id !== undefined;
+                    const app_type    = user.type_partner === 'LEASE_PARTNER' ? 'recouvrement' : 'tracking';
+
+                    const newAccessToken = jwt.sign(
+                        {
+                            id:             user.id,
+                            phone:          user.phone,
+                            user_unique_id: user.user_unique_id,
+                            user_type:      isChauffeur ? 'chauffeur' : 'regular',
+                            app_type,
+                        },
+                        JWT_ACCESS_SECRET,
+                        { expiresIn: '90d' }
+                    );
+
+                    // Return new token in header so Flutter can persist it
+                    res.setHeader('X-New-Access-Token', newAccessToken);
+
+                    req.user = {
+                        id:             user.id,
+                        phone:          user.phone,
+                        user_unique_id: user.user_unique_id,
+                        user_type:      isChauffeur ? 'chauffeur' : 'regular',
+                        app_type,
+                    };
+
+                    logger.info(`🔄 Token auto-refreshed for user ${user.id} | app_type=${app_type}`);
+                    return next();
+
+                } catch (refreshError) {
+                    logger.warn('❌ Refresh token verification failed:', refreshError.message);
+                    return res.status(401).json({
+                        message: 'Invalid session. Please login again.',
+                        code: 'INVALID_REFRESH_TOKEN',
+                    });
+                }
+
+            } else {
+                // Malformed or wrong-signature token
+                logger.warn('❌ Invalid access token:', tokenError.message);
+                return res.status(401).json({ message: 'Invalid token' });
             }
-            logger.warn(`❌ Token verification failed: ${err.message}`);
-            return res.status(401).json({ message: 'Invalid token', code: 'INVALID_TOKEN' });
         }
 
-        // Resolve local user from keycloak sub
-        const keycloakId = payload.sub;
-        const localUser  = await resolveLocalUser(keycloakId);
-
-        if (!localUser) {
-            logger.warn(`❌ No local user for keycloak_id=${keycloakId}`);
-            return res.status(401).json({ message: 'User account not found', code: 'USER_NOT_FOUND' });
-        }
-
-        // Extract client roles
-        const appClient  = resolveAppClient(payload);
-        const clientRoles = payload?.resource_access?.[appClient]?.roles || [];
-
-        // Populate req.user — same id contract as before + Keycloak extras
-        req.user = {
-            id:             localUser.id,
-            user_unique_id: localUser.user_unique_id,
-            phone:          localUser.phone,
-            partner_id:     localUser.partner_id,
-            keycloak_id:    keycloakId,
-            app_client:     appClient,
-            roles:          clientRoles,
-        };
-
-        logger.debug(`✅ Auth OK — user ${localUser.id} | client=${appClient} | roles=${clientRoles}`);
-        return next();
-
-    } catch (err) {
-        logger.error('🔥 Auth middleware error:', err.message);
+    } catch (error) {
+        logger.error('🔥 Auth middleware error:', error);
         return res.status(500).json({ message: 'Authentication error' });
     }
 };
