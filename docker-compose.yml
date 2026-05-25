@@ -18,17 +18,17 @@ services:
     container_name: proxym_backend
     restart: always
     ports:
-      - "5000:5000"
+      - "5005:5000"
     env_file:
       - .env
     environment:
       NODE_ENV: production
-      DB_HOST: host.docker.internal   # points to VPS native MySQL
+      DB_HOST: host.docker.internal
       DB_PORT: 3306
       REDIS_HOST: redis
       REDIS_PORT: 6379
     extra_hosts:
-      - "host.docker.internal:host-gateway"   # required on Linux
+      - "host.docker.internal:host-gateway"
     depends_on:
       redis:
         condition: service_healthy

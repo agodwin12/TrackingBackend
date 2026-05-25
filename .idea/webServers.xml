@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="3634d5f4-875b-4fc5-b735-5de2c5ffd206" name="tracking server">
+        <fileTransfer rootFolder="/home/ubuntu" accessType="SFTP" host="51.75.31.246" port="22" sshConfigId="b8778dda-7237-4b5b-b2c0-2735a6a63fb4" sshConfig="ubuntu@51.75.31.246:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

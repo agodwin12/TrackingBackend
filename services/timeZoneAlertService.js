@@ -3,7 +3,7 @@ const Alert = require("../models/Alert");
 const Voiture = require("../models/voiture");
 const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
-const NotificationService = require("./notificationService");
+const NotificationService = require("../controllers/notificationController");
 
 class TimeZoneAlertService {
     // Cooldown period in minutes
@@ -162,12 +162,15 @@ class TimeZoneAlertService {
             console.log(`✅ Time zone alert created: ${alert.id}`);
 
             // Send notification
-            await NotificationService.sendAlertNotification(userId, {
-                type: 'time_zone',
+            await NotificationService.sendToUser(userId, {
                 title: '🕐 Restricted Hours Violation',
                 body: message,
-                vehicleId: vehicle.id,
-                alertId: alert.id
+                data: {
+                    type: 'time_zone',
+                    vehicleId: String(vehicle.id),
+                    alertId: String(alert.id),
+                    timestamp: new Date().toISOString()
+                }
             });
 
             // Mark as sent
