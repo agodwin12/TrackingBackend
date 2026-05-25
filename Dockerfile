@@ -12,9 +12,12 @@ FROM node:18-alpine AS production
 
 WORKDIR /app
 
-# Copy everything from builder, then prune devDeps
-COPY --from=builder /app /app
-RUN npm prune --omit=dev
+# Only copy package files and install prod deps fresh (cleaner than pruning)
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy app source (not node_modules) from builder
+COPY --from=builder /app .
 
 # Create logs dir and set ownership BEFORE switching user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
