@@ -9,7 +9,7 @@ class TimeZoneAlertService {
     // Cooldown period in minutes
     static ALERT_COOLDOWN_MINUTES = 10;
 
-    // Minimum speed to consider vehicle as "moving" (km/h)
+    // Minimum speed to consider vehicle as "moving" (km/h
     static MIN_MOVEMENT_SPEED = 1;
 
     /**

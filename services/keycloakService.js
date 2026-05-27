@@ -24,6 +24,8 @@ const ROLE_APP_MAP = {
             'call_center', 'CALL_CENTER', 'DRIVER',
             'INDIVIDUAL_OWNER', 'PARTNER_ADMIN', 'SITE_MANAGER',
             'SUPER_ADMIN', 'TECH_ADMIN',
+            'utilisateur_principale',
+            'UTILISATEUR_PRINCIPALE',
 
             'utilisateur',
             'UTILISATEUR',
@@ -73,7 +75,7 @@ async function getAdminToken() {
     }
 }
 
-// ─── ROPC login — try one client ─────────────────────────────────────────────
+// ─── ROPC login — try on client ─────────────────────────────────────────────
 
 async function attemptLogin(username, password, clientId) {
     try {
