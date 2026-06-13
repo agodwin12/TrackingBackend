@@ -52,6 +52,11 @@ const _ownedByUser = (userId) => ({
 });
 
 /**
+ * Carry-over renewal date calculation.
+ * If vehicle has an active unexpired sub → new days stack on top.
+ * Otherwise → fresh start from today.
+ */
+/**
  * Adds duration to a base date according to the plan's billing_mode.
  *
  * MONTH mode: addMonths(n) — March 15 + 1 month = April 15.
@@ -79,6 +84,8 @@ const _addDuration = (baseDate, plan) => {
  * Renewal (carry-over) logic:
  *   - Active sub not yet expired → new duration stacks on top of end_date.
  *   - Expired or no sub → starts fresh from today.
+ *
+ * Now accepts the full `plan` object so it can read billing_mode.
  */
 const _calculateDates = (existingSub, plan) => {
     const now = new Date();
@@ -162,6 +169,7 @@ const initiateSubscriptionPayment = async ({
                 provider,
                 customRef,
                 country_code,
+                plan.currency || 'XAF',
             );
         } catch (err) {
             await payment.update({ status: 'FAILED' });
@@ -194,20 +202,6 @@ const initiateSubscriptionPayment = async ({
 
         if (existingSub) await existingSub.update({ status: 'RENEWED' });
 
-        // Create payment first so we have its id to link into the subscription
-        const payment = await Payment.create({
-            user_id,
-            vehicle_id,
-            plan_id,
-            amount:          totalAmount,
-            currency:        plan.currency || 'XAF',
-            method,
-            status:          'SUCCESS',
-            paid_at:         new Date(),
-            transaction_ref: `CASH-${uuidv4().replace(/-/g, '').substring(0, 10).toUpperCase()}`,
-        });
-
-        // Create subscription with payment_id linked  ✅ FIX
         const subscription = await Subscription.create({
             user_id,
             vehicle_id,
@@ -215,11 +209,20 @@ const initiateSubscriptionPayment = async ({
             status:     'ACTIVE',
             start_date: startDate,
             end_date:   endDate,
-            payment_id: payment.id,   // ✅ FIX: link payment → subscription
         });
 
-        // Back-link subscription → payment
-        await payment.update({ subscription_id: subscription.id });
+        const payment = await Payment.create({
+            user_id,
+            vehicle_id,
+            plan_id,
+            subscription_id: subscription.id,
+            amount:          totalAmount,
+            currency:        plan.currency || 'XAF',
+            method,
+            status:          'SUCCESS',
+            paid_at:         new Date(),
+            transaction_ref: `CASH-${uuidv4().replace(/-/g, '').substring(0, 10).toUpperCase()}`,
+        });
 
         return {
             payment_id:      payment.id,
@@ -257,14 +260,16 @@ const initiateSubscriptionPaymentBatch = async ({
     });
     if (!plan) throw new Error('Subscription plan not found or inactive.');
 
-    // FIX: use combined subquery so Sequelize doesn't merge/clobber two
-    // separate `id` conditions.
+    // ── FIX: use combined subquery so Sequelize doesn't merge/clobber two
+    // separate `id` conditions. One subquery handles both the ownership
+    // check AND the vehicle_ids filter simultaneously.
     const normalizedIds = vehicle_ids.map(Number);
 
     const vehicles = await Vehicle.findAll({
         where: _ownedByUserAndInList(user_id, normalizedIds),
     });
 
+    // Debug log to help diagnose mismatches
     console.log(`🔍 [BATCH] Requested IDs: [${normalizedIds}] | Found: [${vehicles.map(v => v.id)}] | user_id: ${user_id}`);
 
     if (vehicles.length !== normalizedIds.length) {
@@ -278,8 +283,13 @@ const initiateSubscriptionPaymentBatch = async ({
 
     // ── MOBILE MONEY ──────────────────────────────────────────────────────────
     if (method === 'MOBILE_MONEY') {
+        // batchRef is the shared PayGate external_reference for the whole batch.
+        // Each DB row gets its own unique ref (batchRef-{vehicleId}) to avoid
+        // the unique constraint violation on transaction_ref.
         const batchRef = `WGO-B-${uuidv4().replace(/-/g, '').substring(0, 10).toUpperCase()}`;
 
+        // MySQL does not support `returning: true` in bulkCreate.
+        // We use individual Payment.create() calls so each instance has its id.
         const payments = await Promise.all(
             normalizedIds.map((vid) =>
                 Payment.create({
@@ -303,10 +313,12 @@ const initiateSubscriptionPaymentBatch = async ({
                 totalAmount,
                 phone_number,
                 provider,
-                batchRef,
+                batchRef,      // PayGate still sees one clean batch ref
                 country_code,
+                plan.currency || 'XAF',
             );
         } catch (err) {
+            // Mark all rows in this batch as FAILED using the shared prefix
             await Payment.update(
                 { status: 'FAILED' },
                 { where: { transaction_ref: payments.map((p) => p.transaction_ref) } },
@@ -314,8 +326,9 @@ const initiateSubscriptionPaymentBatch = async ({
             throw new Error(`PayGate error: ${err.message}`);
         }
 
-        // Stamp the same PayGate transaction_id on all batch payment rows.
-        // The webhook uses transaction_id to find all rows for this batch.
+        // Now that transaction_id is no longer UNIQUE in the DB, we can safely
+        // store the same PayGate transaction_id on all batch rows.
+        // The webhook finds them all with: WHERE transaction_id = '...'
         const pgTransactionId = paygateResponse.transaction_id || null;
         await Promise.all(
             payments.map((p) => p.update({ transaction_id: pgTransactionId }))
@@ -352,20 +365,6 @@ const initiateSubscriptionPaymentBatch = async ({
 
             if (existingSub) await existingSub.update({ status: 'RENEWED' });
 
-            // Create payment first so we have its id  ✅ FIX
-            const payment = await Payment.create({
-                user_id,
-                vehicle_id:      vehicleId,
-                plan_id,
-                amount:          unitPrice,
-                currency:        plan.currency || 'XAF',
-                method,
-                status:          'SUCCESS',
-                paid_at:         new Date(),
-                transaction_ref: `CASH-${uuidv4().replace(/-/g, '').substring(0, 10).toUpperCase()}`,
-            });
-
-            // Create subscription with payment_id linked  ✅ FIX
             const subscription = await Subscription.create({
                 user_id,
                 vehicle_id: vehicleId,
@@ -373,11 +372,20 @@ const initiateSubscriptionPaymentBatch = async ({
                 status:     'ACTIVE',
                 start_date: startDate,
                 end_date:   endDate,
-                payment_id: payment.id,   // ✅ FIX: link payment → subscription
             });
 
-            // Back-link subscription → payment
-            await payment.update({ subscription_id: subscription.id });
+            const payment = await Payment.create({
+                user_id,
+                vehicle_id:      vehicleId,
+                plan_id,
+                subscription_id: subscription.id,
+                amount:          unitPrice,
+                currency:        plan.currency || 'XAF',
+                method,
+                status:          'SUCCESS',
+                paid_at:         new Date(),
+                transaction_ref: `CASH-${uuidv4().replace(/-/g, '').substring(0, 10).toUpperCase()}`,
+            });
 
             results.push({
                 vehicle_id:      vehicleId,
