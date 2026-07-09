@@ -306,7 +306,7 @@ class BatteryMonitoringService {
      */
     async getLastBatteryAlert(vehicleId, threshold, direction) {
         try {
-            const alertType = direction === 'recovery' ? 'battery_recovery' : 'battery_low';
+            const alertType = direction === 'recovery' ? 'battery_recovery' : 'low_battery';
 
             const alert = await Alert.findOne({
                 where: {

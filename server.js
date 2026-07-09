@@ -259,12 +259,8 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    logger.error('\n╔════════════════════════════════════════╗');
-    logger.error('║     🔥 UNHANDLED REJECTION            ║');
-    logger.error('╚════════════════════════════════════════╝');
+    logger.error('🔥 UNHANDLED REJECTION (non-fatal, process continues)');
     logger.error('Reason:', reason);
-    logger.error('Promise:', promise);
-    gracefulShutdown('UNHANDLED_REJECTION');
 });
 
 // ========== VERIFY CRITICAL ENVIRONMENT VARIABLES ==========

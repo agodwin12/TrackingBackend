@@ -21,12 +21,12 @@ const GPS_MAP_TYPE = process.env.GPS_MAP_TYPE || "WGS84";
 // ==============================
 const GPS_ACCOUNTS = {
     tracking: {
-        loginName: process.env.GPS_LOGIN_NAME_1 ,
-        loginPassword: process.env.GPS_LOGIN_PASSWORD_1 ,
+        loginName: process.env.GPS_LOGIN_NAME_1,
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_1,
     },
     mobility: {
         loginName: process.env.GPS_LOGIN_NAME_2,
-        loginPassword: process.env.GPS_LOGIN_PASSWORD_2 ,
+        loginPassword: process.env.GPS_LOGIN_PASSWORD_2,
     },
 };
 
@@ -80,36 +80,123 @@ function toBool(v) {
 }
 
 /**
- * Normalize "status bitfield" strings like "10100000".
- * We only care about 1st (ACC) and 3rd (oil/relay) bits per your app.
- * Returns: { accState?: boolean, oilState?: boolean }
+ * Parse the 8-character status bitfield from 18gps API.
+ *
+ * Per API docs (Interface 9 / 15):
+ *   status[0] → ACC state        (1=on,  0=off)
+ *   status[1] → Device defense   (1=armed, 0=disarmed)
+ *   status[2] → Oil/electricity  (1=on,  0=CUT — relay open)
+ *   status[3] → Charging state
+ *   status[4] → Door state       (1=open, 0=closed)
+ *   status[5] → GPS positioning  (1=yes, 0=no)
+ *   status[6] → Main power       (1=present, 0=absent)
+ *   status[7] → Platform defense
  */
 function parseStatusBits(status) {
     if (typeof status !== "string" || status.length < 3) return {};
     return {
-        accState: status[0] === "1",
-        oilState: status[2] === "1",
+        accState: status[0] === "1",   // ACC / ignition
+        oilState: status[2] === "1",   // relay: 1=connected, 0=cut
     };
 }
 
 /**
- * Normalize provider status response:
- * Returns:
- * {
- *   success: boolean,
- *   gps_status?: string,
- *   speed?: number,
- *   status?: string,
- *   oilState?: boolean,
- *   accState?: boolean,
- *   raw: any,
- *   message?: string
- * }
+ * ── KEY MAP from 18gps API docs (Interface 9 & 15) ──────────────────────────
+ * records[N] is an array. Each index maps to:
+ *   0  → sys_time      (UTC ms timestamp of GPS fix)
+ *   1  → user_name     (device name)
+ *   2  → jingdu        (longitude)
+ *   3  → weidu         (latitude)
+ *   4  → ljingdu       (corrected longitude — same as [2] for WGS84)
+ *   5  → lweidu        (corrected latitude  — same as [3] for WGS84)
+ *   6  → datetime      (server receive time ms)
+ *   7  → heart_time    (device heartbeat time ms)
+ *   8  → su            (speed; "-9" = device disabled)
+ *   9  → status        (8-char bitfield — see parseStatusBits above)
+ *  10  → hangxiang     (direction/heading degrees)
+ *  11  → sim_id        (IMEI / device number)
+ *  12  → user_id       (18gps device Guid)
+ *  15  → server_time   (current server time ms — used for online check)
+ *  19  → statenumber   (16-value csv: mileage, oil, weight, temp, battery…)
+ *
+ * Online check (per docs): (server_time - heart_time) < 25 minutes = online
+ * Disabled check:          speed === "-9" AND offline > 25 min
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+const RECORD_KEY = {
+    SYS_TIME:    0,
+    USER_NAME:   1,
+    LONGITUDE:   2,
+    LATITUDE:    3,
+    DATETIME:    6,
+    HEART_TIME:  7,
+    SPEED:       8,
+    STATUS:      9,
+    DIRECTION:   10,
+    SIM_ID:      11,
+    USER_ID:     12,
+    SERVER_TIME: 15,
+    STATENUMBER: 19,
+};
+
+/**
+ * Parse a single records[] entry from the 18gps API into a normalized status
+ * object that matches the shape the controller already expects.
+ *
+ * @param {Array} record  — one element of data[0].records
+ * @returns {{
+ *   success: true,
+ *   gps_status: string,
+ *   speed: number,
+ *   status: string,
+ *   oilState: boolean,
+ *   accState: boolean,
+ *   latitude: number,
+ *   longitude: number,
+ *   direction: number,
+ *   isOnline: boolean,
+ *   isDisabled: boolean,
+ *   raw: Array
+ * }}
+ */
+function parseRecord(record) {
+    const statusStr  = String(record[RECORD_KEY.STATUS] || "");
+    const speedRaw   = record[RECORD_KEY.SPEED];
+    const speed      = Number(speedRaw) || 0;
+    const heartTime  = Number(record[RECORD_KEY.HEART_TIME]) || 0;
+    const serverTime = Number(record[RECORD_KEY.SERVER_TIME]) || Date.now();
+
+    const offlineMs   = serverTime - heartTime;
+    const isOnline    = offlineMs < 25 * 60 * 1000; // < 25 minutes
+    const isDisabled  = String(speedRaw) === "-9" && !isOnline;
+
+    const bits = parseStatusBits(statusStr);
+
+    return {
+        success:    true,
+        gps_status: isOnline ? "Connected" : "Disconnected",
+        speed,
+        status:     statusStr,
+        oilState:   bits.oilState  ?? false,
+        accState:   bits.accState  ?? false,
+        latitude:   Number(record[RECORD_KEY.LATITUDE])  || 0,
+        longitude:  Number(record[RECORD_KEY.LONGITUDE]) || 0,
+        direction:  Number(record[RECORD_KEY.DIRECTION]) || 0,
+        isOnline,
+        isDisabled,
+        raw: record,
+    };
+}
+
+/**
+ * Normalize "status bitfield" strings like "10100000".
+ * We only care about 1st (ACC) and 3rd (oil/relay) bits per your app.
+ * Returns: { accState?: boolean, oilState?: boolean }
+ * Kept for backward compatibility with any other callers.
  */
 function normalizeStatusResponse(body) {
     if (!body) return { success: false, message: "Empty response" };
 
-    // handle shapes like { success, data: {...} } or flat {...}
     const data = body.data ?? body;
 
     const success =
@@ -144,7 +231,6 @@ function normalizeStatusResponse(body) {
         message: body.msg || body.message || data.msg || data.message,
     };
 
-    // If explicit flags are not present but we have a bitfield string, derive them.
     if (normalized.status && (oilState === undefined || accState === undefined)) {
         const bits = parseStatusBits(normalized.status);
         if (normalized.oilState === undefined && bits.oilState !== undefined) {
@@ -155,7 +241,6 @@ function normalizeStatusResponse(body) {
         }
     }
 
-    // If gps_status returns "1"/"0"
     if (normalized.gps_status === "1") normalized.gps_status = "Connected";
     if (normalized.gps_status === "0") normalized.gps_status = "Disconnected";
 
@@ -172,7 +257,6 @@ function extractErrorCode(resp) {
 
 /**
  * Determine if response indicates token is invalid/expired.
- * 18gps sometimes returns errorCode=403 or 401-ish.
  */
 function isTokenInvalid(resp) {
     const code = extractErrorCode(resp);
@@ -188,7 +272,6 @@ function isTokenInvalid(resp) {
 
 /**
  * Decide if a command succeeded.
- * For SendCommands, 18gps often uses success="true" and/or errorCode="200".
  */
 function isCommandOk(providerResp) {
     if (!providerResp) return false;
@@ -220,10 +303,10 @@ function getProviderMessage(providerResp) {
 
 /**
  * Login to GPS system for a specific account and retrieve token (mds).
- * NO CACHING: always returns a fresh token.
+ * NO CACHING: always returns a fresh token + unitId.
  *
  * @param {string} accountName "tracking" | "mobility"
- * @returns {Promise<string|null>}
+ * @returns {Promise<{token: string, unitId: string}|null>}
  */
 async function loginGps(accountName) {
     const creds = getCredentialsForAccount(accountName);
@@ -254,7 +337,8 @@ async function loginGps(accountName) {
 
         if (data && (data.success === "true" || data.success === true) && data.mds) {
             console.log(`✅ Login successful for account="${accountName}". Token received.`);
-            return data.mds;
+            // ── CHANGED: also return unitId (data.id) — needed for getDeviceListByCustomId fallback ──
+            return { token: data.mds, unitId: data.id || null };
         }
 
         console.error(`❌ Login failed for account="${accountName}":`, data);
@@ -267,7 +351,6 @@ async function loginGps(accountName) {
 
 /**
  * Send command to GPS device (OPENRELAY / CLOSERELAY).
- * NOW USES ACCOUNT PASSWORD as the device password.
  * Returns provider raw response or null on failure.
  */
 async function sendGpsCommand(macId, command, accountName, params, sendTime, token) {
@@ -277,7 +360,6 @@ async function sendGpsCommand(macId, command, accountName, params, sendTime, tok
             return null;
         }
 
-        // Get the account credentials to use the correct password
         const creds = getCredentialsForAccount(accountName);
         if (!creds) {
             console.error(`❌ Invalid account name: ${accountName}`);
@@ -289,7 +371,7 @@ async function sendGpsCommand(macId, command, accountName, params, sendTime, tok
             macid: macId,
             cmd: String(command || "").trim().toUpperCase(),
             param: params || "",
-            pwd: creds.loginPassword, // ✅ Use the account's actual password
+            pwd: creds.loginPassword,
             sendTime: sendTime || nowIso(),
             mds: token,
         };
@@ -307,7 +389,6 @@ async function sendGpsCommand(macId, command, accountName, params, sendTime, tok
 
 /**
  * ✅ Send command WITH fallback (token refresh once on invalid token)
- * This is the safest function to call from controller.
  *
  * @param {object} opts
  * @param {string} opts.accountName "tracking" | "mobility"
@@ -335,9 +416,8 @@ async function sendGpsCommandWithFallback({
         };
     }
 
-    // 1) Login first
-    let token = await loginGps(acc);
-    if (!token) {
+    const loginResult = await loginGps(acc);
+    if (!loginResult) {
         return {
             ok: false,
             message: `Login failed for account "${acc}"`,
@@ -346,17 +426,17 @@ async function sendGpsCommandWithFallback({
         };
     }
 
-    // 2) Send command (now using account password automatically)
+    let { token } = loginResult;
+
     let providerResp = await sendGpsCommand(macId, command, acc, params, sendTime, token);
 
-    // 3) If token invalid, refresh once and retry
     let retried = false;
     if (providerResp && isTokenInvalid(providerResp)) {
         retried = true;
         console.warn("⚠️ Token seems invalid/expired. Re-login and retry once...");
 
-        token = await loginGps(acc);
-        if (!token) {
+        const retryLogin = await loginGps(acc);
+        if (!retryLogin) {
             return {
                 ok: false,
                 message: `Token refresh login failed for account "${acc}"`,
@@ -365,89 +445,194 @@ async function sendGpsCommandWithFallback({
             };
         }
 
+        token = retryLogin.token;
         providerResp = await sendGpsCommand(macId, command, acc, params, sendTime, token);
     }
 
     const ok = isCommandOk(providerResp);
     const message = getProviderMessage(providerResp);
 
-    return {
-        ok,
-        message,
-        providerResp,
-        retried,
-    };
+    return { ok, message, providerResp, retried };
 }
 
 /**
- * Get realtime STATUS (NOT location) for a device by MAC.
- * Returns normalized object.
+ * ── CHANGED ──────────────────────────────────────────────────────────────────
+ * Get realtime status for a device using the correct 18gps API endpoints.
+ *
+ * Strategy:
+ *   1. PRIMARY:  getUserAndGpsInfoByIDsUtcNew  — single device by 18gps user_id (Guid)
+ *                Requires gpsUserId (sim_gps.objectid).
+ *   2. FALLBACK: getDeviceListByCustomId       — all devices under the unit account
+ *                Requires unitId from login response. Filters by macId in the result.
+ *
+ * Both return records[] arrays parsed with parseRecord() using the documented key map.
+ *
+ * @param {string}      macId      — IMEI / mac_id_gps
+ * @param {string}      token      — 18gps mds token
+ * @param {string|null} gpsUserId  — sim_gps.objectid (18gps device Guid), may be null
+ * @param {string|null} unitId     — unit id from loginGps() response, used as fallback
  */
-async function getRealtimeStatusByMac(macId, token) {
+async function getRealtimeStatusByMac(macId, token, gpsUserId = null, unitId = null) {
     if (!token) {
         return { success: false, message: "Missing token" };
     }
 
-    const commonParams = { macid: macId, mds: token, mapType: GPS_MAP_TYPE };
-
-    // fallback methods
-    const candidates = ["GetDeviceStatus", "GetNowData", "GetBitStatus"];
-    let lastErr = null;
-
-    for (const method of candidates) {
+    // ── PRIMARY: getUserAndGpsInfoByIDsUtcNew ─────────────────────────────────
+    if (gpsUserId) {
         try {
-            console.log(`🔎 Fetching realtime status via method=${method} for MAC=${macId}`);
-            const data = await getWithParams(COMMAND_URL, { method, ...commonParams });
-            const normalized = normalizeStatusResponse(data);
+            console.log(`🔎 [PRIMARY] getUserAndGpsInfoByIDsUtcNew → MAC=${macId} gpsUserId=${gpsUserId}`);
 
-            if (normalized.success) return normalized;
+            const data = await getWithParams(COMMAND_URL, {
+                method:  "getUserAndGpsInfoByIDsUtcNew",
+                user_id: gpsUserId,
+                mapType: GPS_MAP_TYPE,
+                option:  GPS_LANGUAGE,
+                mds:     token,
+            });
 
-            lastErr = new Error(normalized.message || "Unknown provider failure");
-            console.warn(`⚠️ ${method} did not return success.`, normalized);
+            console.log("📡 getUserAndGpsInfoByIDsUtcNew response:", JSON.stringify(data).slice(0, 300));
+
+            if (
+                data &&
+                (data.success === "true" || data.success === true) &&
+                Array.isArray(data.data) &&
+                data.data.length > 0
+            ) {
+                const deviceBlock = data.data[0];
+                const records = deviceBlock.records;
+
+                if (Array.isArray(records) && records.length > 0) {
+                    const parsed = parseRecord(records[0]);
+                    console.log(`✅ [PRIMARY] Status parsed — oilState=${parsed.oilState} accState=${parsed.accState} speed=${parsed.speed}`);
+                    return parsed;
+                }
+            }
+
+            console.warn("⚠️ [PRIMARY] No records in response, falling through to fallback");
         } catch (err) {
-            lastErr = err;
-            console.warn(`⚠️ ${method} call failed:`, err.message);
+            console.warn(`⚠️ [PRIMARY] getUserAndGpsInfoByIDsUtcNew failed: ${err.message}`);
         }
+    } else {
+        console.warn(`⚠️ [PRIMARY] gpsUserId not available for MAC=${macId}, skipping primary method`);
+    }
+
+    // ── FALLBACK: getDeviceListByCustomId ─────────────────────────────────────
+    if (unitId) {
+        try {
+            console.log(`🔎 [FALLBACK] getDeviceListByCustomId → unitId=${unitId} looking for MAC=${macId}`);
+
+            const data = await getWithParams(COMMAND_URL, {
+                method:  "getDeviceListByCustomId",
+                id:      unitId,
+                mapType: GPS_MAP_TYPE,
+                mds:     token,
+            });
+
+            console.log("📡 getDeviceListByCustomId response:", JSON.stringify(data).slice(0, 300));
+
+            if (
+                data &&
+                (data.success === "true" || data.success === true) &&
+                Array.isArray(data.data) &&
+                data.data.length > 0
+            ) {
+                const deviceBlock = data.data[0];
+                const records = deviceBlock.records;
+
+                if (Array.isArray(records) && records.length > 0) {
+                    // Filter to find the specific MAC in the list
+                    const match = records.find(
+                        (r) => String(r[RECORD_KEY.SIM_ID] || "").trim() === String(macId).trim()
+                    );
+
+                    if (match) {
+                        const parsed = parseRecord(match);
+                        console.log(`✅ [FALLBACK] Status parsed — oilState=${parsed.oilState} accState=${parsed.accState} speed=${parsed.speed}`);
+                        return parsed;
+                    }
+
+                    console.warn(`⚠️ [FALLBACK] MAC=${macId} not found in device list of ${records.length} records`);
+                }
+            }
+
+            console.warn("⚠️ [FALLBACK] No usable data in getDeviceListByCustomId response");
+        } catch (err) {
+            console.warn(`⚠️ [FALLBACK] getDeviceListByCustomId failed: ${err.message}`);
+        }
+    } else {
+        console.warn(`⚠️ [FALLBACK] unitId not available, cannot use getDeviceListByCustomId`);
     }
 
     return {
         success: false,
-        message: lastErr?.message || "All status methods failed",
+        message: "All status methods failed — check gpsUserId (sim_gps.objectid) and unitId from login",
     };
 }
 
 /**
- * ✅ Status WITH fallback (token refresh once)
+ * ── CHANGED ──────────────────────────────────────────────────────────────────
+ * Status WITH fallback (token refresh once).
+ * Now looks up sim_gps.objectid to pass as gpsUserId to getRealtimeStatusByMac.
+ * Controller signature unchanged: { accountName, macId }
  *
  * @param {object} opts
  * @param {string} opts.accountName
  * @param {string} opts.macId
- * @returns {Promise<{success:boolean, message?:string, retried:boolean, status?:any, raw?:any}>}
+ * @returns {Promise<{success:boolean, message?:string, retried:boolean, status?:any}>}
  */
 async function getRealtimeStatusByMacWithFallback({ accountName, macId }) {
     const acc = normalizeAccountName(accountName);
     if (!acc) return { success: false, message: `Invalid accountName "${accountName}"`, retried: false };
 
-    let token = await loginGps(acc);
-    if (!token) return { success: false, message: `Login failed for account "${acc}"`, retried: false };
+    // ── Look up gpsUserId from sim_gps.objectid ───────────────────────────────
+    // We import SimGps here (lazy require) to avoid circular dependency issues.
+    let gpsUserId = null;
+    try {
+        const SimGps = require("../models/sim_gps");
+        const simRecord = await SimGps.findOne({
+            where: { mac_id: macId },
+            attributes: ["objectid"],
+            order: [["updated_at", "DESC"]],
+        });
+        gpsUserId = simRecord?.objectid || null;
+        if (gpsUserId) {
+            console.log(`✅ Found gpsUserId=${gpsUserId} for MAC=${macId}`);
+        } else {
+            console.warn(`⚠️ sim_gps.objectid is null for MAC=${macId} — will use fallback method`);
+        }
+    } catch (err) {
+        console.warn(`⚠️ Could not look up sim_gps.objectid: ${err.message}`);
+    }
 
-    let status = await getRealtimeStatusByMac(macId, token);
+    // ── Login ─────────────────────────────────────────────────────────────────
+    let loginResult = await loginGps(acc);
+    if (!loginResult) return { success: false, message: `Login failed for account "${acc}"`, retried: false };
 
+    let { token, unitId } = loginResult;
+
+    // ── First attempt ─────────────────────────────────────────────────────────
+    let status = await getRealtimeStatusByMac(macId, token, gpsUserId, unitId);
+
+    // ── Token refresh + retry if needed ──────────────────────────────────────
     let retried = false;
-    if (status && status.success === false && status.raw && isTokenInvalid(status.raw)) {
+    if (!status?.success && status?.raw && isTokenInvalid(status.raw)) {
         retried = true;
-        token = await loginGps(acc);
-        if (!token) return { success: false, message: `Token refresh login failed for account "${acc}"`, retried };
+        console.warn("⚠️ Token invalid. Re-login and retry once...");
 
-        status = await getRealtimeStatusByMac(macId, token);
+        loginResult = await loginGps(acc);
+        if (!loginResult) return { success: false, message: `Token refresh login failed for account "${acc}"`, retried };
+
+        token  = loginResult.token;
+        unitId = loginResult.unitId;
+
+        status = await getRealtimeStatusByMac(macId, token, gpsUserId, unitId);
     }
 
     return { success: !!status?.success, message: status?.message, retried, status };
 }
 
 /**
- * Kept only for backward compatibility with controller code.
- * No caching is used, so this does nothing.
+ * Kept for backward compatibility.
  */
 function resetGpsToken() {
     console.log("ℹ️ resetGpsToken() called but token caching is disabled. No action taken.");

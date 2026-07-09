@@ -12,23 +12,27 @@ FROM node:18-alpine AS production
 
 WORKDIR /app
 
-# Only copy package files and install prod deps fresh (cleaner than pruning)
+ENV NODE_ENV=production
+ENV TZ=Africa/Douala
+
+RUN apk add --no-cache tzdata \
+    && cp /usr/share/zoneinfo/Africa/Douala /etc/localtime \
+    && echo "Africa/Douala" > /etc/timezone
+
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# Copy app source (not node_modules) from builder
 COPY --from=builder /app .
 
-# Create logs dir and set ownership BEFORE switching user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
     && mkdir -p /app/logs \
     && chown -R appuser:appgroup /app
 
 USER appuser
 
-EXPOSE 5000
+EXPOSE 6000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:5000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:6000/health || exit 1
 
 CMD ["node", "server.js"]

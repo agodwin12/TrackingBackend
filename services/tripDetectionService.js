@@ -1006,8 +1006,12 @@ class TripDetectionService {
 
         try {
             if (newWaypoints.length > 0) {
-                // ✅ FIX: store raw GPS points — smoothPath() removed from here.
-                const waypointsToInsert = newWaypoints.map(w => ({ ...w, trip_id: currentTrip.id }));
+                // ✅ Store RAW GPS points.
+                // Do NOT simplify here. Simplification was reducing trips to 2–3 points.
+                const waypointsToInsert = newWaypoints.map(w => ({
+                    ...w,
+                    trip_id: currentTrip.id
+                }));
 
                 for (let i = 0; i < waypointsToInsert.length; i += this.WAYPOINT_BATCH_SIZE) {
                     await TripWaypoint.bulkCreate(
@@ -1018,54 +1022,20 @@ class TripDetectionService {
             }
 
             const allWaypoints = await TripWaypoint.findAll({
-                where:      { trip_id: currentTrip.id },
+                where: { trip_id: currentTrip.id },
                 attributes: ["latitude", "longitude", "speed", "recorded_at"],
-                order:      [["sequence_order", "ASC"]],
-                raw:        true,
+                order: [["sequence_order", "ASC"]],
+                raw: true,
                 transaction
             });
 
             logger.info(
                 `[TRIP DETECTION] Trip ${currentTrip.id}: ` +
-                `${allWaypoints.length} raw waypoints before simplification`
+                `${allWaypoints.length} raw waypoints saved`
             );
 
-            // Douglas-Peucker simplification runs on the raw GPS points before
-            // final storage. This reduces DB size without affecting road-snap
-            // quality because the simplification threshold (0.0001°≈11m) is
-            // smaller than a typical road width.
-            const simplifiedWaypoints = this.simplifyPath(allWaypoints);
+            const metrics = this.calculateTripMetrics(allWaypoints);
 
-            if (simplifiedWaypoints.length < allWaypoints.length) {
-                const reduction = ((1 - simplifiedWaypoints.length / allWaypoints.length) * 100).toFixed(1);
-                logger.info(
-                    `[TRIP DETECTION] Path simplified: ` +
-                    `${allWaypoints.length} → ${simplifiedWaypoints.length} waypoints (${reduction}% reduction)`
-                );
-
-                await TripWaypoint.destroy({ where: { trip_id: currentTrip.id }, transaction });
-
-                const simplifiedInserts = simplifiedWaypoints.map((w, idx) => ({
-                    trip_id:        currentTrip.id,
-                    latitude:       w.latitude,
-                    longitude:      w.longitude,
-                    speed:          w.speed,
-                    recorded_at:    w.recorded_at,
-                    sequence_order: idx + 1
-                }));
-
-                for (let i = 0; i < simplifiedInserts.length; i += this.WAYPOINT_BATCH_SIZE) {
-                    await TripWaypoint.bulkCreate(
-                        simplifiedInserts.slice(i, i + this.WAYPOINT_BATCH_SIZE),
-                        { transaction }
-                    );
-                }
-            }
-
-            const finalWaypoints = simplifiedWaypoints.length > 0 ? simplifiedWaypoints : allWaypoints;
-            const metrics        = this.calculateTripMetrics(finalWaypoints);
-
-            // fixed last week error
             if (
                 metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM
@@ -1075,9 +1045,21 @@ class TripDetectionService {
                     `(${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`
                 );
 
-                await TripWaypoint.destroy({ where: { trip_id: currentTrip.id }, transaction });
-                await Location.update({ trip_id: null }, { where: { trip_id: currentTrip.id }, transaction });
-                await Trip.destroy({ where: { id: currentTrip.id }, transaction });
+                await TripWaypoint.destroy({
+                    where: { trip_id: currentTrip.id },
+                    transaction
+                });
+
+                await Location.update(
+                    { trip_id: null },
+                    { where: { trip_id: currentTrip.id }, transaction }
+                );
+
+                await Trip.destroy({
+                    where: { id: currentTrip.id },
+                    transaction
+                });
+
                 await Location.update(
                     { processed: true, trip_id: null },
                     { where: { id: locationIds }, transaction }
@@ -1087,26 +1069,29 @@ class TripDetectionService {
                 return false;
             }
 
-            // ── Geocode end address ────────────────────────────────────────────
             logger.info(`[TRIP DETECTION] Geocoding end address for trip ${currentTrip.id}...`);
+
             const endAddressData = await this.reverseGeocode(
                 endLocation.latitude,
                 endLocation.longitude
             );
 
             await Trip.update({
-                end_time:           endLocation.sys_time,
-                end_latitude:       endLocation.latitude,
-                end_longitude:      endLocation.longitude,
-                end_address:        endAddressData.address,
+                end_time: endLocation.sys_time,
+                end_latitude: endLocation.latitude,
+                end_longitude: endLocation.longitude,
+                end_address: endAddressData.address,
                 end_address_status: endAddressData.status,
-                duration_minutes:   Math.round(metrics.durationMinutes),
-                total_distance_km:  parseFloat(metrics.totalDistanceKm.toFixed(2)),
-                avg_speed_kmh:      parseFloat(metrics.avgSpeed.toFixed(2)),
-                max_speed_kmh:      parseFloat(metrics.maxSpeed.toFixed(2)),
-                waypoint_count:     finalWaypoints.length,
-                status:             "completed"
-            }, { where: { id: currentTrip.id }, transaction });
+                duration_minutes: Math.round(metrics.durationMinutes),
+                total_distance_km: parseFloat(metrics.totalDistanceKm.toFixed(2)),
+                avg_speed_kmh: parseFloat(metrics.avgSpeed.toFixed(2)),
+                max_speed_kmh: parseFloat(metrics.maxSpeed.toFixed(2)),
+                waypoint_count: allWaypoints.length,
+                status: "completed"
+            }, {
+                where: { id: currentTrip.id },
+                transaction
+            });
 
             await Location.update(
                 { processed: true, trip_id: currentTrip.id },
@@ -1121,7 +1106,7 @@ class TripDetectionService {
                 `${Math.round(metrics.durationMinutes)} min | ` +
                 `${metrics.totalDistanceKm.toFixed(2)} km | ` +
                 `${metrics.avgSpeed.toFixed(1)} km/h avg | ` +
-                `${finalWaypoints.length} waypoints`
+                `${allWaypoints.length} raw waypoints`
             );
 
             return true;

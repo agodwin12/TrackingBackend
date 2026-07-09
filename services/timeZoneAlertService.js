@@ -5,16 +5,20 @@ const User = require("../models/userModel");
 const AssocUserVoitures = require("../models/AssociationUserVoiture");
 const NotificationService = require("../controllers/notificationController");
 
+
+const pendingViolations = new Map();
+
 class TimeZoneAlertService {
-    // Cooldown period in minutes
+    // Cooldown period in minutes (between actual fired alerts, stored in DB)
     static ALERT_COOLDOWN_MINUTES = 10;
 
-    // Minimum speed to consider vehicle as "moving" (km/h
+    // Minimum speed to consider vehicle as "moving" (km/h)
     static MIN_MOVEMENT_SPEED = 1;
 
-    /**
-     * Check if vehicle is moving during restricted time zone
-     */
+    // How long movement must be sustained before we fire the alert (ms)
+    static CONFIRMATION_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
+
+
     static async checkTimeZoneViolation(vehicleId, macIdGps, currentSpeed, location) {
         try {
             console.log(`🕐 Checking time zone for vehicle ${vehicleId}`);
@@ -32,21 +36,15 @@ class TimeZoneAlertService {
             // Check if time zone is configured
             if (!vehicle.time_zone_start || !vehicle.time_zone_end) {
                 console.log(`⏭️ No time zone restriction set for vehicle ${vehicleId}`);
+                pendingViolations.delete(vehicleId);
                 return;
             }
 
-            // Check if vehicle is moving
-            const actualSpeed = parseFloat(currentSpeed || 0);
-            if (actualSpeed < this.MIN_MOVEMENT_SPEED) {
-                console.log(`✅ Vehicle stationary (${actualSpeed} km/h)`);
-                return;
-            }
-
-            // Get current time
+            // Get current time (server is WAT so toTimeString() is correct)
             const now = new Date();
-            const currentTime = now.toTimeString().split(' ')[0]; // HH:MM:SS format
+            const currentTime = now.toTimeString().split(' ')[0]; // HH:MM:SS
 
-            // Check if current time is within restricted zone
+            // Check if current time is within restricted window
             const isInRestrictedZone = this.isTimeInRestrictedZone(
                 currentTime,
                 vehicle.time_zone_start,
@@ -55,17 +53,54 @@ class TimeZoneAlertService {
 
             if (!isInRestrictedZone) {
                 console.log(`✅ Current time ${currentTime} is outside restricted zone (${vehicle.time_zone_start} - ${vehicle.time_zone_end})`);
+                // Clear any pending confirmation — restriction lifted
+                if (pendingViolations.has(vehicleId)) {
+                    pendingViolations.delete(vehicleId);
+                    console.log(`🔄 [TimeZone] Cleared pending confirmation for vehicle ${vehicleId} (outside restricted window)`);
+                }
                 return;
             }
 
-            console.log(`⚠️ TIME ZONE VIOLATION DETECTED! Vehicle moving at ${currentTime} (restricted: ${vehicle.time_zone_start} - ${vehicle.time_zone_end})`);
+            // Check if vehicle is moving
+            const actualSpeed = parseFloat(currentSpeed || 0);
+            if (actualSpeed < this.MIN_MOVEMENT_SPEED) {
+                console.log(`✅ Vehicle stationary (${actualSpeed} km/h)`);
+                // Vehicle stopped — reset confirmation timer
+                if (pendingViolations.has(vehicleId)) {
+                    pendingViolations.delete(vehicleId);
+                    console.log(`🔄 [TimeZone] Cleared pending confirmation for vehicle ${vehicleId} (vehicle stopped)`);
+                }
+                return;
+            }
 
-            // Check for recent alerts (cooldown)
+            // Vehicle is moving inside restricted window
+            if (!pendingViolations.has(vehicleId)) {
+                // First time we see it moving — start the confirmation clock
+                pendingViolations.set(vehicleId, now);
+                const restrictedStr = `${vehicle.time_zone_start} - ${vehicle.time_zone_end}`;
+                console.log(`⏳ [TimeZone] Vehicle ${vehicleId} moving at ${currentTime} during restricted hours (${restrictedStr}) — starting 3-min confirmation window`);
+                return;
+            }
+
+            const firstDetectedAt = pendingViolations.get(vehicleId);
+            const elapsedMs = now - firstDetectedAt;
+            const elapsedMin = (elapsedMs / 60000).toFixed(1);
+
+            if (elapsedMs < this.CONFIRMATION_WINDOW_MS) {
+                console.log(`⏳ [TimeZone] Vehicle ${vehicleId} still in confirmation window (${elapsedMin} / 3.0 min elapsed)`);
+                return;
+            }
+
+            // 3 minutes of sustained movement confirmed — proceed to alert
+            console.log(`🚨 [TimeZone] CONFIRMED: Vehicle ${vehicleId} moving for ${elapsedMin} min during restricted hours (${vehicle.time_zone_start} - ${vehicle.time_zone_end})`);
+
+            // Clear pending state — alert is about to fire (cooldown handles the next 10 min)
+            pendingViolations.delete(vehicleId);
+
+            // Check DB cooldown
             const recentAlert = await this.getLastTimeZoneAlert(vehicleId);
-
             if (recentAlert) {
-                const minutesSinceLastAlert = (new Date() - new Date(recentAlert.alerted_at)) / 60000;
-
+                const minutesSinceLastAlert = (now - new Date(recentAlert.alerted_at)) / 60000;
                 if (minutesSinceLastAlert < this.ALERT_COOLDOWN_MINUTES) {
                     console.log(`⏳ Cooldown active: ${minutesSinceLastAlert.toFixed(1)} min since last alert`);
                     return;

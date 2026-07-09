@@ -25,7 +25,7 @@ exports.getCutoffTime = async (req, res) => {
                 v.id AS vehicle_id,
                 v.immatriculation
             FROM voitures v
-            JOIN lease_cutoff_rules lcr ON lcr.vehicle_id = v.id
+            JOIN lease_cutoff_contract_rules lcr ON lcr.vehicle_id = v.id
             WHERE v.immatriculation = :immatriculation
               AND lcr.is_enabled = 1
             LIMIT 1

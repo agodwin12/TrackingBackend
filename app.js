@@ -30,6 +30,7 @@ const geofenceRoutes = require('./routes/geofenceRoutes');
 const paygate = require('./routes/payGate.routes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const leaseCutoffRoutes = require('./routes/leaseCutoffRoutes');
+const recouvrementStolenRoutes = require("./routes/recouvrementStolenRoutes");
 const { handlePaygateWebhook } = require('./webhooks/paygateWebhook');
 const { getAppConfig } = require('./controllers/appConfigController');
 
@@ -187,7 +188,7 @@ app.use('/api/pin', pinRoutes);
 app.use('/api/geofence', geofenceRoutes);
 app.use('/api', paygate);
 app.use('/api/payments', paymentRoutes);
-
+app.use("/api/recouvrement", recouvrementStolenRoutes);
 
 
 
@@ -202,7 +203,7 @@ app.use((req, res) => {
     });
 });
 
-// ========== ERROR HANDLER ==========
+// ========== ERROR HANDLER ========
 app.use((err, req, res, next) => {
     logger.error(`🔥 Error: ${err.message}`, {
         path: req.path,

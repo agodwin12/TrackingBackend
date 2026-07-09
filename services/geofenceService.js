@@ -3,7 +3,6 @@
 const turf = require("@turf/turf");
 const logger = require("../utils/logger");
 
-// ==================== CAMEROON COORDINATE BOUNDS ====================
 const CAMEROON_BOUNDS = {
     LAT_MIN: 1.5,   // Southern boundary (slightly extended)
     LAT_MAX: 13.5,  // Northern boundary (slightly extended)
@@ -430,3 +429,4 @@ module.exports = {
     closePolygon,
     CAMEROON_BOUNDS
 };
+

@@ -3,7 +3,8 @@ const router = express.Router();
 
 const {
     toggleVehicleSecurity,
-    getSecurityStatus
+    getSecurityStatus,
+    geofenceUnlock
 } = require('../controllers/vehicleSecurityController');
 const authMiddleware = require('../middleware/authMiddleware');
 const { requireFeature, FEATURES } = require('../middleware/subscriptionMiddleware');
@@ -28,5 +29,8 @@ router.get('/vehicle/:voitureId/security/status',
         getSecurityStatus(req, res, next);
     }
 );
+
+
+router.post('/vehicles/:voitureId/geofence-unlock', authMiddleware, geofenceUnlock);
 
 module.exports = router;
