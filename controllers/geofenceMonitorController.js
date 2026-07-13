@@ -8,6 +8,7 @@ const socketService   = require('../services/socketService');
 const axios            = require('axios');
 const logger            = require('../utils/logger');
 const redisClient       = require('../config/redis');
+const engineCutService  = require('../services/geofenceEngineCutService');
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
@@ -17,6 +18,29 @@ const OUTSIDE_CONFIRM_THRESHOLD  = 3;
 const INSIDE_CONFIRM_THRESHOLD   = 3;   // symmetric with OUTSIDE_CONFIRM_THRESHOLD
 const ALERT_COOLDOWN_MS          = 2 * 60 * 1000; // 2 minutes — suppresses repeat alerts of the same type/vehicle
 const POSITION_CACHE_TTL_SECONDS = 3600;
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── ephemeral (in-memory, per-process) geofence debounce/cooldown state ──────
+// vehicle_security only has durable columns for last_geofence_state,
+// last_state_change_at, consecutive_outside_count and last_outside_at.
+// The symmetric "returning inside" debounce counter and the two alert-cooldown
+// timestamps have no backing column (and none is being added — no DB schema
+// changes for this feature), so they live here instead. Resetting on process
+// restart is acceptable: worst case is one extra confirmation cycle or one
+// extra alert right after a restart, not a correctness issue.
+const ephemeralGeofenceState = new Map(); // vehicleId -> { consecutiveInsideCount, lastInsideAt, lastLeftZoneAlertAt, lastReturnedAlertAt }
+
+const getEphemeralState = (vehicleId) => {
+    if (!ephemeralGeofenceState.has(vehicleId)) {
+        ephemeralGeofenceState.set(vehicleId, {
+            consecutiveInsideCount: 0,
+            lastInsideAt: null,
+            lastLeftZoneAlertAt: null,
+            lastReturnedAlertAt: null,
+        });
+    }
+    return ephemeralGeofenceState.get(vehicleId);
+};
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── haversine distance (km) ───────────────────────────────────────────────────
@@ -171,12 +195,11 @@ const reverseGeocode = async (latitude, longitude) => {
 
 // ── geofence state helpers ────────────────────────────────────────────────────
 const getCurrentGeofenceState = async (vehicleId) => {
+    const ephemeral = getEphemeralState(vehicleId);
     try {
         const [row] = await sequelize.query(
             `SELECT last_geofence_state, last_state_change_at,
-                    consecutive_outside_count, last_outside_at,
-                    consecutive_inside_count, last_inside_at,
-                    last_left_zone_alert_at, last_returned_alert_at
+                    consecutive_outside_count, last_outside_at
              FROM vehicle_security WHERE voiture_id = ? LIMIT 1`,
             { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
         );
@@ -186,26 +209,26 @@ const getCurrentGeofenceState = async (vehicleId) => {
                 lastStateChangeAt:       row.last_state_change_at ? new Date(row.last_state_change_at) : null,
                 consecutiveOutsideCount: parseInt(row.consecutive_outside_count) || 0,
                 lastOutsideAt:           row.last_outside_at ? new Date(row.last_outside_at) : null,
-                consecutiveInsideCount:  parseInt(row.consecutive_inside_count) || 0,
-                lastInsideAt:            row.last_inside_at ? new Date(row.last_inside_at) : null,
-                lastLeftZoneAlertAt:     row.last_left_zone_alert_at ? new Date(row.last_left_zone_alert_at) : null,
-                lastReturnedAlertAt:     row.last_returned_alert_at ? new Date(row.last_returned_alert_at) : null,
+                consecutiveInsideCount:  ephemeral.consecutiveInsideCount,
+                lastInsideAt:            ephemeral.lastInsideAt,
+                lastLeftZoneAlertAt:     ephemeral.lastLeftZoneAlertAt,
+                lastReturnedAlertAt:     ephemeral.lastReturnedAlertAt,
             };
         }
         // No vehicle_security row — treat as fresh/inside state
         return {
             currentState: 'inside', lastStateChangeAt: null,
             consecutiveOutsideCount: 0, lastOutsideAt: null,
-            consecutiveInsideCount: 0, lastInsideAt: null,
-            lastLeftZoneAlertAt: null, lastReturnedAlertAt: null,
+            consecutiveInsideCount: ephemeral.consecutiveInsideCount, lastInsideAt: ephemeral.lastInsideAt,
+            lastLeftZoneAlertAt: ephemeral.lastLeftZoneAlertAt, lastReturnedAlertAt: ephemeral.lastReturnedAlertAt,
         };
     } catch (err) {
         logger.error(`❌ getCurrentGeofenceState: ${err.message}`);
         return {
             currentState: 'inside', lastStateChangeAt: null,
             consecutiveOutsideCount: 0, lastOutsideAt: null,
-            consecutiveInsideCount: 0, lastInsideAt: null,
-            lastLeftZoneAlertAt: null, lastReturnedAlertAt: null,
+            consecutiveInsideCount: ephemeral.consecutiveInsideCount, lastInsideAt: ephemeral.lastInsideAt,
+            lastLeftZoneAlertAt: ephemeral.lastLeftZoneAlertAt, lastReturnedAlertAt: ephemeral.lastReturnedAlertAt,
         };
     }
 };
@@ -229,14 +252,15 @@ const updateGeofenceState = async (vehicleId, newState, crossingTime) => {
 };
 
 const incrementOutsideCounter = async (vehicleId) => {
+    // Trending outside — the symmetric inside counter resets (ephemeral, no DB column for it).
+    getEphemeralState(vehicleId).consecutiveInsideCount = 0;
     try {
         await sequelize.query(
-            `INSERT INTO vehicle_security (voiture_id, consecutive_outside_count, last_outside_at, consecutive_inside_count, createdAt, updatedAt)
-             VALUES (?, 1, NOW(), 0, NOW(), NOW())
+            `INSERT INTO vehicle_security (voiture_id, consecutive_outside_count, last_outside_at, createdAt, updatedAt)
+             VALUES (?, 1, NOW(), NOW(), NOW())
              ON DUPLICATE KEY UPDATE
                consecutive_outside_count = consecutive_outside_count + 1,
                last_outside_at           = NOW(),
-               consecutive_inside_count  = 0,
                updatedAt                = NOW()`,
             { replacements: [vehicleId], type: sequelize.QueryTypes.INSERT }
         );
@@ -253,39 +277,38 @@ const incrementOutsideCounter = async (vehicleId) => {
 
 // ── NEW: symmetric counterpart to incrementOutsideCounter ─────────────────────
 const incrementInsideCounter = async (vehicleId) => {
+    const ephemeral = getEphemeralState(vehicleId);
+    ephemeral.consecutiveInsideCount += 1;
+    ephemeral.lastInsideAt = new Date();
+
     try {
         await sequelize.query(
-            `INSERT INTO vehicle_security (voiture_id, consecutive_inside_count, last_inside_at, consecutive_outside_count, createdAt, updatedAt)
-             VALUES (?, 1, NOW(), 0, NOW(), NOW())
+            `INSERT INTO vehicle_security (voiture_id, consecutive_outside_count, createdAt, updatedAt)
+             VALUES (?, 0, NOW(), NOW())
              ON DUPLICATE KEY UPDATE
-               consecutive_inside_count  = consecutive_inside_count + 1,
-               last_inside_at            = NOW(),
                consecutive_outside_count = 0,
                updatedAt                = NOW()`,
             { replacements: [vehicleId], type: sequelize.QueryTypes.INSERT }
         );
-        const [row] = await sequelize.query(
-            'SELECT consecutive_inside_count FROM vehicle_security WHERE voiture_id = ? LIMIT 1',
-            { replacements: [vehicleId], type: sequelize.QueryTypes.SELECT }
-        );
-        return parseInt(row?.consecutive_inside_count) || 1;
     } catch (err) {
         logger.error(`❌ incrementInsideCounter: ${err.message}`);
-        return 1;
     }
+    return ephemeral.consecutiveInsideCount;
 };
 
 // ── NEW: zero both crossing counters at once (used right after a confirmed crossing) ──
 const resetCrossingCounters = async (vehicleId) => {
+    const ephemeral = getEphemeralState(vehicleId);
+    ephemeral.consecutiveInsideCount = 0;
+    ephemeral.lastInsideAt = null;
+
     try {
         await sequelize.query(
-            `INSERT INTO vehicle_security (voiture_id, consecutive_outside_count, last_outside_at, consecutive_inside_count, last_inside_at, createdAt, updatedAt)
-             VALUES (?, 0, NULL, 0, NULL, NOW(), NOW())
+            `INSERT INTO vehicle_security (voiture_id, consecutive_outside_count, last_outside_at, createdAt, updatedAt)
+             VALUES (?, 0, NULL, NOW(), NOW())
              ON DUPLICATE KEY UPDATE
                consecutive_outside_count = 0,
                last_outside_at           = NULL,
-               consecutive_inside_count  = 0,
-               last_inside_at            = NULL,
                updatedAt                = NOW()`,
             { replacements: [vehicleId], type: sequelize.QueryTypes.INSERT }
         );
@@ -294,27 +317,20 @@ const resetCrossingCounters = async (vehicleId) => {
     }
 };
 
-// ── NEW: alert cooldown helpers ────────────────────────────────────────────────
-const ALERT_TIMESTAMP_COLUMNS = new Set(['last_left_zone_alert_at', 'last_returned_alert_at']);
+// ── NEW: alert cooldown helpers (ephemeral — see ephemeralGeofenceState above) ──
+const ALERT_TIMESTAMP_FIELDS = new Set(['lastLeftZoneAlertAt', 'lastReturnedAlertAt']);
 
 const isAlertOnCooldown = (lastAlertAt) => {
     if (!lastAlertAt) return false; // first alert of its kind always fires
     return (Date.now() - lastAlertAt.getTime()) < ALERT_COOLDOWN_MS;
 };
 
-const recordAlertTimestamp = async (vehicleId, column) => {
-    if (!ALERT_TIMESTAMP_COLUMNS.has(column)) {
-        logger.error(`❌ recordAlertTimestamp: rejected unknown column "${column}"`);
+const recordAlertTimestamp = (vehicleId, field) => {
+    if (!ALERT_TIMESTAMP_FIELDS.has(field)) {
+        logger.error(`❌ recordAlertTimestamp: rejected unknown field "${field}"`);
         return;
     }
-    try {
-        await sequelize.query(
-            `UPDATE vehicle_security SET ${column} = NOW(), updatedAt = NOW() WHERE voiture_id = ?`,
-            { replacements: [vehicleId], type: sequelize.QueryTypes.UPDATE }
-        );
-    } catch (err) {
-        logger.error(`❌ recordAlertTimestamp(${column}): ${err.message}`);
-    }
+    getEphemeralState(vehicleId)[field] = new Date();
 };
 
 const getActiveGeofenceAlert = async (vehicleId) => {
@@ -379,25 +395,24 @@ const initializeGeofenceState = async (vehicleId) => {
         const initialState = isInside ? 'inside' : 'outside';
 
         // Upsert — works with or without an existing vehicle_security row.
-        // Alert cooldown columns are intentionally left untouched here: a
+        // Alert cooldown state is intentionally left untouched here: a
         // (re)initialization is a state-tracking reset, not an alert-history reset.
         await sequelize.query(
             `INSERT INTO vehicle_security
                (voiture_id, last_geofence_state, last_state_change_at,
                 consecutive_outside_count, last_outside_at,
-                consecutive_inside_count, last_inside_at,
                 createdAt, updatedAt)
-             VALUES (?, ?, NOW(), 0, NULL, 0, NULL, NOW(), NOW())
+             VALUES (?, ?, NOW(), 0, NULL, NOW(), NOW())
              ON DUPLICATE KEY UPDATE
                last_geofence_state       = VALUES(last_geofence_state),
                last_state_change_at      = NOW(),
                consecutive_outside_count = 0,
                last_outside_at           = NULL,
-               consecutive_inside_count  = 0,
-               last_inside_at            = NULL,
                updatedAt                = NOW()`,
             { replacements: [vehicleId, initialState], type: sequelize.QueryTypes.INSERT }
         );
+        getEphemeralState(vehicleId).consecutiveInsideCount = 0;
+        getEphemeralState(vehicleId).lastInsideAt = null;
 
         logger.info(`✅ Geofence state initialized vehicleId=${vehicleId} state=${initialState}`);
         return { success: true, vehicleId, initialState, isInside, latitude: location.latitude, longitude: location.longitude };
@@ -502,6 +517,23 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
                 await updateGeofenceState(vehicleId, 'outside', crossingTime);
                 await resetCrossingCounters(vehicleId);
 
+                // ── Lease-partner engine cutoff — runs on every confirmed exit, ──
+                // independent of the alert cooldown below (that cooldown is only
+                // about not spamming notifications, not about skipping the cutoff).
+                try {
+                    const leaseInfo = await engineCutService.isLeasePartnerVehicle(vehicleId);
+                    if (leaseInfo.isLease) {
+                        const vehicleName  = voiture.nickname || `${voiture.marque} ${voiture.model}`;
+                        const locationInfo = await reverseGeocode(latitude, longitude);
+                        const locationName = formatLocationName(locationInfo);
+                        logger.warn(`🔴 [Geofence] vehicleId=${vehicleId} belongs to LEASE_PARTNER "${leaseInfo.partnerName}" — starting engine cutoff`);
+                        await engineCutService.sendGeofenceWarningNotifications(vehicleId, vehicleName, locationName, leaseInfo.partnerId);
+                        await engineCutService.startSpeedWatcher(vehicleId, vehicleName, leaseInfo.partnerId);
+                    }
+                } catch (cutErr) {
+                    logger.error(`❌ [Geofence] lease cutoff check failed for vehicle ${vehicleId}: ${cutErr.message}`);
+                }
+
                 const onCooldown = isAlertOnCooldown(stateInfo.lastLeftZoneAlertAt);
                 let alertCreated = false;
                 if (onCooldown) {
@@ -510,7 +542,7 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
                     const existingAlert = await getActiveGeofenceAlert(vehicleId);
                     if (!existingAlert) {
                         await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime);
-                        await recordAlertTimestamp(vehicleId, 'last_left_zone_alert_at');
+                        recordAlertTimestamp(vehicleId, 'lastLeftZoneAlertAt');
                         alertCreated = true;
                     }
                 }
@@ -557,6 +589,10 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
             await updateGeofenceState(vehicleId, 'inside', crossingTime);
             await resetCrossingCounters(vehicleId);
 
+            // Vehicle is back inside — abort any pending engine cutoff for it.
+            // No-op if this vehicle isn't a lease-partner vehicle or has no active watcher.
+            engineCutService.cancelSpeedWatcher(vehicleId);
+
             const activeAlert = await getActiveGeofenceAlert(vehicleId);
             if (activeAlert) await resolveAlert(activeAlert.id);
 
@@ -566,7 +602,7 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
                 logger.info(`🧊 [Geofence] vehicleId=${vehicleId} RETURNED_ZONE alert suppressed — cooldown active (last at ${stateInfo.lastReturnedAlertAt.toISOString()})`);
             } else {
                 await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'RETURNED_ZONE', crossingTime);
-                await recordAlertTimestamp(vehicleId, 'last_returned_alert_at');
+                recordAlertTimestamp(vehicleId, 'lastReturnedAlertAt');
                 alertCreated = true;
             }
 

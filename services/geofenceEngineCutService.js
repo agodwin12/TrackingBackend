@@ -9,6 +9,12 @@ const SPEED_CUT_THRESHOLD_KMH = 15;   // cut engine when speed drops below this
 const POLL_INTERVAL_MS        = 8000; // check speed every 8 seconds
 const MAX_WATCH_MINUTES       = 10;   // give up after 10 minutes
 const MAX_WATCH_MS            = MAX_WATCH_MINUTES * 60 * 1000;
+
+// Real CLOSERELAY commands are dangerous (cuts a vehicle's engine remotely,
+// irreversible from here once sent) and this codebase has no other simulation
+// gate anywhere. Default OFF — logs what it would have sent instead of sending
+// it — until this has been verified end-to-end and explicitly turned on.
+const CUTOFF_EXECUTION_ENABLED = String(process.env.GEOFENCE_CUTOFF_EXECUTION_ENABLED || 'false').toLowerCase() === 'true';
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -279,16 +285,34 @@ const startSpeedWatcher = async (vehicleId, vehicleName, partnerId) => {
             }
 
             // ── Speed is below threshold — send CLOSERELAY ────────────────────
-            logger.warn(`🔴 [EngineCut] speed=${speed} < ${SPEED_CUT_THRESHOLD_KMH} — sending CLOSERELAY to vehicle ${vehicleId}`);
+            logger.warn(
+                `🔴 [EngineCut] speed=${speed} < ${SPEED_CUT_THRESHOLD_KMH} — ` +
+                `${CUTOFF_EXECUTION_ENABLED ? 'sending' : 'SIMULATING (GEOFENCE_CUTOFF_EXECUTION_ENABLED=false)'} ` +
+                `CLOSERELAY to vehicle ${vehicleId}`
+            );
             stopWatcher(vehicleId); // stop polling immediately before async work
 
-            const cmdResult = await sendGpsCommandWithFallback({
-                accountName: String(account_name).trim().toLowerCase(),
-                macId:       mac_id_gps,
-                command:     'CLOSERELAY',
-            });
+            const cmdResult = CUTOFF_EXECUTION_ENABLED
+                ? await sendGpsCommandWithFallback({
+                    accountName: String(account_name).trim().toLowerCase(),
+                    macId:       mac_id_gps,
+                    command:     'CLOSERELAY',
+                })
+                : {
+                    ok:           true,
+                    message:      'SIMULATED — GEOFENCE_CUTOFF_EXECUTION_ENABLED is not "true"',
+                    providerResp: null,
+                    retried:      false,
+                    simulated:    true,
+                };
 
-            if (cmdResult.ok) {
+            if (cmdResult.ok && cmdResult.simulated) {
+                // Simulation mode: prove the trigger logic works end-to-end without
+                // sending a real command or telling driver/partner the engine is off
+                // when it isn't.
+                logger.info(`🧪 [EngineCut] SIMULATED CLOSERELAY for vehicle ${vehicleId} (speed=${speed}km/h) — no real command sent, no user notified`);
+
+            } else if (cmdResult.ok) {
                 logger.info(`✅ [EngineCut] CLOSERELAY succeeded for vehicle ${vehicleId}`);
 
                 // Mark in DB
