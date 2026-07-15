@@ -3,7 +3,7 @@
 const AssociationChauffeurVoiturePartner = require("../models/associationChauffeurVoiturePartner");
 const Voiture = require("../models/voiture");
 const Command = require("../models/Command");
-const Alert = require("../models/alert");
+const Alert = require("../models/Alert");
 
 const {
     sendGpsCommandWithFallback,
