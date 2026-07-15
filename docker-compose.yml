@@ -15,7 +15,7 @@ services:
 
   backend:
     build: .
-    container_name: proxym_backend
+    container_name: fleetra_prod_backend
     restart: always
     ports:
       - "6005:6000"
