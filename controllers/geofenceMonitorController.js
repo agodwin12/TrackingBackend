@@ -43,6 +43,31 @@ const getEphemeralState = (vehicleId) => {
 };
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── per-vehicle async lock ────────────────────────────────────────────────────
+// checkGeofenceViolation is NOT read-only: it reads state, decides, and writes
+// state + creates alerts. It's invoked from two independent places — the
+// background GPS poller (location.js, on a timer) AND the live per-vehicle
+// HTTP status endpoint (getGeofenceStatus below, hit by the dashboard while a
+// vehicle's detail view is open). Without serialization, two calls for the
+// SAME vehicle arriving close together can both read the pre-crossing state
+// (including the debounce counter and the alert cooldown timestamp) before
+// either writes back the post-crossing state — each independently concludes
+// "this is a confirmed, non-cooldown crossing" and each creates its own alert.
+// That's what produced duplicate RETURNED_ZONE alerts at the same timestamp.
+// This queues calls per vehicleId so only one is ever inside the
+// read-decide-write section at a time; other vehicles are unaffected.
+const vehicleLocks = new Map(); // key: String(vehicleId) -> Promise (tail of the queue)
+
+const withVehicleLock = (vehicleId, fn) => {
+    const key      = String(vehicleId);
+    const previous = vehicleLocks.get(key) || Promise.resolve();
+    const run      = previous.then(fn, fn); // run fn even if the previous call in the queue failed
+    // Keep the chain alive for the next caller, but never let a rejection propagate into it.
+    vehicleLocks.set(key, run.catch(() => {}));
+    return run;
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── haversine distance (km) ───────────────────────────────────────────────────
 const haversineKm = (lat1, lng1, lat2, lng2) => {
     const R    = 6371;
@@ -423,9 +448,15 @@ const initializeGeofenceState = async (vehicleId) => {
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// MAIN CHECK — called from location.js on every GPS update
+// MAIN CHECK — called from location.js on every GPS update, and from the
+// getGeofenceStatus HTTP endpoint below. Wrapped in withVehicleLock so the two
+// call sites (or two overlapping HTTP polls) can never race each other for the
+// same vehicle — see the vehicleLocks comment above.
 // ══════════════════════════════════════════════════════════════════════════════
-const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
+const checkGeofenceViolation = (vehicleId, latitude, longitude) =>
+    withVehicleLock(vehicleId, () => checkGeofenceViolationLocked(vehicleId, latitude, longitude));
+
+const checkGeofenceViolationLocked = async (vehicleId, latitude, longitude) => {
     logger.debug(`\n🚨 [Geofence] check vehicleId=${vehicleId} pos=[${latitude},${longitude}]`);
 
     try {
