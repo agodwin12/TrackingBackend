@@ -18,7 +18,7 @@ services:
     container_name: proxym_backend
     restart: always
     ports:
-      - "5005:5000"
+      - "6005:6000"
     env_file:
       - .env
     environment:
