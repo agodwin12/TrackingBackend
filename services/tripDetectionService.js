@@ -533,6 +533,14 @@ class TripDetectionService {
         let tripStartBuffer         = [];
         let totalDistanceTraveled   = 0;
 
+        // Location IDs we've made a FINAL decision on that will never become part
+        // of a trip (rejected as noise, or a trip-start buffer that fizzled out).
+        // These must be marked processed=true so they stop blocking every future
+        // run — previously they were silently dropped and re-evaluated forever,
+        // permanently stalling any vehicle that accumulated enough of them at the
+        // front of its unprocessed queue.
+        let discardedIds = [];
+
         if (currentTrip) {
             lastMovingTime = new Date(currentTrip.end_time);
             logger.debug(`[TRIP DETECTION] Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
@@ -558,12 +566,14 @@ class TripDetectionService {
             const isValidPoint = this.isValidGPSPoint(loc, lastValidPosition, timeDiff);
 
             if (!isValidPoint) {
+                discardedIds.push(loc.id);
                 rejectedOutliers++;
                 continue;
             }
 
             if (i < locations.length - 1 && lastValidPosition) {
                 if (!this.isConsistentDirection(lastValidPosition, loc, locations[i + 1])) {
+                    discardedIds.push(loc.id);
                     rejectedDirectionErrors++;
                     continue;
                 }
@@ -594,6 +604,9 @@ class TripDetectionService {
                     if (enoughPoints && enoughDistance) {
                         if (this.isCircularMovement(tripStartBuffer)) {
                             logger.warn("[TRIP DETECTION] Circular movement (parking lot drift) — NOT starting trip");
+                            // Final decision made on this buffer: it's parking-lot drift,
+                            // not a trip. Mark it processed so it's not re-evaluated forever.
+                            discardedIds.push(...tripStartBuffer.map(l => l.id));
                             consecutiveMovingPoints = [];
                             tripStartBuffer         = [];
                             totalDistanceTraveled   = 0;
@@ -643,6 +656,11 @@ class TripDetectionService {
                             `(had ${consecutiveMovingPoints.length} points, ${totalDistanceTraveled.toFixed(0)}m)`
                         );
                     }
+                    // Final decision made: this stationary point, plus whatever moving
+                    // buffer preceded it, did not become a trip. Mark all of it
+                    // processed instead of leaving it to be silently re-evaluated
+                    // (and re-discarded) on every future run forever.
+                    discardedIds.push(loc.id, ...tripStartBuffer.map(l => l.id));
                     consecutiveMovingPoints = [];
                     tripStartBuffer         = [];
                     totalDistanceTraveled   = 0;
@@ -717,6 +735,19 @@ class TripDetectionService {
                 `${rejectedOutliers} outlier(s) rejected, ` +
                 `${rejectedDirectionErrors} direction error(s) rejected`
             );
+        }
+
+        // Persist the final decisions made above (rejected noise, abandoned
+        // trip-start buffers) so this data stops being re-evaluated on every
+        // future run. This is what prevents a vehicle from getting permanently
+        // stuck once enough non-trip points accumulate at the front of its
+        // unprocessed queue.
+        if (discardedIds.length > 0) {
+            await Location.update(
+                { processed: true },
+                { where: { id: discardedIds } }
+            );
+            logger.info(`[TRIP DETECTION] Marked ${discardedIds.length} non-trip location(s) as processed`);
         }
 
         return { tripsCreated, tripsMerged };
