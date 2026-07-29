@@ -550,6 +550,22 @@ const checkGeofenceViolationLocked = async (vehicleId, latitude, longitude) => {
 
                 const onCooldown = isAlertOnCooldown(stateInfo.lastLeftZoneAlertAt);
 
+                // ── LEFT_ZONE alert — resolved before the cutoff block below so the
+                // resulting command's audit row (commands.trigger_alert_id) can point
+                // at the exact alert that triggered it.
+                let alertCreated  = false;
+                let existingAlert = await getActiveGeofenceAlert(vehicleId);
+                let leftZoneAlertId = existingAlert?.id || null;
+
+                if (onCooldown) {
+                    logger.info(`🧊 [Geofence] vehicleId=${vehicleId} LEFT_ZONE alert suppressed — cooldown active (last at ${stateInfo.lastLeftZoneAlertAt.toISOString()})`);
+                } else if (!existingAlert) {
+                    const newAlert = await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime);
+                    recordAlertTimestamp(vehicleId, 'lastLeftZoneAlertAt');
+                    alertCreated    = true;
+                    leftZoneAlertId = newAlert?.id || null;
+                }
+
                 // ── Lease-partner engine cutoff — the cutoff itself (startSpeedWatcher)
                 // runs on every confirmed exit regardless of cooldown, since actually
                 // cutting the engine is safety-critical and must not be skipped just
@@ -569,22 +585,10 @@ const checkGeofenceViolationLocked = async (vehicleId, latitude, longitude) => {
                             const locationName = formatLocationName(locationInfo);
                             await engineCutService.sendGeofenceWarningNotifications(vehicleId, vehicleName, locationName, leaseInfo.partnerId);
                         }
-                        await engineCutService.startSpeedWatcher(vehicleId, vehicleName, leaseInfo.partnerId);
+                        await engineCutService.startSpeedWatcher(vehicleId, vehicleName, leaseInfo.partnerId, leftZoneAlertId);
                     }
                 } catch (cutErr) {
                     logger.error(`❌ [Geofence] lease cutoff check failed for vehicle ${vehicleId}: ${cutErr.message}`);
-                }
-
-                let alertCreated = false;
-                if (onCooldown) {
-                    logger.info(`🧊 [Geofence] vehicleId=${vehicleId} LEFT_ZONE alert suppressed — cooldown active (last at ${stateInfo.lastLeftZoneAlertAt.toISOString()})`);
-                } else {
-                    const existingAlert = await getActiveGeofenceAlert(vehicleId);
-                    if (!existingAlert) {
-                        await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime);
-                        recordAlertTimestamp(vehicleId, 'lastLeftZoneAlertAt');
-                        alertCreated = true;
-                    }
                 }
 
                 return {
