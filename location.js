@@ -23,6 +23,51 @@ require('dotenv').config();
 // Persists across fetch cycles. Keyed by mac_id_gps.
 const lastKnownPositions = new Map();
 
+// ========== MAC ID FORMAT VALIDATION ==========
+// Real GPS device IDs from our provider are numeric strings of at least 15
+// digits (e.g. "863957076523494"). A handful of vehicles carry old/placeholder
+// 4-digit mac_id_gps values instead of a real device ID -- reject their
+// records here so nothing ever lands in `locations` for them, and nothing
+// downstream (including the app) can ever fetch location data for a vehicle
+// that was never validly identified in the first place.
+const MIN_MAC_ID_DIGITS = 15;
+
+function isValidMacIdFormat(macIdGps) {
+    const str = String(macIdGps);
+    return /^\d+$/.test(str) && str.length >= MIN_MAC_ID_DIGITS;
+}
+
+// ========== VEHICLE INFO CACHE ==========
+// Persists across fetch cycles, like lastKnownPositions. Avoids re-querying
+// voitures (id, model, nickname) for every vehicle on every 10s cycle --
+// this data essentially never changes at runtime. A short TTL still lets an
+// admin reassigning a mac_id_gps to a different vehicle take effect within
+// a few minutes instead of requiring a server restart.
+const vehicleInfoCache = new Map();
+const VEHICLE_INFO_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+async function getVehicleInfo(connection, macIdGps) {
+    const cached = vehicleInfoCache.get(macIdGps);
+    if (cached && (Date.now() - cached.cachedAt) < VEHICLE_INFO_CACHE_TTL_MS) {
+        return cached;
+    }
+
+    try {
+        const [rows] = await connection.execute(
+            'SELECT id, model, nickname FROM voitures WHERE mac_id_gps = ? LIMIT 1',
+            [macIdGps]
+        );
+        const info = rows.length > 0
+            ? { id: rows[0].id, model: rows[0].model, nickname: rows[0].nickname, cachedAt: Date.now() }
+            : { id: null, model: null, nickname: null, cachedAt: Date.now() };
+        vehicleInfoCache.set(macIdGps, info);
+        return info;
+    } catch (e) {
+        logger.error(`❌ Failed to resolve vehicle info for MAC ${macIdGps}:`, e.message);
+        return cached || { id: null, model: null, nickname: null, cachedAt: 0 };
+    }
+}
+
 // ========== CONCURRENT FETCH GUARD ==========
 // Prevents cycles from stacking if one takes longer than the interval.
 let isFetchingGPS = false;
@@ -405,7 +450,12 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
     const invalidatedVehicles = new Set();
     const gpsUpdates          = new Map();
-    const macToVoitureId      = new Map();
+    // Accepted-but-not-yet-persisted records for this cycle. Collected here
+    // and written in one batched INSERT after the loop, instead of one
+    // sequential INSERT per record -- with up to ~250 vehicles reporting
+    // every 10s on a single borrowed pool connection, one-row-at-a-time
+    // writes were the single biggest source of per-cycle DB round trips.
+    const pendingInserts = [];
 
     if (locations.success === 'true' && locations.data) {
         let acceptedRecords      = 0;
@@ -430,9 +480,9 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                 const hdop               = extractHdop(record);
                 const recordTimestampMs  = getRecordTimestampMs(record[0], formattedSysTime);
 
-                if (!macIdGps) {
+                if (!macIdGps || !isValidMacIdFormat(macIdGps)) {
                     rejectedRecords++;
-                    logger.warn(`🚫 [${accountName}] Rejected: missing MAC ID`);
+                    logger.warn(`🚫 [${accountName}] Rejected: invalid MAC ID format (need >= ${MIN_MAC_ID_DIGITS} digits): "${macIdGps}"`);
                     continue;
                 }
 
@@ -447,22 +497,8 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                 // record[2]=lng. ⛔ Do NOT re-add a GCJ-02/BD-09 conversion here.
                 const corrected = { lat: rawLat, lng: rawLng };
 
-                // Resolve voiture_id — one DB lookup per unique MAC per cycle
-                let voitureId = null;
-                if (macToVoitureId.has(macIdGps)) {
-                    voitureId = macToVoitureId.get(macIdGps);
-                } else {
-                    try {
-                        const [rows] = await connection.execute(
-                            'SELECT id FROM voitures WHERE mac_id_gps = ? LIMIT 1',
-                            [macIdGps]
-                        );
-                        voitureId = rows.length > 0 ? rows[0].id : null;
-                    } catch (e) {
-                        logger.error(`❌ [${accountName}] Failed to resolve voiture_id for MAC ${macIdGps}:`, e.message);
-                    }
-                    macToVoitureId.set(macIdGps, voitureId);
-                }
+                // Resolve voiture_id via the persistent, cross-cycle vehicle cache
+                const voitureId = (await getVehicleInfo(connection, macIdGps)).id;
 
                 // GPS quality filter
                 const lastKnown  = await getLastKnownPosition(connection, macIdGps);
@@ -486,56 +522,73 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
                     logger.warn(`⚠️ [${accountName}] Low-confidence GPS accepted without alert: MAC=${macIdGps}, HDOP=${hdop ?? 'N/A'}`);
                 }
 
-                try {
-                    await connection.execute(
-                        `INSERT INTO locations
-                         (sys_time, user_name, longitude, latitude, datetime, heart_time, speed, status, direction, mac_id_gps, voiture_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [
-                            formattedSysTime,
-                            record[1],
-                            corrected.lng,
-                            corrected.lat,
-                            formattedDatetime,
-                            formattedHeartTime,
-                            reportedSpeedKmh,
-                            record[9],
-                            record[10],
-                            macIdGps,
-                            voitureId
-                        ]
-                    );
+                // Update the noise-filter cache immediately (not deferred to
+                // after the batch insert) so a second record for the same
+                // device later in this same poll cycle still validates
+                // against the freshest position, exactly as before.
+                lastKnownPositions.set(macIdGps, {
+                    lat:       corrected.lat,
+                    lng:       corrected.lng,
+                    timestamp: recordTimestampMs
+                });
 
+                // Queue for the single batched INSERT below -- the rest of the
+                // bookkeeping (acceptedRecords, gpsUpdates) happens only after
+                // a row has actually been persisted, so an in-memory failure
+                // never drifts ahead of the real DB state.
+                pendingInserts.push({
+                    formattedSysTime, formattedDatetime, formattedHeartTime,
+                    userName: record[1], lng: corrected.lng, lat: corrected.lat,
+                    reportedSpeedKmh, status: record[9], direction: record[10],
+                    macIdGps, voitureId, statenumber, recordTimestampMs, gpsQuality, hdop
+                });
+            }
+        }
+
+        // ===== BATCHED INSERT =====
+        // One multi-row INSERT per chunk instead of one row-at-a-time INSERT
+        // per record -- collapses what could be ~250 sequential round trips
+        // on a single borrowed pool connection down to a handful.
+        const INSERT_CHUNK_SIZE = 500;
+        for (let i = 0; i < pendingInserts.length; i += INSERT_CHUNK_SIZE) {
+            const batch = pendingInserts.slice(i, i + INSERT_CHUNK_SIZE);
+            const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+            const values = batch.flatMap(r => [
+                r.formattedSysTime, r.userName, r.lng, r.lat,
+                r.formattedDatetime, r.formattedHeartTime, r.reportedSpeedKmh,
+                r.status, r.direction, r.macIdGps, r.voitureId
+            ]);
+
+            try {
+                await connection.query(
+                    `INSERT INTO locations
+                     (sys_time, user_name, longitude, latitude, datetime, heart_time, speed, status, direction, mac_id_gps, voiture_id)
+                     VALUES ${placeholders}`,
+                    values
+                );
+
+                for (const r of batch) {
                     acceptedRecords++;
-                    invalidatedVehicles.add(macIdGps);
+                    invalidatedVehicles.add(r.macIdGps);
 
-                    // Update in-memory last known position
-                    lastKnownPositions.set(macIdGps, {
-                        lat:       corrected.lat,
-                        lng:       corrected.lng,
-                        timestamp: recordTimestampMs
+                    gpsUpdates.set(r.macIdGps, {
+                        latitude:       r.lat,
+                        longitude:      r.lng,
+                        speed:          r.reportedSpeedKmh,
+                        status:         r.status,
+                        direction:      r.direction,
+                        statenumber:    r.statenumber,
+                        timestamp:      r.formattedDatetime || new Date().toISOString(),
+                        quality:        r.gpsQuality.quality,
+                        alertSafe:      r.gpsQuality.alertSafe,
+                        qualityReasons: r.gpsQuality.reasons,
+                        hdop:           r.hdop
                     });
-
-                    gpsUpdates.set(macIdGps, {
-                        latitude:       corrected.lat,
-                        longitude:      corrected.lng,
-                        speed:          reportedSpeedKmh,
-                        status:         record[9],
-                        direction:      record[10],
-                        statenumber:    statenumber,
-                        timestamp:      formattedDatetime || new Date().toISOString(),
-                        quality:        gpsQuality.quality,
-                        alertSafe:      gpsQuality.alertSafe,
-                        qualityReasons: gpsQuality.reasons,
-                        hdop:           hdop
-                    });
-
-                    logger.debug(
-                        `💾 [${accountName}] Saved: MAC=${macIdGps}, VoitureID=${voitureId}, Lat=${corrected.lat}, Lng=${corrected.lng}, Speed=${reportedSpeedKmh} km/h, Quality=${gpsQuality.quality}`
-                    );
-                } catch (error) {
-                    logger.error(`❌ [${accountName}] Error saving location:`, error.message);
                 }
+
+                logger.debug(`💾 [${accountName}] Batch-saved ${batch.length} location(s)`);
+            } catch (error) {
+                logger.error(`❌ [${accountName}] Batch insert error (${batch.length} rows):`, error.message);
             }
         }
 
@@ -545,15 +598,12 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
         if (invalidatedVehicles.size > 0) {
             for (const macId of invalidatedVehicles) {
                 try {
-                    const [vehicles] = await connection.execute(
-                        'SELECT id, model, nickname FROM voitures WHERE mac_id_gps = ?',
-                        [macId]
-                    );
+                    const vehicleInfo = await getVehicleInfo(connection, macId);
 
-                    if (vehicles.length === 0) continue;
+                    if (!vehicleInfo.id) continue;
 
-                    const vehicleId = vehicles[0].id;
-                    const carModel  = vehicles[0].model;
+                    const vehicleId = vehicleInfo.id;
+                    const carModel  = vehicleInfo.model;
                     const gpsData   = gpsUpdates.get(macId);
 
                     if (!gpsData) {
