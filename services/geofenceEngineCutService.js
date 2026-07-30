@@ -300,6 +300,7 @@ const startSpeedWatcher = async (vehicleId, vehicleName, partnerId, alertId = nu
                 status:            'failed',
                 type_commande:     'COUPURE',
                 trigger_source:    'geofence_auto',
+                description:       'Geofence violation - recorded by System Admin',
                 trigger_alert_id:  alertId,
                 provider_response: { error: 'gps_info_not_found' },
                 verification_result: 'skipped_not_ok'
@@ -328,6 +329,7 @@ const startSpeedWatcher = async (vehicleId, vehicleName, partnerId, alertId = nu
             status:           'pending',
             type_commande:    'COUPURE',
             trigger_source:   'geofence_auto',
+            description:      'Geofence violation - recorded by System Admin',
             trigger_alert_id: alertId
         });
     } catch (dbErr) {

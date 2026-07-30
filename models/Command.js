@@ -45,6 +45,10 @@ const Command = sequelize.define('Command', {
         type: DataTypes.STRING(30),
         allowNull: true
     },
+    description: {
+        type: DataTypes.STRING(255),
+        allowNull: true
+    },
     trigger_alert_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true
