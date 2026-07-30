@@ -694,9 +694,14 @@ const createGeofenceAlert = async (vehicleId, voiture, latitude, longitude, aler
         const minutesSince = Math.round((Date.now() - new Date(crossingTime).getTime()) / 60_000);
         const timeText     = formatTimeAgo(minutesSince);
 
+        // Always include the raw coordinates alongside the reverse-geocoded name
+        // so the alert is still actionable when geocoding fails/returns
+        // "Unknown Location" (no silent loss of the one thing we always have).
+        const coordsText = `${Number(latitude).toFixed(6)}, ${Number(longitude).toFixed(6)}`;
+
         const alertMessage      = alertSubtype === 'LEFT_ZONE'
-            ? `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName}`
-            : `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName}`;
+            ? `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName} (${coordsText})`
+            : `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName} (${coordsText})`;
         const notificationTitle = alertSubtype === 'LEFT_ZONE' ? '⚠️ Geofence Alert' : '✅ Vehicle Returned';
 
         const newAlert = await Alert.create({
