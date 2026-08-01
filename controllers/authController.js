@@ -66,6 +66,25 @@ async function fetchChauffeurVehicles(chauffeurId) {
     return rows.map(r => r.voiture).filter(Boolean);
 }
 
+// Partner staff (role_id 6, "Administrateur partenaire") aren't chauffeurs
+// themselves — they have no row of their own in
+// association_chauffeur_voiture_partner. What they see instead is every
+// vehicle assigned to ANY chauffeur under the same partner (their super
+// admin's whole fleet). No Sequelize association exists from that table to
+// User for the chauffeur side, so this joins directly.
+async function fetchPartnerFleetVehicles(partnerId) {
+    const attrs = VOITURE_ATTRIBUTES.map(a => `v.${a}`).join(', ');
+    const rows = await Voiture.sequelize.query(
+        `SELECT DISTINCT ${attrs}
+         FROM association_chauffeur_voiture_partner acvp
+         JOIN users chauffeur ON chauffeur.id = acvp.chauffeur_id
+         JOIN voitures v ON v.id = acvp.voiture_id
+         WHERE chauffeur.partner_id = :partnerId`,
+        { replacements: { partnerId }, type: Voiture.sequelize.QueryTypes.SELECT }
+    );
+    return rows;
+}
+
 async function fetchVehicleSubscriptionMap(userId, vehicleIds) {
     if (!vehicleIds?.length) return new Map();
 
@@ -73,6 +92,28 @@ async function fetchVehicleSubscriptionMap(userId, vehicleIds) {
     const active = await Subscription.findAll({
         where: {
             user_id: userId,
+            vehicle_id: { [Op.in]: vehicleIds },
+            status: 'ACTIVE',
+            end_date: { [Op.gt]: now },
+        },
+        attributes: ['vehicle_id'],
+    });
+
+    const activeSet = new Set(active.map(s => Number(s.vehicle_id)));
+    const map = new Map();
+    for (const id of vehicleIds) map.set(id, activeSet.has(Number(id)));
+    return map;
+}
+
+// Partner staff aren't the subscriber on any of the fleet's vehicles — each
+// one's subscription belongs to whichever driver/owner it's actually
+// assigned to. So this checks by vehicle_id alone, not by requesting user.
+async function fetchFleetSubscriptionMap(vehicleIds) {
+    if (!vehicleIds?.length) return new Map();
+
+    const now = new Date();
+    const active = await Subscription.findAll({
+        where: {
             vehicle_id: { [Op.in]: vehicleIds },
             status: 'ACTIVE',
             end_date: { [Op.gt]: now },
@@ -132,16 +173,23 @@ exports.login = async (req, res) => {
         // STEP 5: Extract Keycloak roles
         const { clientRoles } = keycloakService.extractRolesFromToken(decodedToken, clientId);
 
-        // STEP 6: Resolve app_type from partner's type_partner
+        // STEP 6: Resolve app_type
         //
-        //   No partner_id          → tracking   (regular owner)
-        //   partner.LEASE_PARTNER  → recouvrement
-        //   partner.SIMPLE_PARTNER → tracking
+        //   Partner staff (role_id 6, "Administrateur partenaire") always land
+        //   in tracking, regardless of their partner's type — they're fleet
+        //   staff, not a driver on a lease/recouvrement program.
         //
-        const isChauffeur = user.partner_id !== null && user.partner_id !== undefined;
-        const app_type    = await resolveAppType(user.partner_id);
+        //   Otherwise, by partner's type_partner:
+        //     No partner_id          → tracking   (regular owner)
+        //     partner.LEASE_PARTNER  → recouvrement
+        //     partner.SIMPLE_PARTNER → tracking
+        //
+        const hasPartner     = user.partner_id !== null && user.partner_id !== undefined;
+        const isPartnerStaff = user.role_id === 6 && hasPartner;
+        const isChauffeur    = hasPartner && !isPartnerStaff;
+        const app_type       = isPartnerStaff ? 'tracking' : await resolveAppType(user.partner_id);
 
-        logger.info(`👤 User ${user.id} | partner_id=${user.partner_id} | app_type=${app_type} | isChauffeur=${isChauffeur} | client=${clientId} | roles=${clientRoles}`);
+        logger.info(`👤 User ${user.id} | partner_id=${user.partner_id} | app_type=${app_type} | isChauffeur=${isChauffeur} | isPartnerStaff=${isPartnerStaff} | client=${clientId} | roles=${clientRoles}`);
 
         // STEP 7: Tracking-only — fetch vehicles and subscriptions
         //   Recouvrement users skip this block entirely.
@@ -149,9 +197,11 @@ exports.login = async (req, res) => {
         let subscriptionStatus = 'NONE';
 
         if (app_type === 'tracking') {
-            const vehicles = isChauffeur
-                ? await fetchChauffeurVehicles(user.id)
-                : await fetchRegularUserVehicles(user.id);
+            const vehicles = isPartnerStaff
+                ? await fetchPartnerFleetVehicles(user.partner_id)
+                : isChauffeur
+                    ? await fetchChauffeurVehicles(user.id)
+                    : await fetchRegularUserVehicles(user.id);
 
             if (vehicles.length === 0) {
                 logger.warn(`❌ No vehicles for user ${user.id}`);
@@ -161,10 +211,12 @@ exports.login = async (req, res) => {
             }
 
             const vehicleIds = vehicles.map(v => v.id);
-            const subMap     = await fetchVehicleSubscriptionMap(user.id, vehicleIds);
+            const subMap     = isPartnerStaff
+                ? await fetchFleetSubscriptionMap(vehicleIds)
+                : await fetchVehicleSubscriptionMap(user.id, vehicleIds);
 
             vehiclesWithSubs = vehicles.map(v => ({
-                ...v.toJSON(),
+                ...(typeof v.toJSON === 'function' ? v.toJSON() : v),
                 has_active_subscription: subMap.get(Number(v.id)) ?? false,
             }));
 
