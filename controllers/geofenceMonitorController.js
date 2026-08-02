@@ -395,6 +395,60 @@ const formatTimeAgo = (minutes) => {
     return `${minutes} minutes ago`;
 };
 
+// ── resolve geofence zone: inline polygon OR a reference into geofence_zones ──
+// voitures.geofence_zone has historically stored the polygon inline as
+// [[lng,lat],[lng,lat],...]. Some vehicles instead have it set to a bare
+// integer — a reference to a named zone in geofence_zones (id, name, zone),
+// assigned by a separate app that has no dedicated column to store this link
+// in yet. geofence_zones.zone uses a different point shape: [{lat,lng},...].
+const resolveGeofenceZone = async (rawGeofenceZone) => {
+    if (!rawGeofenceZone) return { zone: null, reason: 'No geofence defined' };
+
+    let parsed;
+    try {
+        parsed = typeof rawGeofenceZone === 'string' ? JSON.parse(rawGeofenceZone) : rawGeofenceZone;
+    } catch (_) {
+        return { zone: null, reason: 'Invalid geofence data' };
+    }
+
+    // Inline polygon — existing format, unchanged.
+    if (Array.isArray(parsed)) {
+        if (parsed.length < 3) return { zone: null, reason: 'geofence_zone_too_few_points' };
+        return { zone: parsed, reason: null };
+    }
+
+    // Bare integer — a reference into geofence_zones, not an inline polygon.
+    if (typeof parsed === 'number' && Number.isInteger(parsed)) {
+        const [namedZone] = await sequelize.query(
+            'SELECT id, name, zone FROM geofence_zones WHERE id = ?',
+            { replacements: [parsed], type: sequelize.QueryTypes.SELECT }
+        );
+        if (!namedZone) {
+            logger.warn(`⚠️ [Geofence] geofence_zone references geofence_zones.id=${parsed}, which does not exist`);
+            return { zone: null, reason: 'geofence_zone_reference_not_found' };
+        }
+
+        let points;
+        try {
+            points = typeof namedZone.zone === 'string' ? JSON.parse(namedZone.zone) : namedZone.zone;
+        } catch (_) {
+            return { zone: null, reason: 'Invalid named geofence data' };
+        }
+
+        if (!Array.isArray(points) || points.length < 3) {
+            return { zone: null, reason: 'named_geofence_too_few_points' };
+        }
+
+        // geofence_zones stores {lat,lng} objects — convert to the [lng,lat]
+        // pairs isInsideGeofence expects.
+        const converted = points.map(p => [p.lng, p.lat]);
+        logger.debug(`🎯 [Geofence] Resolved geofence_zone reference ${parsed} -> named zone "${namedZone.name}" (${converted.length} points)`);
+        return { zone: converted, reason: null };
+    }
+
+    return { zone: null, reason: 'geofence_zone_too_few_points' };
+};
+
 // ── initialize state ──────────────────────────────────────────────────────────
 const initializeGeofenceState = async (vehicleId) => {
     try {
@@ -410,11 +464,8 @@ const initializeGeofenceState = async (vehicleId) => {
         );
         if (!location) return { success: false, reason: 'No GPS data' };
 
-        let geofenceZone;
-        try {
-            geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
-        } catch (_) { return { success: false, reason: 'Invalid geofence data' }; }
+        const { zone: geofenceZone, reason: zoneErrorReason } = await resolveGeofenceZone(voiture.geofence_zone);
+        if (!geofenceZone) return { success: false, reason: zoneErrorReason || 'Invalid geofence data' };
 
         const isInside     = isInsideGeofence(location.latitude, location.longitude, geofenceZone);
         const initialState = isInside ? 'inside' : 'outside';
@@ -490,21 +541,11 @@ const checkGeofenceViolationLocked = async (vehicleId, latitude, longitude) => {
             };
         }
 
-        // ── STEP 4: parse zone ────────────────────────────────────────────────
-        let geofenceZone;
-        try {
-            geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
-        } catch (_) { return { violation: false, reason: 'Invalid geofence data' }; }
-
-
-        // ── STEP 4b: validate zone has enough points ────────────────────────
-        if (!Array.isArray(geofenceZone) || geofenceZone.length < 3) {
-            logger.warn(
-                `⚠️ [Geofence] vehicleId=${vehicleId} geofence_zone has ${Array.isArray(geofenceZone) ? geofenceZone.length : 0} point(s) — ` +
-                `need at least 3 to form a polygon. Skipping check. Fix the zone data for this vehicle in the DB.`
-            );
-            return { violation: false, reason: 'geofence_zone_too_few_points' };
+        // ── STEP 4: resolve zone — inline polygon, or a reference into geofence_zones ──
+        const { zone: geofenceZone, reason: zoneErrorReason } = await resolveGeofenceZone(voiture.geofence_zone);
+        if (!geofenceZone) {
+            logger.warn(`⚠️ [Geofence] vehicleId=${vehicleId} could not resolve a usable zone (${zoneErrorReason}). Skipping check. Fix the zone data for this vehicle in the DB.`);
+            return { violation: false, reason: zoneErrorReason || 'Invalid geofence data' };
         }
         // ── STEP 5: inside or outside? ────────────────────────────────────────
         const isInside     = isInsideGeofence(latitude, longitude, geofenceZone);
