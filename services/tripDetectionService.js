@@ -541,6 +541,24 @@ class TripDetectionService {
         // front of its unprocessed queue.
         let discardedIds = [];
 
+        // An "ongoing" trip normally only closes when a later batch shows an
+        // idle gap after it. If the vehicle goes quiet and this is the first
+        // data to arrive since well before the idle threshold, blindly
+        // continuing it would wrongly glue two unrelated journeys into one
+        // multi-hour/day trip. Finalize the stale trip now instead, then
+        // start fresh — exactly as if the idle gap had been seen in-line.
+        if (currentTrip && locations.length > 0) {
+            const gapMinutes = (new Date(locations[0].sys_time) - new Date(currentTrip.end_time)) / 60000;
+            if (gapMinutes >= this.IDLE_THRESHOLD_MINUTES) {
+                logger.info(
+                    `[TRIP DETECTION] Ongoing trip ${currentTrip.id} is stale ` +
+                    `(${gapMinutes.toFixed(1)} min since last update) — finalizing before new data`
+                );
+                await this.finalizeStaleTrip(currentTrip);
+                currentTrip = null;
+            }
+        }
+
         if (currentTrip) {
             lastMovingTime = new Date(currentTrip.end_time);
             logger.debug(`[TRIP DETECTION] Continuing trip ${currentTrip.id} from ${lastMovingTime}`);
@@ -1071,6 +1089,20 @@ class TripDetectionService {
                 metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
                 metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM
             ) {
+                // A trip with substantial real distance but near-zero duration means
+                // the underlying sys_time values are corrupted (upstream GPS provider
+                // replaying a frozen/duplicate timestamp), not that the trip is fake.
+                // Flag it distinctly so it can be reviewed instead of vanishing silently
+                // into the same log line as genuinely-too-short parking-lot movements.
+                if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN && metrics.totalDistanceKm >= 1) {
+                    logger.warn(
+                        `[TRIP DETECTION] SUSPECTED TIMESTAMP CORRUPTION — trip ${currentTrip.id} ` +
+                        `covers ${metrics.totalDistanceKm.toFixed(2)} km but computed duration is only ` +
+                        `${metrics.durationMinutes.toFixed(2)} min. Deleting per existing rules, but the ` +
+                        `underlying location rows (locationIds below) likely contain a real trip.`
+                    );
+                }
+
                 logger.warn(
                     `[TRIP DETECTION] Trip ${currentTrip.id} below minimums — deleting ` +
                     `(${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`
@@ -1146,6 +1178,125 @@ class TripDetectionService {
             await transaction.rollback();
             logger.error(`[TRIP DETECTION] Error finalizing trip ${currentTrip.id}: ${error.message}`);
             return false;
+        }
+    }
+
+    // ==================== STALE TRIP HANDLING ====================
+
+    // Finalizes an "ongoing" trip using ONLY the waypoints it already has —
+    // no new location data to add, no new endLocation reported. Used both
+    // in-line (when fresh data resumes after too long a gap) and by the
+    // periodic sweep (when a vehicle goes quiet and never sends data again,
+    // so nothing would otherwise ever trigger this trip's finalization).
+    static async finalizeStaleTrip(currentTrip) {
+        const transaction = await sequelize.transaction();
+
+        try {
+            const allWaypoints = await TripWaypoint.findAll({
+                where: { trip_id: currentTrip.id },
+                attributes: ["latitude", "longitude", "speed", "recorded_at"],
+                order: [["sequence_order", "ASC"]],
+                raw: true,
+                transaction
+            });
+
+            if (allWaypoints.length === 0) {
+                await Location.update({ trip_id: null }, { where: { trip_id: currentTrip.id }, transaction });
+                await Trip.destroy({ where: { id: currentTrip.id }, transaction });
+                await transaction.commit();
+                logger.warn(`[TRIP DETECTION] Stale trip ${currentTrip.id} had no waypoints — deleted`);
+                return;
+            }
+
+            const metrics = this.calculateTripMetrics(allWaypoints);
+
+            if (
+                metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN ||
+                metrics.totalDistanceKm < this.MIN_TRIP_DISTANCE_KM
+            ) {
+                if (metrics.durationMinutes < this.MIN_TRIP_DURATION_MIN && metrics.totalDistanceKm >= 1) {
+                    logger.warn(
+                        `[TRIP DETECTION] SUSPECTED TIMESTAMP CORRUPTION — stale trip ${currentTrip.id} ` +
+                        `covers ${metrics.totalDistanceKm.toFixed(2)} km but computed duration is only ` +
+                        `${metrics.durationMinutes.toFixed(2)} min.`
+                    );
+                }
+
+                logger.warn(
+                    `[TRIP DETECTION] Stale trip ${currentTrip.id} below minimums — deleting ` +
+                    `(${metrics.durationMinutes.toFixed(1)} min, ${metrics.totalDistanceKm.toFixed(2)} km)`
+                );
+
+                await TripWaypoint.destroy({ where: { trip_id: currentTrip.id }, transaction });
+                await Location.update({ trip_id: null }, { where: { trip_id: currentTrip.id }, transaction });
+                await Trip.destroy({ where: { id: currentTrip.id }, transaction });
+                await transaction.commit();
+                return;
+            }
+
+            const lastWaypoint = allWaypoints[allWaypoints.length - 1];
+            const endAddressData = await this.reverseGeocode(lastWaypoint.latitude, lastWaypoint.longitude);
+
+            await Trip.update({
+                end_time:           lastWaypoint.recorded_at,
+                end_latitude:        lastWaypoint.latitude,
+                end_longitude:       lastWaypoint.longitude,
+                end_address:         endAddressData.address,
+                end_address_status:  endAddressData.status,
+                duration_minutes:    Math.round(metrics.durationMinutes),
+                total_distance_km:   parseFloat(metrics.totalDistanceKm.toFixed(2)),
+                avg_speed_kmh:       parseFloat(metrics.avgSpeed.toFixed(2)),
+                max_speed_kmh:       parseFloat(metrics.maxSpeed.toFixed(2)),
+                waypoint_count:      allWaypoints.length,
+                status:              "completed"
+            }, { where: { id: currentTrip.id }, transaction });
+
+            await transaction.commit();
+
+            logger.info(
+                `[TRIP DETECTION] ✅ Stale trip ${currentTrip.id} force-finalized — ` +
+                `${Math.round(metrics.durationMinutes)} min | ` +
+                `${metrics.totalDistanceKm.toFixed(2)} km | ` +
+                `${allWaypoints.length} raw waypoints`
+            );
+
+        } catch (error) {
+            await transaction.rollback();
+            logger.error(`[TRIP DETECTION] Error finalizing stale trip ${currentTrip.id}: ${error.message}`);
+        }
+    }
+
+    // Sweeps for "ongoing" trips whose vehicle has gone quiet — no new
+    // location data ever arrived to naturally trigger the idle-gap check.
+    // Without this, such a trip sits open forever: invisible to the app
+    // (which only ever queries status='completed' trips) and, if the device
+    // ever reconnects far later, at risk of being wrongly continued into a
+    // multi-day trip. Called every cron tick, independent of whether there's
+    // any new unprocessed location data.
+    static async sweepStaleOngoingTrips() {
+        try {
+            const staleTrips = await Trip.findAll({
+                where: {
+                    status: "ongoing",
+                    end_time: { [Op.lt]: new Date(Date.now() - this.IDLE_THRESHOLD_MINUTES * 60000) }
+                },
+                attributes: ["id", "vehicle_id", "mac_id_gps", "end_time"],
+                raw: true
+            });
+
+            if (staleTrips.length === 0) return { finalized: 0 };
+
+            logger.info(`[TRIP DETECTION] Sweep found ${staleTrips.length} stale ongoing trip(s) — finalizing`);
+
+            for (const trip of staleTrips) {
+                await this.finalizeStaleTrip(trip);
+            }
+
+            return { finalized: staleTrips.length };
+
+        } catch (error) {
+            logger.error(`[TRIP DETECTION] Error sweeping stale ongoing trips: ${error.message}`);
+            return { finalized: 0, error: error.message };
         }
     }
 

@@ -110,14 +110,14 @@ const generalLimiter = rateLimit({
 });
 
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
+    windowMs: 30 * 1000,
     max: 5,
     skipSuccessfulRequests: true,
     message: { message: 'Too many authentication attempts.' },
     handler: (req, res) => {
         logger.warn(`🚨 Auth rate limit: IP=${req.ip}, Phone=${req.body.phone || 'N/A'}`);
         res.status(429).json({
-            message: 'Too many authentication attempts. Please try again after 15 minutes.'
+            message: 'Too many authentication attempts. Please try again in 30 seconds.'
         });
     }
 });

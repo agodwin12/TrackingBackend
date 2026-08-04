@@ -1,14 +1,33 @@
 
 const sequelize              = require('../config/database');
-const { sendGpsCommandWithFallback } = require('./GpsService');
+const { sendGpsCommandWithFallback, getRealtimeStatusByMacWithFallback } = require('./GpsService');
 const notificationController = require('../controllers/notificationController');
+const Command                = require('../models/Command');
 const logger                 = require('../utils/logger');
 
 // ── tuneable constants ────────────────────────────────────────────────────────
-const SPEED_CUT_THRESHOLD_KMH = 15;   // cut engine when speed drops below this
-const POLL_INTERVAL_MS        = 8000; // check speed every 8 seconds
-const MAX_WATCH_MINUTES       = 10;   // give up after 10 minutes
-const MAX_WATCH_MS            = MAX_WATCH_MINUTES * 60 * 1000;
+// No speed gate: per fleet policy, a lease-partner vehicle is cut off
+// immediately on a confirmed geofence exit, regardless of current speed.
+
+// After sending CLOSERELAY, the GPS provider's "success" only means the
+// platform accepted the command — not that the device actually received it
+// and opened the relay. These control the post-send verification poll that
+// closes that gap.
+const VERIFY_POLL_ATTEMPTS      = 4;
+const VERIFY_POLL_INTERVAL_MS   = 6000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helper: extract the GPS provider's own command reference number
+// from its response, so the audit trail has a real, provider-side ID to
+// trace — not just our locally-generated placeholder. Mirrors the same
+// helper in controllers/recouvrementStolenController.js.
+// ─────────────────────────────────────────────────────────────────────────────
+const extractCmdNo = (providerResp) => {
+    if (Array.isArray(providerResp?.data) && providerResp.data.length > 0) {
+        return providerResp.data[0]?.CmdNo || null;
+    }
+    return null;
+};
 
 // Real CLOSERELAY commands are dangerous (cuts a vehicle's engine remotely,
 // irreversible from here once sent) and this codebase has no other simulation
@@ -18,7 +37,7 @@ const CUTOFF_EXECUTION_ENABLED = String(process.env.GEOFENCE_CUTOFF_EXECUTION_EN
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-const activeWatchers = new Map();
+const activeCutoffs = new Map(); // vehicleId -> true, while a cutoff attempt is in flight
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper: resolve mac_id_gps + account_name for a vehicleId
@@ -132,6 +151,44 @@ const resolveVehicleUsers = async (vehicleId) => {
     }
 };
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helper: after sending CLOSERELAY, poll the device's real state
+// (not the provider's "command accepted" ack) to confirm the relay actually
+// opened. Returns 'engine_confirmed_off' | 'engine_still_on' | 'no_response'.
+// ─────────────────────────────────────────────────────────────────────────────
+const verifyEngineCut = async (macIdGps, accountName) => {
+    let gotAnyResponse = false;
+
+    for (let attempt = 1; attempt <= VERIFY_POLL_ATTEMPTS; attempt++) {
+        await sleep(VERIFY_POLL_INTERVAL_MS);
+
+        try {
+            const result = await getRealtimeStatusByMacWithFallback({ accountName, macId: macIdGps });
+
+            if (result.success && result.status && typeof result.status.oilState === 'boolean') {
+                gotAnyResponse = true;
+                logger.info(
+                    `🔎 [EngineCut] verify attempt ${attempt}/${VERIFY_POLL_ATTEMPTS} for MAC=${macIdGps}: ` +
+                    `oilState=${result.status.oilState} (true=relay connected/engine can run, false=cut)`
+                );
+
+                if (result.status.oilState === false) {
+                    return 'engine_confirmed_off';
+                }
+                // oilState still true — device confirmed it did NOT cut yet, keep polling
+            } else {
+                logger.warn(`⚠️ [EngineCut] verify attempt ${attempt}/${VERIFY_POLL_ATTEMPTS} for MAC=${macIdGps}: no usable status (${result.message || 'unknown'})`);
+            }
+        } catch (err) {
+            logger.error(`❌ [EngineCut] verify attempt ${attempt}/${VERIFY_POLL_ATTEMPTS} error: ${err.message}`);
+        }
+    }
+
+    return gotAnyResponse ? 'engine_still_on' : 'no_response';
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PUBLIC: Check if a vehicle belongs to a LEASE_PARTNER (e.g. Royal Holdings).
 //
@@ -181,8 +238,8 @@ const sendGeofenceWarningNotifications = async (vehicleId, vehicleName, location
     if (driverId) {
         await safeSendNotification(
             driverId,
-            '⚠️ Zone Alert — Engine Will Be Cut',
-            `You have left the authorized zone. The engine of ${vehicleName} will be turned off once you slow down.`,
+            '⚠️ Zone Alert — Engine Being Disabled',
+            `You have left the authorized zone. The engine of ${vehicleName} is being turned off now.`,
             {
                 type:       'geofence_engine_warning',
                 vehicleId:  String(vehicleId),
@@ -198,7 +255,7 @@ const sendGeofenceWarningNotifications = async (vehicleId, vehicleName, location
         await safeSendNotification(
             partnerId,
             '⚠️ Geofence Breach — Engine Cut Pending',
-            `Vehicle ${vehicleName} has left the authorized zone at ${locationName}. Engine cut will be executed when speed drops below ${SPEED_CUT_THRESHOLD_KMH} km/h.`,
+            `Vehicle ${vehicleName} has left the authorized zone at ${locationName}. Engine cut is being executed now.`,
             {
                 type:       'geofence_engine_warning',
                 vehicleId:  String(vehicleId),
@@ -211,114 +268,129 @@ const sendGeofenceWarningNotifications = async (vehicleId, vehicleName, location
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUBLIC: Start the speed watcher for a vehicle.
-//
-//   - Polls speed every POLL_INTERVAL_MS.
-//   - Cuts engine when speed < SPEED_CUT_THRESHOLD_KMH.
-//   - Gives up after MAX_WATCH_MINUTES and notifies partner that cut failed.
-//   - One watcher per vehicle (duplicate calls are ignored).
+// PUBLIC: Immediately cut the engine for a lease-partner vehicle that just
+// confirmed a geofence exit. No speed gate — sends CLOSERELAY right away
+// regardless of current speed, per fleet policy. One attempt per vehicle at
+// a time (a duplicate call while one is already in flight is ignored).
 // ─────────────────────────────────────────────────────────────────────────────
-const startSpeedWatcher = async (vehicleId, vehicleName, partnerId) => {
+const startSpeedWatcher = async (vehicleId, vehicleName, partnerId, alertId = null) => {
 
-    // Guard: don't start a second watcher for the same vehicle
-    if (activeWatchers.has(vehicleId)) {
-        logger.warn(`⚠️ [EngineCut] Watcher already active for vehicle ${vehicleId} — skipping`);
+    if (activeCutoffs.has(vehicleId)) {
+        logger.warn(`⚠️ [EngineCut] Cutoff already in progress for vehicle ${vehicleId} — skipping`);
         return;
     }
+    activeCutoffs.set(vehicleId, true);
 
-    logger.info(`🔍 [EngineCut] Starting speed watcher for vehicle ${vehicleId} (${vehicleName})`);
+    try {
+        logger.warn(`🔴 [EngineCut] Executing immediate geofence cutoff for vehicle ${vehicleId} (${vehicleName}) — no speed gate`);
 
-    // Resolve GPS device info once
-    const gpsInfo = await resolveVehicleGps(vehicleId);
-    if (!gpsInfo) {
-        logger.error(`❌ [EngineCut] Cannot resolve GPS info for vehicle ${vehicleId} — aborting watcher`);
-        return;
-    }
+        // Resolve GPS device info
+        const gpsInfo = await resolveVehicleGps(vehicleId);
+        if (!gpsInfo) {
+            logger.error(`❌ [EngineCut] Cannot resolve GPS info for vehicle ${vehicleId} — aborting cutoff`);
+            try {
+                await Command.create({
+                    user_id:           partnerId || null,
+                    employe_id:        null,
+                    vehicule_id:       vehicleId,
+                    CmdNo:             `LOCAL-${Date.now()}-${vehicleId}`,
+                    status:            'failed',
+                    type_commande:     'COUPURE',
+                    trigger_source:    'geofence_auto',
+                    description:       'Geofence violation - recorded by System Admin',
+                    trigger_alert_id:  alertId,
+                    provider_response: { error: 'gps_info_not_found' },
+                    verification_result: 'skipped_not_ok'
+                });
+            } catch (dbErr) {
+                logger.error(`⚠️ [EngineCut] Failed to log aborted cutoff for vehicle ${vehicleId}: ${dbErr.message}`);
+            }
+            return;
+        }
 
-    const { mac_id_gps, account_name } = gpsInfo;
-    const watchStartTime = Date.now();
+        const { mac_id_gps, account_name } = gpsInfo;
+        const normalizedAccount = String(account_name).trim().toLowerCase();
+        const speed = await getCurrentSpeed(mac_id_gps); // logged for the audit trail only — not gated on
 
-    // ── Interval tick ─────────────────────────────────────────────────────────
-    const intervalId = setInterval(async () => {
+        // ── Audit trail: one row per cutoff attempt. This is what lets us
+        // answer "was it actually sent, and did it actually work" after the
+        // fact instead of only having the coarse vehicle_security.geofence_locked
+        // flag (which carries no history).
+        let commandRecord;
         try {
-            // Check timeout first
-            const elapsedMs = Date.now() - watchStartTime;
-            if (elapsedMs >= MAX_WATCH_MS) {
-                logger.warn(
-                    `⏰ [EngineCut] Timeout reached (${MAX_WATCH_MINUTES}min) for vehicle ${vehicleId}. ` +
-                    `Engine NOT cut. Stopping watcher.`
-                );
-                stopWatcher(vehicleId);
+            commandRecord = await Command.create({
+                user_id:          partnerId || null,
+                employe_id:       null,
+                vehicule_id:      vehicleId,
+                CmdNo:            `LOCAL-${Date.now()}-${vehicleId}`,
+                status:           'pending',
+                type_commande:    'COUPURE',
+                trigger_source:   'geofence_auto',
+                description:      'Geofence violation - recorded by System Admin',
+                trigger_alert_id: alertId,
+                speed_at_send:    speed,
+                sent_at:          new Date()
+            });
+        } catch (dbErr) {
+            logger.error(`⚠️ [EngineCut] Failed to create pending command row for vehicle ${vehicleId}: ${dbErr.message}`);
+            // Don't abort the actual cutoff attempt just because the audit row failed
+        }
 
-                // Notify partner that the cut could not be executed
-                if (partnerId) {
-                    await safeSendNotification(
-                        partnerId,
-                        '⚠️ Engine Cut Could Not Be Executed',
-                        `Vehicle ${vehicleName} remained at high speed for over ${MAX_WATCH_MINUTES} minutes after leaving the zone. Engine was not cut automatically. Please take manual action.`,
-                        {
-                            type:       'geofence_cut_timeout',
-                            vehicleId:  String(vehicleId),
-                            vehicleName
-                        }
-                    );
-                }
-                return;
+        logger.warn(
+            `🔴 [EngineCut] ${CUTOFF_EXECUTION_ENABLED ? 'Sending' : 'SIMULATING (GEOFENCE_CUTOFF_EXECUTION_ENABLED=false)'} ` +
+            `CLOSERELAY to vehicle ${vehicleId} (speed=${speed ?? 'unknown'}km/h)`
+        );
+
+        const cmdResult = CUTOFF_EXECUTION_ENABLED
+            ? await sendGpsCommandWithFallback({
+                accountName: normalizedAccount,
+                macId:       mac_id_gps,
+                command:     'CLOSERELAY',
+            })
+            : {
+                ok:           true,
+                message:      'SIMULATED — GEOFENCE_CUTOFF_EXECUTION_ENABLED is not "true"',
+                providerResp: null,
+                retried:      false,
+                simulated:    true,
+            };
+
+        if (commandRecord) {
+            await commandRecord.update({
+                CmdNo:              extractCmdNo(cmdResult.providerResp) || commandRecord.CmdNo,
+                status:             cmdResult.simulated ? 'simulated' : (cmdResult.ok ? 'sent' : 'failed'),
+                provider_response:  cmdResult.providerResp
+            }).catch(() => {});
+        }
+
+        if (cmdResult.ok && cmdResult.simulated) {
+            // Simulation mode: prove the trigger logic works end-to-end without
+            // sending a real command or telling driver/partner the engine is off
+            // when it isn't.
+            logger.info(`🧪 [EngineCut] SIMULATED CLOSERELAY for vehicle ${vehicleId} — no real command sent, no user notified`);
+            if (commandRecord) {
+                await commandRecord.update({ verification_result: 'skipped_simulated' }).catch(() => {});
             }
 
-            // Read current speed from DB
-            const speed = await getCurrentSpeed(mac_id_gps);
+        } else if (cmdResult.ok) {
+            logger.info(`✅ [EngineCut] CLOSERELAY accepted by provider for vehicle ${vehicleId} — verifying actual device state before declaring success`);
 
-            if (speed === null) {
-                logger.warn(`⚠️ [EngineCut] Could not read speed for vehicle ${vehicleId} — will retry`);
-                return; // retry next tick
+            // The provider ack only means "command accepted" — confirm the
+            // relay actually opened before telling anyone the engine is off.
+            const verification = await verifyEngineCut(mac_id_gps, normalizedAccount);
+            if (commandRecord) {
+                await commandRecord.update({
+                    verified_at:          new Date(),
+                    verification_result:  verification,
+                    status:               verification === 'engine_confirmed_off' ? 'confirmed_cut' : 'cut_not_confirmed'
+                }).catch(() => {});
             }
 
-            logger.info(
-                `🏎️ [EngineCut] vehicle=${vehicleId} speed=${speed} km/h ` +
-                `(threshold=${SPEED_CUT_THRESHOLD_KMH}) elapsed=${Math.round(elapsedMs / 1000)}s`
-            );
+            if (verification === 'engine_confirmed_off') {
+                logger.info(`✅ [EngineCut] Engine cut CONFIRMED for vehicle ${vehicleId}`);
 
-            if (speed >= SPEED_CUT_THRESHOLD_KMH) {
-                // Still too fast — keep watching
-                return;
-            }
-
-            // ── Speed is below threshold — send CLOSERELAY ────────────────────
-            logger.warn(
-                `🔴 [EngineCut] speed=${speed} < ${SPEED_CUT_THRESHOLD_KMH} — ` +
-                `${CUTOFF_EXECUTION_ENABLED ? 'sending' : 'SIMULATING (GEOFENCE_CUTOFF_EXECUTION_ENABLED=false)'} ` +
-                `CLOSERELAY to vehicle ${vehicleId}`
-            );
-            stopWatcher(vehicleId); // stop polling immediately before async work
-
-            const cmdResult = CUTOFF_EXECUTION_ENABLED
-                ? await sendGpsCommandWithFallback({
-                    accountName: String(account_name).trim().toLowerCase(),
-                    macId:       mac_id_gps,
-                    command:     'CLOSERELAY',
-                })
-                : {
-                    ok:           true,
-                    message:      'SIMULATED — GEOFENCE_CUTOFF_EXECUTION_ENABLED is not "true"',
-                    providerResp: null,
-                    retried:      false,
-                    simulated:    true,
-                };
-
-            if (cmdResult.ok && cmdResult.simulated) {
-                // Simulation mode: prove the trigger logic works end-to-end without
-                // sending a real command or telling driver/partner the engine is off
-                // when it isn't.
-                logger.info(`🧪 [EngineCut] SIMULATED CLOSERELAY for vehicle ${vehicleId} (speed=${speed}km/h) — no real command sent, no user notified`);
-
-            } else if (cmdResult.ok) {
-                logger.info(`✅ [EngineCut] CLOSERELAY succeeded for vehicle ${vehicleId}`);
-
-                // Mark in DB
                 await markGeofenceLocked(vehicleId);
 
-                // Notify driver
                 const { driverId } = await resolveVehicleUsers(vehicleId);
                 if (driverId) {
                     await safeSendNotification(
@@ -333,81 +405,93 @@ const startSpeedWatcher = async (vehicleId, vehicleName, partnerId) => {
                     );
                 }
 
-                // Notify partner
                 if (partnerId) {
                     await safeSendNotification(
                         partnerId,
                         '🔴 Engine Cut Executed',
-                        `Vehicle ${vehicleName} engine has been automatically disabled (speed dropped to ${speed} km/h outside the zone).`,
+                        `Vehicle ${vehicleName} engine has been automatically disabled after leaving the authorized zone.`,
                         {
                             type:       'geofence_engine_cut',
                             vehicleId:  String(vehicleId),
                             vehicleName,
-                            speed:      String(speed)
+                            speed:      String(speed ?? '')
                         }
                     );
                 }
 
             } else {
-                // Command failed — log and notify partner
+                // Provider accepted the command but the device never confirmed
+                // the relay actually opened — do NOT tell driver/partner the
+                // engine is off, and do NOT mark geofence_locked, since it isn't
+                // verified. Surface this clearly instead of a false "success".
                 logger.error(
-                    `❌ [EngineCut] CLOSERELAY FAILED for vehicle ${vehicleId}: ${cmdResult.message}`
+                    `❌ [EngineCut] CLOSERELAY accepted by provider but NOT CONFIRMED on device for vehicle ${vehicleId} ` +
+                    `(verification=${verification})`
                 );
 
                 if (partnerId) {
                     await safeSendNotification(
                         partnerId,
-                        '❌ Engine Cut Failed',
-                        `Attempted to cut engine of ${vehicleName} (speed ${speed} km/h) but the GPS command failed. Please take manual action.`,
+                        '⚠️ Engine Cut Sent But Not Confirmed',
+                        `Vehicle ${vehicleName} was sent an engine cut command, but the device did not confirm it took effect. Please verify manually.`,
                         {
-                            type:       'geofence_cut_failed',
+                            type:       'geofence_cut_unconfirmed',
                             vehicleId:  String(vehicleId),
                             vehicleName,
-                            error:      cmdResult.message || 'Unknown error'
+                            verification
                         }
                     );
                 }
             }
 
-        } catch (err) {
-            logger.error(`❌ [EngineCut] Interval tick error for vehicle ${vehicleId}: ${err.message}`);
-            // Don't stop watcher on transient errors — keep trying
+        } else {
+            // Command failed — log and notify partner
+            logger.error(
+                `❌ [EngineCut] CLOSERELAY FAILED for vehicle ${vehicleId}: ${cmdResult.message}`
+            );
+            if (commandRecord) {
+                await commandRecord.update({ verification_result: 'skipped_not_ok' }).catch(() => {});
+            }
+
+            if (partnerId) {
+                await safeSendNotification(
+                    partnerId,
+                    '❌ Engine Cut Failed',
+                    `Attempted to cut engine of ${vehicleName} but the GPS command failed. Please take manual action.`,
+                    {
+                        type:       'geofence_cut_failed',
+                        vehicleId:  String(vehicleId),
+                        vehicleName,
+                        error:      cmdResult.message || 'Unknown error'
+                    }
+                );
+            }
         }
-    }, POLL_INTERVAL_MS);
 
-    activeWatchers.set(vehicleId, intervalId);
-    logger.info(
-        `⏱️ [EngineCut] Watcher registered for vehicle ${vehicleId}. ` +
-        `Will poll every ${POLL_INTERVAL_MS / 1000}s for up to ${MAX_WATCH_MINUTES}min.`
-    );
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal: clear and remove a watcher
-// ─────────────────────────────────────────────────────────────────────────────
-const stopWatcher = (vehicleId) => {
-    const intervalId = activeWatchers.get(vehicleId);
-    if (intervalId) {
-        clearInterval(intervalId);
-        activeWatchers.delete(vehicleId);
-        logger.info(`🛑 [EngineCut] Watcher stopped for vehicle ${vehicleId}`);
+    } catch (err) {
+        logger.error(`❌ [EngineCut] startSpeedWatcher error for vehicle ${vehicleId}: ${err.message}`);
+    } finally {
+        activeCutoffs.delete(vehicleId);
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUBLIC: Stop watcher externally (e.g. when vehicle returns to zone)
+// PUBLIC: Kept for call-site compatibility (geofenceMonitorController calls
+// this when a vehicle's return to zone is confirmed). Since cutoff is now
+// immediate rather than speed-gated, there's no pending watcher to abort by
+// the time a return is confirmed — this is a no-op safety valve, not an
+// active cancellation.
 // ─────────────────────────────────────────────────────────────────────────────
 const cancelSpeedWatcher = (vehicleId) => {
-    if (activeWatchers.has(vehicleId)) {
-        stopWatcher(vehicleId);
-        logger.info(`✅ [EngineCut] Watcher cancelled (vehicle returned to zone) for vehicle ${vehicleId}`);
+    if (activeCutoffs.has(vehicleId)) {
+        logger.info(`ℹ️ [EngineCut] Vehicle ${vehicleId} returned to zone while its cutoff attempt was still in flight (verification poll) — letting it finish.`);
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUBLIC: How many watchers are currently active (useful for monitoring)
+// PUBLIC: How many cutoffs are currently in flight (useful for monitoring)
 // ─────────────────────────────────────────────────────────────────────────────
-const activeWatcherCount = () => activeWatchers.size;
+const activeWatcherCount = () => activeCutoffs.size;
 
 module.exports = {
     isLeasePartnerVehicle,

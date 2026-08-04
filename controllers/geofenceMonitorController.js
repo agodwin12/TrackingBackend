@@ -43,6 +43,31 @@ const getEphemeralState = (vehicleId) => {
 };
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── per-vehicle async lock ────────────────────────────────────────────────────
+// checkGeofenceViolation is NOT read-only: it reads state, decides, and writes
+// state + creates alerts. It's invoked from two independent places — the
+// background GPS poller (location.js, on a timer) AND the live per-vehicle
+// HTTP status endpoint (getGeofenceStatus below, hit by the dashboard while a
+// vehicle's detail view is open). Without serialization, two calls for the
+// SAME vehicle arriving close together can both read the pre-crossing state
+// (including the debounce counter and the alert cooldown timestamp) before
+// either writes back the post-crossing state — each independently concludes
+// "this is a confirmed, non-cooldown crossing" and each creates its own alert.
+// That's what produced duplicate RETURNED_ZONE alerts at the same timestamp.
+// This queues calls per vehicleId so only one is ever inside the
+// read-decide-write section at a time; other vehicles are unaffected.
+const vehicleLocks = new Map(); // key: String(vehicleId) -> Promise (tail of the queue)
+
+const withVehicleLock = (vehicleId, fn) => {
+    const key      = String(vehicleId);
+    const previous = vehicleLocks.get(key) || Promise.resolve();
+    const run      = previous.then(fn, fn); // run fn even if the previous call in the queue failed
+    // Keep the chain alive for the next caller, but never let a rejection propagate into it.
+    vehicleLocks.set(key, run.catch(() => {}));
+    return run;
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── haversine distance (km) ───────────────────────────────────────────────────
 const haversineKm = (lat1, lng1, lat2, lng2) => {
     const R    = 6371;
@@ -370,6 +395,60 @@ const formatTimeAgo = (minutes) => {
     return `${minutes} minutes ago`;
 };
 
+// ── resolve geofence zone: inline polygon OR a reference into geofence_zones ──
+// voitures.geofence_zone has historically stored the polygon inline as
+// [[lng,lat],[lng,lat],...]. Some vehicles instead have it set to a bare
+// integer — a reference to a named zone in geofence_zones (id, name, zone),
+// assigned by a separate app that has no dedicated column to store this link
+// in yet. geofence_zones.zone uses a different point shape: [{lat,lng},...].
+const resolveGeofenceZone = async (rawGeofenceZone) => {
+    if (!rawGeofenceZone) return { zone: null, reason: 'No geofence defined' };
+
+    let parsed;
+    try {
+        parsed = typeof rawGeofenceZone === 'string' ? JSON.parse(rawGeofenceZone) : rawGeofenceZone;
+    } catch (_) {
+        return { zone: null, reason: 'Invalid geofence data' };
+    }
+
+    // Inline polygon — existing format, unchanged.
+    if (Array.isArray(parsed)) {
+        if (parsed.length < 3) return { zone: null, reason: 'geofence_zone_too_few_points' };
+        return { zone: parsed, reason: null };
+    }
+
+    // Bare integer — a reference into geofence_zones, not an inline polygon.
+    if (typeof parsed === 'number' && Number.isInteger(parsed)) {
+        const [namedZone] = await sequelize.query(
+            'SELECT id, name, zone FROM geofence_zones WHERE id = ?',
+            { replacements: [parsed], type: sequelize.QueryTypes.SELECT }
+        );
+        if (!namedZone) {
+            logger.warn(`⚠️ [Geofence] geofence_zone references geofence_zones.id=${parsed}, which does not exist`);
+            return { zone: null, reason: 'geofence_zone_reference_not_found' };
+        }
+
+        let points;
+        try {
+            points = typeof namedZone.zone === 'string' ? JSON.parse(namedZone.zone) : namedZone.zone;
+        } catch (_) {
+            return { zone: null, reason: 'Invalid named geofence data' };
+        }
+
+        if (!Array.isArray(points) || points.length < 3) {
+            return { zone: null, reason: 'named_geofence_too_few_points' };
+        }
+
+        // geofence_zones stores {lat,lng} objects — convert to the [lng,lat]
+        // pairs isInsideGeofence expects.
+        const converted = points.map(p => [p.lng, p.lat]);
+        logger.debug(`🎯 [Geofence] Resolved geofence_zone reference ${parsed} -> named zone "${namedZone.name}" (${converted.length} points)`);
+        return { zone: converted, reason: null };
+    }
+
+    return { zone: null, reason: 'geofence_zone_too_few_points' };
+};
+
 // ── initialize state ──────────────────────────────────────────────────────────
 const initializeGeofenceState = async (vehicleId) => {
     try {
@@ -385,11 +464,8 @@ const initializeGeofenceState = async (vehicleId) => {
         );
         if (!location) return { success: false, reason: 'No GPS data' };
 
-        let geofenceZone;
-        try {
-            geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
-        } catch (_) { return { success: false, reason: 'Invalid geofence data' }; }
+        const { zone: geofenceZone, reason: zoneErrorReason } = await resolveGeofenceZone(voiture.geofence_zone);
+        if (!geofenceZone) return { success: false, reason: zoneErrorReason || 'Invalid geofence data' };
 
         const isInside     = isInsideGeofence(location.latitude, location.longitude, geofenceZone);
         const initialState = isInside ? 'inside' : 'outside';
@@ -423,9 +499,15 @@ const initializeGeofenceState = async (vehicleId) => {
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// MAIN CHECK — called from location.js on every GPS update
+// MAIN CHECK — called from location.js on every GPS update, and from the
+// getGeofenceStatus HTTP endpoint below. Wrapped in withVehicleLock so the two
+// call sites (or two overlapping HTTP polls) can never race each other for the
+// same vehicle — see the vehicleLocks comment above.
 // ══════════════════════════════════════════════════════════════════════════════
-const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
+const checkGeofenceViolation = (vehicleId, latitude, longitude) =>
+    withVehicleLock(vehicleId, () => checkGeofenceViolationLocked(vehicleId, latitude, longitude));
+
+const checkGeofenceViolationLocked = async (vehicleId, latitude, longitude) => {
     logger.debug(`\n🚨 [Geofence] check vehicleId=${vehicleId} pos=[${latitude},${longitude}]`);
 
     try {
@@ -459,21 +541,11 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
             };
         }
 
-        // ── STEP 4: parse zone ────────────────────────────────────────────────
-        let geofenceZone;
-        try {
-            geofenceZone = typeof voiture.geofence_zone === 'string'
-                ? JSON.parse(voiture.geofence_zone) : voiture.geofence_zone;
-        } catch (_) { return { violation: false, reason: 'Invalid geofence data' }; }
-
-
-        // ── STEP 4b: validate zone has enough points ────────────────────────
-        if (!Array.isArray(geofenceZone) || geofenceZone.length < 3) {
-            logger.warn(
-                `⚠️ [Geofence] vehicleId=${vehicleId} geofence_zone has ${Array.isArray(geofenceZone) ? geofenceZone.length : 0} point(s) — ` +
-                `need at least 3 to form a polygon. Skipping check. Fix the zone data for this vehicle in the DB.`
-            );
-            return { violation: false, reason: 'geofence_zone_too_few_points' };
+        // ── STEP 4: resolve zone — inline polygon, or a reference into geofence_zones ──
+        const { zone: geofenceZone, reason: zoneErrorReason } = await resolveGeofenceZone(voiture.geofence_zone);
+        if (!geofenceZone) {
+            logger.warn(`⚠️ [Geofence] vehicleId=${vehicleId} could not resolve a usable zone (${zoneErrorReason}). Skipping check. Fix the zone data for this vehicle in the DB.`);
+            return { violation: false, reason: zoneErrorReason || 'Invalid geofence data' };
         }
         // ── STEP 5: inside or outside? ────────────────────────────────────────
         const isInside     = isInsideGeofence(latitude, longitude, geofenceZone);
@@ -517,34 +589,47 @@ const checkGeofenceViolation = async (vehicleId, latitude, longitude) => {
                 await updateGeofenceState(vehicleId, 'outside', crossingTime);
                 await resetCrossingCounters(vehicleId);
 
-                // ── Lease-partner engine cutoff — runs on every confirmed exit, ──
-                // independent of the alert cooldown below (that cooldown is only
-                // about not spamming notifications, not about skipping the cutoff).
+                const onCooldown = isAlertOnCooldown(stateInfo.lastLeftZoneAlertAt);
+
+                // ── LEFT_ZONE alert — resolved before the cutoff block below so the
+                // resulting command's audit row (commands.trigger_alert_id) can point
+                // at the exact alert that triggered it.
+                let alertCreated  = false;
+                let existingAlert = await getActiveGeofenceAlert(vehicleId);
+                let leftZoneAlertId = existingAlert?.id || null;
+
+                if (onCooldown) {
+                    logger.info(`🧊 [Geofence] vehicleId=${vehicleId} LEFT_ZONE alert suppressed — cooldown active (last at ${stateInfo.lastLeftZoneAlertAt.toISOString()})`);
+                } else if (!existingAlert) {
+                    const newAlert = await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime);
+                    recordAlertTimestamp(vehicleId, 'lastLeftZoneAlertAt');
+                    alertCreated    = true;
+                    leftZoneAlertId = newAlert?.id || null;
+                }
+
+                // ── Lease-partner engine cutoff — the cutoff itself (startSpeedWatcher)
+                // runs on every confirmed exit regardless of cooldown, since actually
+                // cutting the engine is safety-critical and must not be skipped just
+                // because a notification was recently sent. The WARNING NOTIFICATION,
+                // though, previously bypassed the cooldown entirely — meaning a vehicle
+                // oscillating across the boundary (confirmed-out -> confirmed-in ->
+                // confirmed-out...) sent a fresh "Engine Will Be Cut" push every single
+                // time, unlike every other alert in this file. It's now gated by the
+                // same cooldown as the regular LEFT_ZONE alert below.
                 try {
                     const leaseInfo = await engineCutService.isLeasePartnerVehicle(vehicleId);
                     if (leaseInfo.isLease) {
-                        const vehicleName  = voiture.nickname || `${voiture.marque} ${voiture.model}`;
-                        const locationInfo = await reverseGeocode(latitude, longitude);
-                        const locationName = formatLocationName(locationInfo);
+                        const vehicleName = voiture.nickname || `${voiture.marque} ${voiture.model}`;
                         logger.warn(`🔴 [Geofence] vehicleId=${vehicleId} belongs to LEASE_PARTNER "${leaseInfo.partnerName}" — starting engine cutoff`);
-                        await engineCutService.sendGeofenceWarningNotifications(vehicleId, vehicleName, locationName, leaseInfo.partnerId);
-                        await engineCutService.startSpeedWatcher(vehicleId, vehicleName, leaseInfo.partnerId);
+                        if (!onCooldown) {
+                            const locationInfo = await reverseGeocode(latitude, longitude);
+                            const locationName = formatLocationName(locationInfo);
+                            await engineCutService.sendGeofenceWarningNotifications(vehicleId, vehicleName, locationName, leaseInfo.partnerId);
+                        }
+                        await engineCutService.startSpeedWatcher(vehicleId, vehicleName, leaseInfo.partnerId, leftZoneAlertId);
                     }
                 } catch (cutErr) {
                     logger.error(`❌ [Geofence] lease cutoff check failed for vehicle ${vehicleId}: ${cutErr.message}`);
-                }
-
-                const onCooldown = isAlertOnCooldown(stateInfo.lastLeftZoneAlertAt);
-                let alertCreated = false;
-                if (onCooldown) {
-                    logger.info(`🧊 [Geofence] vehicleId=${vehicleId} LEFT_ZONE alert suppressed — cooldown active (last at ${stateInfo.lastLeftZoneAlertAt.toISOString()})`);
-                } else {
-                    const existingAlert = await getActiveGeofenceAlert(vehicleId);
-                    if (!existingAlert) {
-                        await createGeofenceAlert(vehicleId, voiture, latitude, longitude, 'LEFT_ZONE', crossingTime);
-                        recordAlertTimestamp(vehicleId, 'lastLeftZoneAlertAt');
-                        alertCreated = true;
-                    }
                 }
 
                 return {
@@ -650,9 +735,14 @@ const createGeofenceAlert = async (vehicleId, voiture, latitude, longitude, aler
         const minutesSince = Math.round((Date.now() - new Date(crossingTime).getTime()) / 60_000);
         const timeText     = formatTimeAgo(minutesSince);
 
+        // Always include the raw coordinates alongside the reverse-geocoded name
+        // so the alert is still actionable when geocoding fails/returns
+        // "Unknown Location" (no silent loss of the one thing we always have).
+        const coordsText = `${Number(latitude).toFixed(6)}, ${Number(longitude).toFixed(6)}`;
+
         const alertMessage      = alertSubtype === 'LEFT_ZONE'
-            ? `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName}`
-            : `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName}`;
+            ? `Your vehicle ${vehicleName} left the defined zone ${timeText} via ${locationName} (${coordsText})`
+            : `Your vehicle ${vehicleName} returned to the defined zone ${timeText} via ${locationName} (${coordsText})`;
         const notificationTitle = alertSubtype === 'LEFT_ZONE' ? '⚠️ Geofence Alert' : '✅ Vehicle Returned';
 
         const newAlert = await Alert.create({

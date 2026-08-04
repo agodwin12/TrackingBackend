@@ -41,6 +41,38 @@ const Command = sequelize.define('Command', {
         type: DataTypes.STRING(30),
         allowNull: true
     },
+    trigger_source: {
+        type: DataTypes.STRING(30),
+        allowNull: true
+    },
+    description: {
+        type: DataTypes.STRING(255),
+        allowNull: true
+    },
+    trigger_alert_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true
+    },
+    speed_at_send: {
+        type: DataTypes.DECIMAL(6, 2),
+        allowNull: true
+    },
+    sent_at: {
+        type: DataTypes.DATE,
+        allowNull: true
+    },
+    provider_response: {
+        type: DataTypes.JSON,
+        allowNull: true
+    },
+    verified_at: {
+        type: DataTypes.DATE,
+        allowNull: true
+    },
+    verification_result: {
+        type: DataTypes.STRING(30),
+        allowNull: true
+    },
     created_at: {
         type: DataTypes.DATE,
         allowNull: true,

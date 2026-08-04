@@ -69,6 +69,16 @@ class TripDetectionCron {
             logger.info("[TRIP CRON] ⏰ Tick started");
 
             try {
+                // ── Sweep stale "ongoing" trips first ─────────────────────────
+                // Runs independent of whether there's new location data — a
+                // vehicle that's gone quiet forever otherwise never triggers
+                // its last trip's finalization, since that normally only
+                // happens when a later batch of data shows the idle gap.
+                const sweepResult = await TripDetectionService.sweepStaleOngoingTrips();
+                if (sweepResult.finalized > 0) {
+                    logger.info(`[TRIP CRON] Swept ${sweepResult.finalized} stale ongoing trip(s)`);
+                }
+
                 // ── Fetch vehicles that have unprocessed GPS data ─────────────
                 const macs = await TripDetectionService.getVehiclesWithUnprocessedData();
 
@@ -142,11 +152,16 @@ class TripDetectionCron {
         logger.info("[TRIP CRON] 🔧 Manual run started");
 
         try {
+            const sweepResult = await TripDetectionService.sweepStaleOngoingTrips();
+            if (sweepResult.finalized > 0) {
+                logger.info(`[TRIP CRON] Manual run: swept ${sweepResult.finalized} stale ongoing trip(s)`);
+            }
+
             const macs = await TripDetectionService.getVehiclesWithUnprocessedData();
 
             if (macs.length === 0) {
                 logger.info("[TRIP CRON] Manual run: no unprocessed data found");
-                return { success: true, tripsCreated: 0, vehiclesProcessed: 0 };
+                return { success: true, tripsCreated: 0, vehiclesProcessed: 0, tripsSwept: sweepResult.finalized };
             }
 
             logger.info(`[TRIP CRON] Manual run: ${macs.length} vehicle(s) to process`);
