@@ -68,6 +68,26 @@ async function getVehicleInfo(connection, macIdGps) {
     }
 }
 
+// Same as getVehicleInfo, but borrows its own short-lived pool connection on
+// a cache miss instead of requiring one to be passed in. Used by alert
+// processing once it's been detached from the position-save cycle's
+// connection lifecycle -- that connection may already be back in the pool
+// (and reused by something else) by the time alert processing runs.
+async function getVehicleInfoAuto(macIdGps) {
+    const cached = vehicleInfoCache.get(macIdGps);
+    if (cached && (Date.now() - cached.cachedAt) < VEHICLE_INFO_CACHE_TTL_MS) {
+        return cached;
+    }
+
+    let connection = null;
+    try {
+        connection = await getPoolConnection();
+        return await getVehicleInfo(connection, macIdGps);
+    } finally {
+        if (connection) connection.release();
+    }
+}
+
 // ========== CONCURRENT FETCH GUARD ==========
 // Prevents cycles from stacking if one takes longer than the interval.
 let isFetchingGPS = false;
@@ -181,6 +201,70 @@ async function login(loginName, loginPassword) {
     }
 }
 
+// ========== TOKEN CACHE ==========
+// Logging in was previously done on every single fetch cycle, for both
+// accounts -- an unnecessary round trip to the provider on every tick.
+// Tokens are now cached per account and only refreshed when they age out
+// or the provider itself reports the token as invalid/expired.
+const tokenCache = new Map(); // account name -> { token, userId, obtainedAt }
+const TOKEN_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes -- conservative vs. the provider's real session length
+
+function extractErrorCode(resp) {
+    if (!resp) return null;
+    return resp.errorCode ?? resp.error_code ?? resp.code ?? resp.statusCode ?? null;
+}
+
+// Mirrors services/GpsService.js's isTokenInvalid() -- same provider, same response shape.
+function isTokenInvalid(resp) {
+    const code = extractErrorCode(resp);
+    if (code === 403 || code === '403') return true;
+    if (code === 401 || code === '401') return true;
+
+    const msg = String(resp?.errorDescribe || resp?.msg || resp?.message || '').toLowerCase();
+    if (msg.includes('token') && (msg.includes('invalid') || msg.includes('expire'))) return true;
+    if (msg.includes('mds') && (msg.includes('invalid') || msg.includes('expire'))) return true;
+
+    return false;
+}
+
+async function getValidToken(account, forceRefresh = false) {
+    const cached = tokenCache.get(account.name);
+    if (!forceRefresh && cached && (Date.now() - cached.obtainedAt) < TOKEN_CACHE_TTL_MS) {
+        return cached;
+    }
+
+    const loginData = await login(account.loginName, account.loginPassword);
+    if (!loginData) return null;
+
+    const entry = { token: loginData.token, userId: loginData.userId, obtainedAt: Date.now() };
+    tokenCache.set(account.name, entry);
+    return entry;
+}
+
+// Runs `apiCall(token, userId)` with a cached (or freshly obtained) token.
+// If the provider reports the token as invalid/expired, forces exactly one
+// re-login and retries once before giving up for this tick.
+async function withValidToken(account, apiCall) {
+    let tokenEntry = await getValidToken(account);
+    if (!tokenEntry) return null;
+
+    let result = await apiCall(tokenEntry.token, tokenEntry.userId);
+
+    if (result && result.tokenInvalid) {
+        logger.warn(`🔑 [${account.name}] Token invalid/expired -- forcing re-login`);
+        tokenEntry = await getValidToken(account, true);
+        if (!tokenEntry) return null;
+        result = await apiCall(tokenEntry.token, tokenEntry.userId);
+    }
+
+    if (result && result.tokenInvalid) {
+        logger.error(`❌ [${account.name}] Still invalid after re-login -- giving up this cycle`);
+        return null;
+    }
+
+    return result;
+}
+
 async function fetchLocations(token, userId) {
     try {
         const response = await axios.get(`${GPS_CONFIG.apiUrl}/GetDate`, {
@@ -198,10 +282,12 @@ async function fetchLocations(token, userId) {
         if (data.success === 'true') {
             logger.debug('✅ Locations fetched successfully');
             return data;
-        } else {
-            logger.warn('❌ Failed to fetch locations:', data.errorDescribe);
-            return null;
         }
+
+        if (isTokenInvalid(data)) return { tokenInvalid: true };
+
+        logger.warn('❌ Failed to fetch locations:', data.errorDescribe);
+        return null;
     } catch (error) {
         logger.error('🔥 Fetch locations API error:', error.message);
         return null;
@@ -231,10 +317,12 @@ async function fetchAlarmData(token, userId) {
             logger.debug('✅ Alarm data fetched successfully');
             logger.debug(`📊 Total alarms: ${data.total || 0}`);
             return data;
-        } else {
-            logger.debug('⚠️ No alarm data available');
-            return null;
         }
+
+        if (isTokenInvalid(data)) return { tokenInvalid: true };
+
+        logger.debug('⚠️ No alarm data available');
+        return null;
     } catch (error) {
         logger.error('🔥 Fetch alarm data error:', error.message);
         return null;
@@ -594,122 +682,14 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
 
         logger.info(`📊 [${accountName}] GPS summary: accepted=${acceptedRecords}, rejected=${rejectedRecords}, low_confidence=${lowConfidenceRecords}`);
 
-        // ===== CACHE INVALIDATION + SOCKET.IO + ALERT CHECKS =====
+        // ===== ALERT PROCESSING (DECOUPLED FROM POSITION-SAVE PATH) =====
+        // Deliberately NOT awaited: positions for this batch are already
+        // durably persisted above. Cache invalidation, Socket.IO emits, and
+        // the safe-zone/geofence/speed/timezone checks below no longer need
+        // to finish before this account (or the next fetch cycle) can proceed.
         if (invalidatedVehicles.size > 0) {
-            for (const macId of invalidatedVehicles) {
-                try {
-                    const vehicleInfo = await getVehicleInfo(connection, macId);
-
-                    if (!vehicleInfo.id) continue;
-
-                    const vehicleId = vehicleInfo.id;
-                    const carModel  = vehicleInfo.model;
-                    const gpsData   = gpsUpdates.get(macId);
-
-                    if (!gpsData) {
-                        logger.warn(`⚠️ No GPS update in memory for MAC=${macId}, skipping`);
-                        continue;
-                    }
-
-                    // Cache invalidation
-                    await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
-
-                    // Socket.IO — GPS update
-                    socketService.emitGPSUpdate(vehicleId, {
-                        latitude:    gpsData.latitude,
-                        longitude:   gpsData.longitude,
-                        speed:       gpsData.speed,
-                        car_model:   carModel,
-                        status:      gpsData.status,
-                        direction:   gpsData.direction,
-                        timestamp:   gpsData.timestamp,
-                        mac_id_gps:  macId,
-                        gps_quality: gpsData.quality,
-                        alert_safe:  gpsData.alertSafe,
-                        hdop:        gpsData.hdop
-                    });
-
-                    let gpsStatus = 'Disconnected';
-                    if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = 'Connected';
-
-                    // Socket.IO — Dashboard update
-                    socketService.emitDashboardUpdate(vehicleId, {
-                        speed:         gpsData.speed,
-                        gpsStatus:     gpsStatus,
-                        vehicleStatus: gpsStatus === 'Connected' ? 'Active' : 'Inactive',
-                        gpsQuality:    gpsData.quality
-                    });
-
-                    // 🔋 0. Battery monitoring — always runs regardless of alertSafe
-                    try {
-                        await BatteryMonitoringService.processBatteryLevel({
-                            statenumber: gpsData.statenumber,
-                            StateNumber: gpsData.statenumber,
-                            weidu:       gpsData.latitude,
-                            jingdu:      gpsData.longitude,
-                            latitude:    gpsData.latitude,
-                            longitude:   gpsData.longitude
-                        }, macId);
-                    } catch (batteryError) {
-                        logger.error(`❌ Battery monitoring error for vehicle ${vehicleId}:`, batteryError.message);
-                    }
-
-                    // Skip movement-based alerts for low-confidence GPS points
-                    if (!gpsData.alertSafe) {
-                        logger.warn(`⚠️ Skipping movement alerts for vehicle ${vehicleId}: quality=${gpsData.quality}`);
-                        continue;
-                    }
-
-                    // ✅ 1. Safe zone violation check
-                    try {
-                        const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-                        if (safeZoneResult.violation && safeZoneResult.isFirstAlert)
-                            logger.info(`🚨 SAFE ZONE VIOLATION: Vehicle ${vehicleId} left safe zone`);
-                        if (safeZoneResult.returned && safeZoneResult.isFirstAlert)
-                            logger.info(`✅ SAFE ZONE RETURN: Vehicle ${vehicleId} returned`);
-                    } catch (safeZoneError) {
-                        logger.error(`❌ Safe zone check error:`, safeZoneError.message);
-                    }
-
-                    // ✅ 2. Geofence violation check
-                    try {
-                        const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
-                        if (geofenceResult.stateChanged) {
-                            if (geofenceResult.currentState === 'outside')
-                                logger.info(`🚨 GEOFENCE VIOLATION: Vehicle ${vehicleId} left geofence`);
-                            else if (geofenceResult.currentState === 'inside')
-                                logger.info(`✅ GEOFENCE RETURN: Vehicle ${vehicleId} returned`);
-                        }
-                    } catch (geofenceError) {
-                        logger.error(`❌ Geofence check error:`, geofenceError.message);
-                    }
-
-                    // ✅ 3. Speed violation check
-                    try {
-                        await SpeedAlertService.checkSpeedViolation(
-                            vehicleId, macId, gpsData.speed,
-                            { latitude: gpsData.latitude, longitude: gpsData.longitude }
-                        );
-                    } catch (speedError) {
-                        logger.error(`❌ Speed check error:`, speedError.message);
-                    }
-
-                    // ✅ 4. Time zone violation check
-                    try {
-                        await TimeZoneAlertService.checkTimeZoneViolation(
-                            vehicleId, macId, gpsData.speed,
-                            { latitude: gpsData.latitude, longitude: gpsData.longitude }
-                        );
-                    } catch (timeZoneError) {
-                        logger.error(`❌ Time zone check error:`, timeZoneError.message);
-                    }
-
-                    // ✅ 5. Device alarms handled via processAlarmData()
-
-                } catch (error) {
-                    logger.error(`❌ Processing error for MAC ${macId}:`, error.message);
-                }
-            }
+            processVehicleAlerts(invalidatedVehicles, gpsUpdates, accountName)
+                .catch(err => logger.error(`🔥 [${accountName}] Unexpected alert-processing failure:`, err.message));
         }
     } else {
         logger.warn(`❌ [${accountName}] No valid location data:`, locations.errorDescribe || 'Unknown error');
@@ -718,72 +698,184 @@ async function saveLocationsToDatabase(connection, locations, accountName) {
     logger.debug(`========== GPS DATA PROCESSING COMPLETE [${accountName}] ==========\n`);
 }
 
-// ========== MAIN GPS FETCH CYCLE (MULTI-ACCOUNT) ==========
+// ========== ALERT PROCESSING (DETACHED FROM POSITION-SAVE PATH) ==========
+// Runs after saveLocationsToDatabase() has already returned. Uses
+// getVehicleInfoAuto() rather than a passed-in connection, since the
+// position-save cycle's borrowed connection may already be released back to
+// the pool (and handed to something else) by the time this executes.
+async function processVehicleAlerts(invalidatedVehicles, gpsUpdates, accountName) {
+    for (const macId of invalidatedVehicles) {
+        try {
+            const vehicleInfo = await getVehicleInfoAuto(macId);
+
+            if (!vehicleInfo.id) continue;
+
+            const vehicleId = vehicleInfo.id;
+            const carModel  = vehicleInfo.model;
+            const gpsData   = gpsUpdates.get(macId);
+
+            if (!gpsData) {
+                logger.warn(`⚠️ No GPS update in memory for MAC=${macId}, skipping`);
+                continue;
+            }
+
+            // Cache invalidation
+            await cacheInvalidationService.invalidateVehicleLocation(vehicleId);
+
+            // Socket.IO — GPS update
+            socketService.emitGPSUpdate(vehicleId, {
+                latitude:    gpsData.latitude,
+                longitude:   gpsData.longitude,
+                speed:       gpsData.speed,
+                car_model:   carModel,
+                status:      gpsData.status,
+                direction:   gpsData.direction,
+                timestamp:   gpsData.timestamp,
+                mac_id_gps:  macId,
+                gps_quality: gpsData.quality,
+                alert_safe:  gpsData.alertSafe,
+                hdop:        gpsData.hdop
+            });
+
+            let gpsStatus = 'Disconnected';
+            if (gpsData.status && /1/.test(gpsData.status)) gpsStatus = 'Connected';
+
+            // Socket.IO — Dashboard update
+            socketService.emitDashboardUpdate(vehicleId, {
+                speed:         gpsData.speed,
+                gpsStatus:     gpsStatus,
+                vehicleStatus: gpsStatus === 'Connected' ? 'Active' : 'Inactive',
+                gpsQuality:    gpsData.quality
+            });
+
+            // 🔋 0. Battery monitoring — always runs regardless of alertSafe
+            try {
+                await BatteryMonitoringService.processBatteryLevel({
+                    statenumber: gpsData.statenumber,
+                    StateNumber: gpsData.statenumber,
+                    weidu:       gpsData.latitude,
+                    jingdu:      gpsData.longitude,
+                    latitude:    gpsData.latitude,
+                    longitude:   gpsData.longitude
+                }, macId);
+            } catch (batteryError) {
+                logger.error(`❌ Battery monitoring error for vehicle ${vehicleId}:`, batteryError.message);
+            }
+
+            // Skip movement-based alerts for low-confidence GPS points
+            if (!gpsData.alertSafe) {
+                logger.warn(`⚠️ Skipping movement alerts for vehicle ${vehicleId}: quality=${gpsData.quality}`);
+                continue;
+            }
+
+            // ✅ 1. Safe zone violation check
+            try {
+                const safeZoneResult = await checkSafeZoneViolation(vehicleId, gpsData.latitude, gpsData.longitude);
+                if (safeZoneResult.violation && safeZoneResult.isFirstAlert)
+                    logger.info(`🚨 SAFE ZONE VIOLATION: Vehicle ${vehicleId} left safe zone`);
+                if (safeZoneResult.returned && safeZoneResult.isFirstAlert)
+                    logger.info(`✅ SAFE ZONE RETURN: Vehicle ${vehicleId} returned`);
+            } catch (safeZoneError) {
+                logger.error(`❌ Safe zone check error:`, safeZoneError.message);
+            }
+
+            // ✅ 2. Geofence violation check
+            try {
+                const geofenceResult = await checkGeofenceViolation(vehicleId, gpsData.latitude, gpsData.longitude);
+                if (geofenceResult.stateChanged) {
+                    if (geofenceResult.currentState === 'outside')
+                        logger.info(`🚨 GEOFENCE VIOLATION: Vehicle ${vehicleId} left geofence`);
+                    else if (geofenceResult.currentState === 'inside')
+                        logger.info(`✅ GEOFENCE RETURN: Vehicle ${vehicleId} returned`);
+                }
+            } catch (geofenceError) {
+                logger.error(`❌ Geofence check error:`, geofenceError.message);
+            }
+
+            // ✅ 3. Speed violation check
+            try {
+                await SpeedAlertService.checkSpeedViolation(
+                    vehicleId, macId, gpsData.speed,
+                    { latitude: gpsData.latitude, longitude: gpsData.longitude }
+                );
+            } catch (speedError) {
+                logger.error(`❌ Speed check error:`, speedError.message);
+            }
+
+            // ✅ 4. Time zone violation check
+            try {
+                await TimeZoneAlertService.checkTimeZoneViolation(
+                    vehicleId, macId, gpsData.speed,
+                    { latitude: gpsData.latitude, longitude: gpsData.longitude }
+                );
+            } catch (timeZoneError) {
+                logger.error(`❌ Time zone check error:`, timeZoneError.message);
+            }
+
+            // ✅ 5. Device alarms handled via processAlarmData(), on its own cycle
+
+        } catch (error) {
+            logger.error(`❌ [${accountName}] Alert processing error for MAC ${macId}:`, error.message);
+        }
+    }
+}
+
+// ========== PER-ACCOUNT POSITION FETCH ==========
+// Each account borrows and releases its OWN connection -- running the two
+// accounts concurrently means they can no longer share a single connection
+// object (mysql2 connections aren't safe for overlapping concurrent queries).
+// The pool is sized (connectionLimit: 5) with this in mind.
+async function processAccount(account) {
+    let connection = null;
+
+    try {
+        connection = await getPoolConnection();
+
+        const locations = await withValidToken(account, fetchLocations);
+        if (locations) {
+            await saveLocationsToDatabase(connection, locations, account.name);
+            logger.info(`✅ ${account.name} done`);
+            return true;
+        }
+
+        logger.warn(`❌ Failed to fetch locations for ${account.name}`);
+        return false;
+    } catch (accountError) {
+        // Error for one account must NOT stop the other account or crash the cycle
+        logger.error(`🔥 Error processing ${account.name}:`, accountError.message);
+        return false;
+    } finally {
+        if (connection) {
+            try {
+                connection.release();
+                logger.debug(`✅ [${account.name}] DB connection released back to pool`);
+            } catch (releaseError) {
+                logger.error('❌ Error releasing DB connection:', releaseError.message);
+            }
+        }
+    }
+}
+
+// ========== MAIN GPS FETCH CYCLE (MULTI-ACCOUNT, PARALLEL) ==========
 async function fetchGPSData() {
-    // Guard: skip this tick if the previous one hasn't finished yet
+    // Guard: skip this tick if the previous one hasn't finished yet. With the
+    // self-rescheduling timer below, a new tick is only ever scheduled after
+    // the previous one fully completes, so this is now just a safety net for
+    // the case of the cycle being manually stopped and restarted mid-flight.
     if (isFetchingGPS) {
         logger.warn('⏭️ Previous GPS fetch still running, skipping tick');
         return;
     }
 
     isFetchingGPS = true;
-    let connection = null;
 
     try {
         logger.info(`\n⏰ [${new Date().toLocaleString()}] Starting GPS fetch cycle...`);
 
-        // Borrow one connection from the pool for the entire cycle
-        connection = await getPoolConnection();
+        const results = await Promise.all(GPS_ACCOUNTS.map(account => processAccount(account)));
+        const totalOk = results.filter(Boolean).length;
 
-        let totalAccountsProcessed = 0;
-        let totalAccountsFailed    = 0;
-
-        for (let i = 0; i < GPS_ACCOUNTS.length; i++) {
-            const account = GPS_ACCOUNTS[i];
-
-            try {
-                logger.info(`🔐 Processing ${account.name} (${i + 1}/${GPS_ACCOUNTS.length})`);
-
-                const loginData = await login(account.loginName, account.loginPassword);
-
-                if (loginData) {
-                    const { token, userId } = loginData;
-
-                    const locations = await fetchLocations(token, userId);
-                    if (locations) {
-                        await saveLocationsToDatabase(connection, locations, account.name);
-                    } else {
-                        logger.warn(`❌ Failed to fetch locations for ${account.name}`);
-                    }
-
-                    try {
-                        const alarmData = await fetchAlarmData(token, userId);
-                        if (alarmData) {
-                            await processAlarmData(alarmData);
-                        }
-                    } catch (alarmError) {
-                        logger.error(`🔥 Alarm processing error for ${account.name}:`, alarmError.message);
-                    }
-
-                    logger.info(`✅ ${account.name} done`);
-                    totalAccountsProcessed++;
-                } else {
-                    logger.warn(`❌ Login failed for ${account.name}`);
-                    totalAccountsFailed++;
-                }
-
-                if (i < GPS_ACCOUNTS.length - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
-
-            } catch (accountError) {
-                // Error for one account must NOT stop other accounts or crash the cycle
-                logger.error(`🔥 Error processing ${account.name}:`, accountError.message);
-                totalAccountsFailed++;
-            }
-        }
-
-        logger.info(`📊 Cycle complete: ${totalAccountsProcessed} ok, ${totalAccountsFailed} failed`);
+        logger.info(`📊 Cycle complete: ${totalOk} ok, ${results.length - totalOk} failed`);
         logger.debug(`⏰ Next fetch in ${GPS_CONFIG.fetchInterval / 1000}s\n`);
 
     } catch (error) {
@@ -791,51 +883,99 @@ async function fetchGPSData() {
         logger.error('🔥 Fatal error in GPS fetch cycle:', error.message);
         logger.error('Stack:', error.stack);
     } finally {
-        // ALWAYS release the connection and reset the guard — no matter what happened above
-        if (connection) {
-            try {
-                connection.release();
-                logger.debug('✅ DB connection released back to pool');
-            } catch (releaseError) {
-                logger.error('❌ Error releasing DB connection:', releaseError.message);
-            }
-        }
         isFetchingGPS = false;
     }
 }
 
+// ========== PER-ACCOUNT ALARM FETCH (SEPARATE, SLOWER CYCLE) ==========
+// Alarms no longer share the position-fetch critical path -- they run on
+// their own interval, so a slow alarm fetch for one account can never delay
+// position updates for either account.
+async function fetchAndProcessAlarms(account) {
+    try {
+        const alarmData = await withValidToken(account, fetchAlarmData);
+        if (alarmData) {
+            await processAlarmData(alarmData);
+        }
+    } catch (alarmError) {
+        logger.error(`🔥 Alarm processing error for ${account.name}:`, alarmError.message);
+    }
+}
+
+let isFetchingAlarms = false;
+
+async function fetchAllAlarms() {
+    if (isFetchingAlarms) {
+        logger.warn('⏭️ Previous alarm fetch still running, skipping tick');
+        return;
+    }
+
+    isFetchingAlarms = true;
+
+    try {
+        await Promise.all(GPS_ACCOUNTS.map(account => fetchAndProcessAlarms(account)));
+    } catch (error) {
+        logger.error('🔥 Fatal error in alarm fetch cycle:', error.message);
+    } finally {
+        isFetchingAlarms = false;
+    }
+}
+
 // ========== SERVICE CONTROL ==========
-let fetchInterval = null;
+// Self-rescheduling setTimeout instead of a fixed setInterval: the next tick
+// is only scheduled once the current one has fully finished, so a slow cycle
+// can no longer stack up ticks behind it -- it just runs a little later than
+// GPS_CONFIG.fetchInterval, instead of silently skipping ticks.
+const ALARM_FETCH_INTERVAL_MS = parseInt(process.env.GPS_ALARM_FETCH_INTERVAL) || 45000;
+
+let fetchTimer   = null;
+let alarmTimer   = null;
+let cycleRunning = false;
+
+function scheduleNextFetch() {
+    if (!cycleRunning) return;
+    fetchTimer = setTimeout(() => { fetchGPSData().finally(scheduleNextFetch); }, GPS_CONFIG.fetchInterval);
+}
+
+function scheduleNextAlarmFetch() {
+    if (!cycleRunning) return;
+    alarmTimer = setTimeout(() => { fetchAllAlarms().finally(scheduleNextAlarmFetch); }, ALARM_FETCH_INTERVAL_MS);
+}
 
 function startGPSFetchCycle() {
-    if (fetchInterval) {
+    if (cycleRunning) {
         logger.warn('⚠️ GPS fetch cycle is already running');
         return;
     }
+
+    cycleRunning = true;
 
     logger.info(`🚀 Starting GPS fetch cycle with ${GPS_ACCOUNTS.length} accounts...`);
     GPS_ACCOUNTS.forEach((account, index) => {
         logger.info(`   ${index + 1}. ${account.name} (${account.loginName})`);
     });
 
-    // Run immediately on startup, then on every interval tick
-    fetchGPSData();
-    fetchInterval = setInterval(fetchGPSData, GPS_CONFIG.fetchInterval);
-    logger.info(`⏰ GPS fetch cycle started (every ${GPS_CONFIG.fetchInterval / 1000}s)`);
+    // Run immediately on startup, then self-reschedule after each run completes
+    fetchGPSData().finally(scheduleNextFetch);
+    fetchAllAlarms().finally(scheduleNextAlarmFetch);
+
+    logger.info(`⏰ GPS fetch cycle started (positions every ${GPS_CONFIG.fetchInterval / 1000}s, alarms every ${ALARM_FETCH_INTERVAL_MS / 1000}s)`);
 }
 
 function stopGPSFetchCycle() {
-    if (fetchInterval) {
-        clearInterval(fetchInterval);
-        fetchInterval = null;
-        logger.info('🛑 GPS fetch cycle stopped');
-    } else {
+    if (!cycleRunning) {
         logger.warn('⚠️ GPS fetch cycle is not running');
+        return;
     }
+
+    cycleRunning = false;
+    if (fetchTimer) { clearTimeout(fetchTimer); fetchTimer = null; }
+    if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; }
+    logger.info('🛑 GPS fetch cycle stopped');
 }
 
 function isRunning() {
-    return fetchInterval !== null;
+    return cycleRunning;
 }
 
 module.exports = {
