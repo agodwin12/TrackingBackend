@@ -1,7 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: proxym_redis
+    container_name: tracking_test_redis
     restart: always
     volumes:
       - redis_data:/data
@@ -15,10 +15,10 @@ services:
 
   backend:
     build: .
-    container_name: fleetra_prod_backend
+    container_name: tracking_test_backend
     restart: always
     ports:
-      - "6005:6000"
+      - "6006:6000"
     env_file:
       - .env
     environment:
