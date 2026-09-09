@@ -28,25 +28,41 @@ const normalizePhone = (phone) => {
 };
 
 /**
- * Resolve app destination by looking up the partner's type_partner.
+ * Resolve app destination from type_partner.
  *
- *   No partner_id          → 'tracking'   (regular owner account)
- *   partner.LEASE_PARTNER  → 'recouvrement'
- *   partner.SIMPLE_PARTNER → 'tracking'
+ *   A partner ROOT account (no partner_id) is classified by its OWN
+ *   type_partner — it has no parent to look up.
+ *   A user WITH a partner_id (staff/chauffeur under a partner) is classified
+ *   by their PARENT's type_partner instead.
+ *
+ *   type_partner value:
+ *     LEASE_PARTNER      → 'recouvrement'
+ *     SEMI_AUTO_PARTNER  → 'recouvrement_semi_auto'
+ *     SIMPLE_PARTNER / null / no partner_id and no type_partner → 'tracking'
  */
-async function resolveAppType(partnerId) {
-    if (!partnerId) return 'tracking';
+async function resolveAppType(user) {
+    if (!user.partner_id) {
+        return appTypeForPartnerType(user.type_partner);
+    }
 
-    const partner = await User.findByPk(partnerId, {
+    const partner = await User.findByPk(user.partner_id, {
         attributes: ['type_partner'],
     });
 
     if (!partner) {
-        logger.warn(`⚠️ Partner ID ${partnerId} not found — defaulting to tracking`);
+        logger.warn(`⚠️ Partner ID ${user.partner_id} not found — defaulting to tracking`);
         return 'tracking';
     }
 
-    return partner.type_partner === 'LEASE_PARTNER' ? 'recouvrement' : 'tracking';
+    return appTypeForPartnerType(partner.type_partner);
+}
+
+function appTypeForPartnerType(typePartner) {
+    switch (typePartner) {
+        case 'LEASE_PARTNER':     return 'recouvrement';
+        case 'SEMI_AUTO_PARTNER': return 'recouvrement_semi_auto';
+        default:                  return 'tracking';
+    }
 }
 
 async function fetchRegularUserVehicles(userId) {
@@ -180,14 +196,15 @@ exports.login = async (req, res) => {
         //   staff, not a driver on a lease/recouvrement program.
         //
         //   Otherwise, by partner's type_partner:
-        //     No partner_id          → tracking   (regular owner)
-        //     partner.LEASE_PARTNER  → recouvrement
-        //     partner.SIMPLE_PARTNER → tracking
+        //     No partner_id              → tracking   (regular owner)
+        //     partner.LEASE_PARTNER      → recouvrement
+        //     partner.SEMI_AUTO_PARTNER  → recouvrement_semi_auto
+        //     partner.SIMPLE_PARTNER     → tracking
         //
         const hasPartner     = user.partner_id !== null && user.partner_id !== undefined;
         const isPartnerStaff = user.role_id === 6 && hasPartner;
         const isChauffeur    = hasPartner && !isPartnerStaff;
-        const app_type       = isPartnerStaff ? 'tracking' : await resolveAppType(user.partner_id);
+        const app_type       = isPartnerStaff ? 'tracking' : await resolveAppType(user);
 
         logger.info(`👤 User ${user.id} | partner_id=${user.partner_id} | app_type=${app_type} | isChauffeur=${isChauffeur} | isPartnerStaff=${isPartnerStaff} | client=${clientId} | roles=${clientRoles}`);
 
@@ -244,7 +261,7 @@ exports.login = async (req, res) => {
         return res.json({
             message:             'Login successful',
             isFirstLogin:        user.is_first_login,
-            app_type,                                   // 'tracking' | 'recouvrement' ← Flutter routes on this
+            app_type,                                   // 'tracking' | 'recouvrement' | 'recouvrement_semi_auto' ← Flutter routes on this
             client_id:           clientId,
             roles:               clientRoles,
             subscription_status: subscriptionStatus,
