@@ -79,12 +79,17 @@ async function getAdminToken() {
 
 async function attemptLogin(username, password, clientId) {
     try {
+        // offline_access makes Keycloak issue an offline refresh token, whose
+        // lifetime is governed by the realm's offlineSessionMaxLifespan
+        // instead of the regular SSO session lifespan — required for a
+        // persistent, multi-week login rather than one tied to a short SSO
+        // session window.
         const params = new URLSearchParams({
             grant_type: 'password',
             client_id:  clientId,
             username,
             password,
-            scope: 'openid email profile',
+            scope: 'openid email profile offline_access',
         });
 
         logger.info(`🔑 Keycloak ROPC attempt — url=${TOKEN_URL} client=${clientId} username=${username}`);
@@ -193,6 +198,7 @@ async function refreshToken(refreshToken, clientId) {
             grant_type:    'refresh_token',
             client_id:     clientId,
             refresh_token: refreshToken,
+            scope:         'openid email profile offline_access',
         });
 
         const { data } = await axios.post(
